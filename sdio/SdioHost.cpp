@@ -62,18 +62,30 @@ static void enablePads() {
 }
 
 // Root frequency for the divider maths below.  MUST track initClock().
-static const uint32_t BASE_CLOCK = 198000000U;
+//
+// 24 MHz, not 198 MHz: this driver takes OSC_24M rather than SYS_PLL2_PFD2.
+// See initClock() for why.
+static const uint32_t BASE_CLOCK = 24000000U;
 
 static void initClock() {
-    // USDHC1 clock root (CLOCK_ROOT58) <- SYS_PLL2_PFD2 (mux 4) / 2 (DIV 1),
-    // then ungate USDHC1 (LPCG117).
+    // USDHC1 clock root (CLOCK_ROOT58) <- OSC_24M (mux 1), undivided, then
+    // ungate USDHC1 (LPCG117).
     //
-    // HARDWARE-VERIFY: this assumes the boot ROM leaves SYS_PLL2_PFD2 at
-    // ~396 MHz.  The imxrt1176 core's startup.c brings up only the ARM PLL and
-    // AHB, never PLL2.  If enumeration fails on silicon with sane-looking code,
-    // suspect this before the protocol -- measure the root, and if PFD2 differs
-    // fall back to OSC_24M: MUX(1)|DIV(0) with BASE_CLOCK = 24000000U.
-    CCM_CLOCK_ROOT58_CONTROL = CCM_CLOCK_ROOT_CONTROL_MUX(4) | CCM_CLOCK_ROOT_CONTROL_DIV(1);
+    // This deliberately does NOT use SYS_PLL2_PFD2 (mux 4, div 2 -> 198 MHz),
+    // which is what SdFat's RT1176 branch does and what this driver did until
+    // 2026-08-17.  That path ASSUMES the boot ROM left PLL2's PFD2 at 396 MHz:
+    // the imxrt1176 core's startup.c brings up only the ARM PLL and the AHB,
+    // never PLL2.  NXP's own BOARD_USDHC1ClockConfiguration() for this board
+    // does not assume it either -- it calls CLOCK_InitSysPll2() and
+    // CLOCK_InitPfd(kCLOCK_PllSys2, kCLOCK_Pfd2, 24) first.
+    //
+    // The trap is that a wrong root is nearly invisible: SYS_CTRL's divider
+    // still produces a stable clock and PRES_STATE[SDSTB] still asserts, so the
+    // controller looks healthy while the card sees a frequency far from the
+    // 400 kHz identification clock it is entitled to expect.  OSC_24M is always
+    // running and boot-independent, which removes the assumption instead of
+    // re-deriving it.  It caps the bus at 24 MHz, ample for enumeration.
+    CCM_CLOCK_ROOT58_CONTROL = CCM_CLOCK_ROOT_CONTROL_MUX(1) | CCM_CLOCK_ROOT_CONTROL_DIV(0);
     CCM_LPCG117_DIRECT = 1;
 }
 
