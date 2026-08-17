@@ -1,0 +1,250 @@
+#include "SdioHost.h"
+
+// USDHC1 register overlay.  Offsets match the RT1176 USDHC register map; the
+// core already carries USDHC1_* macros for the SdFat port, but this library
+// keeps its own overlay so it does not depend on SdFat's headers.
+#define USDHC1_BASE 0x40418000u
+#define REG(off) (*(volatile uint32_t *)(USDHC1_BASE + (off)))
+#define DS_ADDR      REG(0x00)
+#define BLK_ATT      REG(0x04)
+#define CMD_ARG      REG(0x08)
+#define CMD_XFR_TYP  REG(0x0C)
+#define CMD_RSP0     REG(0x10)
+#define CMD_RSP1     REG(0x14)
+#define PRES_STATE   REG(0x24)
+#define PROT_CTRL    REG(0x28)
+#define SYS_CTRL     REG(0x2C)
+#define INT_STATUS   REG(0x30)
+#define INT_STATUS_EN REG(0x34)
+#define INT_SIGNAL_EN REG(0x38)
+#define MIX_CTRL     REG(0x48)
+#define VEND_SPEC    REG(0xC0)
+
+// INT_STATUS bits
+static const uint32_t INT_CC   = 1u << 0;   // command complete
+static const uint32_t INT_CTOE = 1u << 16;  // command timeout
+static const uint32_t INT_CCE  = 1u << 17;  // command CRC error
+static const uint32_t INT_CEBE = 1u << 18;  // command end-bit error
+static const uint32_t INT_CIE  = 1u << 19;  // command index error
+static const uint32_t INT_CMD_ERR = INT_CTOE | INT_CCE | INT_CEBE | INT_CIE;
+
+// CMD_XFR_TYP response types
+static const uint32_t RSP_NONE   = 0u << 16;
+static const uint32_t RSP_136    = 1u << 16;
+static const uint32_t RSP_48     = 2u << 16;
+static const uint32_t RSP_48BUSY = 3u << 16;
+static const uint32_t CHK_CRC    = 1u << 19;
+static const uint32_t CHK_IDX    = 1u << 20;
+
+static void gpioMux(uint8_t mode) {
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_00 = mode;  // USDHC1_CMD
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_01 = mode;  // USDHC1_CLK
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_02 = mode;  // USDHC1_DATA0
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_03 = mode;  // USDHC1_DATA1
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_04 = mode;  // USDHC1_DATA2
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B1_05 = mode;  // USDHC1_DATA3
+}
+
+static void enablePads() {
+    // RT1176 SW_PAD_CTL fields: bit4 ODE, bits[3:2] PULL (01=up,10=down,
+    // 11=none), bit1 PDRV (0=high drive).  CMD/DATA = pull-up + high drive;
+    // CLK = pull-down + high drive.  Copied from SdFat's proven RT1176 branch --
+    // the 1062 PKE/DSE/SPEED encoding does not exist on this part.
+    const uint32_t DATA_PAD = 0x04;
+    const uint32_t CLK_PAD  = 0x08;
+    gpioMux(0);  // ALT0 = USDHC1
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_00 = DATA_PAD;
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_01 = CLK_PAD;
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_02 = DATA_PAD;
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_03 = DATA_PAD;
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_04 = DATA_PAD;
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B1_05 = DATA_PAD;
+}
+
+// Root frequency for the divider maths below.  MUST track initClock().
+static const uint32_t BASE_CLOCK = 198000000U;
+
+static void initClock() {
+    // USDHC1 clock root (CLOCK_ROOT58) <- SYS_PLL2_PFD2 (mux 4) / 2 (DIV 1),
+    // then ungate USDHC1 (LPCG117).
+    //
+    // HARDWARE-VERIFY: this assumes the boot ROM leaves SYS_PLL2_PFD2 at
+    // ~396 MHz.  The imxrt1176 core's startup.c brings up only the ARM PLL and
+    // AHB, never PLL2.  If enumeration fails on silicon with sane-looking code,
+    // suspect this before the protocol -- measure the root, and if PFD2 differs
+    // fall back to OSC_24M: MUX(1)|DIV(0) with BASE_CLOCK = 24000000U.
+    CCM_CLOCK_ROOT58_CONTROL = CCM_CLOCK_ROOT_CONTROL_MUX(4) | CCM_CLOCK_ROOT_CONTROL_DIV(1);
+    CCM_LPCG117_DIRECT = 1;
+}
+
+SdioHost::Status SdioHost::setClock(uint32_t hz) {
+    // Gate the card clock while changing the divider, then wait for SDSTB.
+    uint32_t base = BASE_CLOCK;
+    uint32_t bestPre = 0, bestDiv = 0;
+    uint32_t bestErr = 0xFFFFFFFFu;
+    for (uint32_t pre = 1; pre <= 256; pre <<= 1) {
+        for (uint32_t div = 1; div <= 16; div++) {
+            uint32_t f = base / (pre * div);
+            if (f > hz) continue;
+            uint32_t err = hz - f;
+            if (err < bestErr) { bestErr = err; bestPre = pre; bestDiv = div; }
+        }
+    }
+    if (bestPre == 0) return CLOCK_UNSTABLE;
+
+    // SYS_CTRL: SDCLKFS = prescaler>>1, DVS = divisor-1.
+    uint32_t sdclkfs = bestPre >> 1;
+    uint32_t dvs     = bestDiv - 1;
+    SYS_CTRL = (SYS_CTRL & ~0x0000FFF0u) | (sdclkfs << 8) | (dvs << 4) | (0xEu << 16);
+
+    for (uint32_t i = 0; i < 100000; i++) {
+        if (PRES_STATE & (1u << 3)) return OK;   // SDSTB
+    }
+    return CLOCK_UNSTABLE;
+}
+
+SdioHost::Status SdioHost::sendCommand(uint8_t index, uint32_t arg,
+                                       uint32_t xferFlags, uint32_t *resp) {
+    // Wait for CIHB (command inhibit) to clear.
+    for (uint32_t i = 0; PRES_STATE & (1u << 0); i++) {
+        if (i > 1000000) return CMD_TIMEOUT;
+    }
+    INT_STATUS = 0xFFFFFFFFu;          // clear stale status (w1c)
+    CMD_ARG    = arg;
+    MIX_CTRL  &= ~0x3Fu;               // no data phase for any command here
+    CMD_XFR_TYP = ((uint32_t)index << 24) | xferFlags;
+
+    uint32_t st = 0;
+    for (uint32_t i = 0; ; i++) {
+        st = INT_STATUS;
+        if (st & (INT_CC | INT_CMD_ERR)) break;
+        if (i > 1000000) return CMD_TIMEOUT;
+    }
+    INT_STATUS = st;                   // w1c
+
+    if (st & INT_CTOE) return CMD_TIMEOUT;
+    if (st & (INT_CCE | INT_CEBE | INT_CIE)) return CMD_CRC;
+    if (resp) *resp = CMD_RSP0;
+    return OK;
+}
+
+SdioHost::Status SdioHost::begin() {
+    m_ioFunctions = 0; m_rca = 0; m_cccrRev = 0; m_cisPtr = 0;
+
+    initClock();
+    enablePads();
+
+    // Reset the whole controller (SYS_CTRL RSTA) and wait for it to clear.
+    SYS_CTRL |= (1u << 24);
+    for (uint32_t i = 0; SYS_CTRL & (1u << 24); i++) {
+        if (i > 1000000) return CLOCK_UNSTABLE;
+    }
+    PROT_CTRL = (PROT_CTRL & ~0x6u);   // 1-bit bus width for identification
+    INT_STATUS_EN = 0xFFFFFFFFu;
+    INT_SIGNAL_EN = 0;                 // polled, no interrupts in W1
+
+    Status s = setClock(400000);       // identification clock
+    if (s != OK) return s;
+    delayMicroseconds(2000);           // >= 74 clocks at 400 kHz before CMD5
+
+    // CMD5 IO_SEND_OP_COND, arg 0 -> read the card's OCR.  R4 has no CRC and
+    // no index, so neither is checked.  An SD MEMORY card ignores CMD5 by
+    // spec, so a timeout here is the expected no-card-of-our-kind answer, not
+    // an error to report as a failure.
+    uint32_t r4 = 0;
+    s = sendCommand(5, 0, RSP_48, &r4);
+    if (s != OK) return NO_IO_FUNCTION;
+
+    uint8_t nfn = (r4 >> 28) & 0x7;
+    if (nfn == 0) return NO_IO_FUNCTION;
+
+    // Re-issue CMD5 with the voltage window until the card reports ready.
+    const uint32_t OCR_32_34 = 0x00300000u;
+    for (uint32_t i = 0; i < 1000; i++) {
+        s = sendCommand(5, r4 & 0x00FFFFFFu ? (r4 & 0x00FFFFFFu) : OCR_32_34,
+                        RSP_48, &r4);
+        if (s != OK) return s;
+        if (r4 & 0x80000000u) break;   // C bit: initialisation complete
+        delayMicroseconds(1000);
+        if (i == 999) return CMD_TIMEOUT;
+    }
+    m_ioFunctions = (r4 >> 28) & 0x7;
+
+    // CMD3 SEND_RELATIVE_ADDR -> R6, RCA in bits 31:16.
+    uint32_t r6 = 0;
+    s = sendCommand(3, 0, RSP_48 | CHK_CRC | CHK_IDX, &r6);
+    if (s != OK) return s;
+    m_rca = (uint16_t)(r6 >> 16);
+
+    // CMD7 SELECT_CARD with the RCA -> R1b.
+    s = sendCommand(7, (uint32_t)m_rca << 16, RSP_48BUSY | CHK_CRC | CHK_IDX, nullptr);
+    if (s != OK) return s;
+
+    s = setClock(25000000);            // leave identification speed
+    if (s != OK) return s;
+
+    // CCCR revision (function 0, address 0x00) and the function-0 CIS pointer
+    // (0x09..0x0B, little-endian).
+    uint8_t b = 0;
+    s = cmd52Read(0, 0x00, &b);
+    if (s != OK) return s;
+    m_cccrRev = b & 0x0F;
+
+    m_cisPtr = 0;
+    for (int i = 0; i < 3; i++) {
+        s = cmd52Read(0, 0x09 + i, &b);
+        if (s != OK) return s;
+        m_cisPtr |= (uint32_t)b << (8 * i);
+    }
+    return OK;
+}
+
+// CMD52 argument layout: bit31 R/W, bits30:28 function, bit27 RAW,
+// bits25:9 register address, bits7:0 write data.
+static inline uint32_t cmd52Arg(bool write, uint8_t fn, uint32_t addr, uint8_t data) {
+    return ((uint32_t)write << 31) | ((uint32_t)(fn & 0x7) << 28) |
+           ((addr & 0x1FFFFu) << 9) | data;
+}
+
+SdioHost::Status SdioHost::cmd52Read(uint8_t fn, uint32_t addr, uint8_t *out) {
+    uint32_t r5 = 0;
+    Status s = sendCommand(52, cmd52Arg(false, fn, addr, 0),
+                           RSP_48 | CHK_CRC | CHK_IDX, &r5);
+    if (s != OK) return s;
+    if (out) *out = (uint8_t)(r5 & 0xFF);
+    return OK;
+}
+
+SdioHost::Status SdioHost::cmd52Write(uint8_t fn, uint32_t addr, uint8_t value) {
+    return sendCommand(52, cmd52Arg(true, fn, addr, value),
+                       RSP_48 | CHK_CRC | CHK_IDX, nullptr);
+}
+
+SdioHost::Status SdioHost::readManfId(uint16_t *manufacturer, uint16_t *card) {
+    if (m_cisPtr == 0) return BAD_CIS;
+    // Walk the tuple chain looking for CISTPL_MANFID (0x20).  Tuple format is
+    // <code><link><body...>; 0xFF terminates the chain.  Bound the walk -- a
+    // corrupt link byte must not spin forever.
+    uint32_t addr = m_cisPtr;
+    for (int guard = 0; guard < 128; guard++) {
+        uint8_t code = 0, link = 0;
+        Status s = cmd52Read(0, addr, &code);
+        if (s != OK) return s;
+        if (code == 0xFF) return BAD_CIS;            // end of chain, no MANFID
+        s = cmd52Read(0, addr + 1, &link);
+        if (s != OK) return s;
+        if (code == 0x20) {                          // CISTPL_MANFID
+            if (link < 4) return BAD_CIS;
+            uint8_t b[4];
+            for (int i = 0; i < 4; i++) {
+                s = cmd52Read(0, addr + 2 + i, &b[i]);
+                if (s != OK) return s;
+            }
+            if (manufacturer) *manufacturer = (uint16_t)(b[0] | (b[1] << 8));
+            if (card)         *card         = (uint16_t)(b[2] | (b[3] << 8));
+            return OK;
+        }
+        addr += 2 + link;
+    }
+    return BAD_CIS;
+}
