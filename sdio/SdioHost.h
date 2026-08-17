@@ -33,6 +33,22 @@ public:
     // have nothing in common diagnostically.
     Status begin();
 
+    // Run the bus at 1.8 V instead of the 3.3 V default.  Call BEFORE begin();
+    // begin() resets the controller, which clears VEND_SPEC, so the switch is
+    // applied there rather than here.
+    //
+    // On the MIMXRT1170-EVKB this drives USDHC1_VSELECT (GPIO_AD_34 ALT4) into
+    // U311 (NX3L1G53GT), selecting VDD_1V8 rather than SENSOR_3V3 onto NVCC_SD.
+    // That rail feeds BOTH the bus pull-ups (R373/374/375) and the MCU's own
+    // NVCC_SD1 pad supply (ball D14, via R375), so the whole bus moves together.
+    //
+    // NXP define SDMMCHOST_OPERATION_VOLTAGE_1V8 for every IW416 module config,
+    // so 1.8 V is what these cards are expected to run at.
+    //
+    // WARNING: do not leave this enabled with a 3.3 V-only microSD in J15 --
+    // J15 and the M.2 socket J54 are the same bus.
+    void useIoVoltage1V8(bool enable) { m_use1V8 = enable; }
+
     uint8_t  ioFunctionCount() const { return m_ioFunctions; }
     uint16_t rca()             const { return m_rca; }
     uint8_t  cccrRevision()    const { return m_cccrRev; }
@@ -65,4 +81,5 @@ private:
     uint32_t m_lastIntStatus = 0;
     uint32_t m_lastR4        = 0;
     uint32_t m_lastPresState = 0;
+    bool     m_use1V8        = false;
 };

@@ -159,6 +159,16 @@ SdioHost::Status SdioHost::begin() {
     INT_STATUS_EN = 0xFFFFFFFFu;
     INT_SIGNAL_EN = 0;                 // polled, no interrupts in W1
 
+    if (m_use1V8) {
+        // GPIO_AD_34 (ball J16) ALT4 = USDHC1_VSELECT -> R168 -> U311.5, which
+        // selects VDD_1V8 instead of SENSOR_3V3 onto NVCC_SD.  Must come after
+        // the RSTA above, which clears VEND_SPEC.  RM offsets: SW_MUX_CTL for
+        // GPIO_AD_34 at 194h, SW_PAD_CTL at 3D8h, IOMUXC base 0x400E8000.
+        *(volatile uint32_t *)0x400E8194u = 4u;   // ALT4 = USDHC1_VSELECT
+        VEND_SPEC |= (1u << 1);                   // VSELECT: drive the rail to 1.8 V
+        delay(10);                                // let NVCC_SD settle
+    }
+
     Status s = setClock(400000);       // identification clock
     if (s != OK) return s;
 
