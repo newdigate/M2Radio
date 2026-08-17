@@ -118,9 +118,12 @@ SdioHost::Status SdioHost::sendCommand(uint8_t index, uint32_t arg,
     for (uint32_t i = 0; ; i++) {
         st = INT_STATUS;
         if (st & (INT_CC | INT_CMD_ERR)) break;
-        if (i > 1000000) return CMD_TIMEOUT;
+        if (i > 1000000) { m_lastIntStatus = st; return CMD_TIMEOUT; }
     }
     INT_STATUS = st;                   // w1c
+    // Keep the status we actually observed.  Reading INT_STATUS again after
+    // this point yields zeros -- it is write-1-to-clear and we just cleared it.
+    m_lastIntStatus = st;
 
     if (st & INT_CTOE) return CMD_TIMEOUT;
     if (st & (INT_CCE | INT_CEBE | INT_CIE)) return CMD_CRC;
@@ -130,6 +133,7 @@ SdioHost::Status SdioHost::sendCommand(uint8_t index, uint32_t arg,
 
 SdioHost::Status SdioHost::begin() {
     m_ioFunctions = 0; m_rca = 0; m_cccrRev = 0; m_cisPtr = 0;
+    m_lastIntStatus = 0; m_lastR4 = 0;
 
     initClock();
     enablePads();
@@ -145,15 +149,32 @@ SdioHost::Status SdioHost::begin() {
 
     Status s = setClock(400000);       // identification clock
     if (s != OK) return s;
-    delayMicroseconds(2000);           // >= 74 clocks at 400 kHz before CMD5
+
+    // Send the 80 initialisation clocks via SYS_CTRL[INITA], and wait for the
+    // bit to self-clear.
+    //
+    // This is NOT interchangeable with a delay, which is what stood here until
+    // the first hardware run on 2026-08-17 returned "no card" with the M.2
+    // module fitted, powered and out of reset.  i.MX USDHC GATES SD_CLK while
+    // idle, so a delayMicroseconds() before the first command emits exactly
+    // zero clocks and the card never leaves its power-up state.  SdFat's
+    // SdioTeensy -- hardware-proven on this same controller -- has always used
+    // INITA here (SdioTeensy.cpp:509); this driver simply omitted it.
+    SYS_CTRL |= (1u << 27);
+    for (uint32_t i = 0; SYS_CTRL & (1u << 27); i++) {
+        if (i > 1000000) return INIT_CLK_STUCK;
+    }
 
     // CMD5 IO_SEND_OP_COND, arg 0 -> read the card's OCR.  R4 has no CRC and
     // no index, so neither is checked.  An SD MEMORY card ignores CMD5 by
-    // spec, so a timeout here is the expected no-card-of-our-kind answer, not
-    // an error to report as a failure.
+    // spec, so no response here is the expected answer when one is present --
+    // reported as CMD5_NO_RESPONSE, which is a different fact from a card that
+    // answers and reports zero IO functions.
     uint32_t r4 = 0;
-    s = sendCommand(5, 0, RSP_48, &r4);
-    if (s != OK) return NO_IO_FUNCTION;
+    m_lastPresState = PRES_STATE;        // live bus levels, before we drive it
+    s = sendCommand(5, 0, RSP_48, &r4);  // records m_lastIntStatus itself
+    m_lastR4 = r4;
+    if (s != OK) return CMD5_NO_RESPONSE;
 
     uint8_t nfn = (r4 >> 28) & 0x7;
     if (nfn == 0) return NO_IO_FUNCTION;
