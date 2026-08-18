@@ -236,6 +236,18 @@ public:
     bool     diagEapolSeen()      const { return m_diagEapol; }
     uint16_t diagDataFrames()     const { return m_diagDataFrames; }
     uint16_t diagFirstEthertype() const { return m_diagFirstEthertype; }
+    // Full event-sequence watcher: run the WHOLE window, recording every
+    // command-port event id and a coarse ms timestamp, instead of returning on
+    // the first one.  Reveals a connect-then-drop -- e.g. PORT_RELEASE (0x2B)
+    // at t=X followed by a DEAUTH (0x08) ~1 s later -- which the return-early
+    // watchers cannot show.  Returns OK if a PORT_RELEASE was ever seen (even
+    // if a later deauth dropped it), CMD_CRC if only deauth/mic, else TIMEOUT.
+    SdioHost::Status watchConnect(uint32_t timeoutMs = 8000);
+    uint8_t  eventLogLen() const { return m_eventLogLen; }
+    uint32_t eventLogId(uint8_t i)   const { return i < m_eventLogLen ? m_eventLog[i]  : 0; }
+    uint16_t eventLogTime(uint8_t i) const { return i < m_eventLogLen ? m_eventLogT[i] : 0; }
+    uint32_t eventLogInfo(uint8_t i) const { return i < m_eventLogLen ? m_eventLogI[i] : 0; }
+    bool     sawPortRelease() const { return m_sawPortRelease; }
     // The 4 bytes after the last event's cause -- for EVENT_DEAUTHENTICATED,
     // the low 16 bits are (near) the IEEE reason code.
     uint32_t lastEventInfo() const { return m_lastEventInfo; }
@@ -348,6 +360,12 @@ private:
     bool     m_diagEapol      = false;
     uint16_t m_diagDataFrames = 0;
     uint16_t m_diagFirstEthertype = 0;
+    static const uint8_t EVENT_LOG_CAP = 24;
+    uint32_t m_eventLog[EVENT_LOG_CAP]  = {0};   // event ids, in order seen
+    uint32_t m_eventLogI[EVENT_LOG_CAP] = {0};   // the info word after each
+    uint16_t m_eventLogT[EVENT_LOG_CAP] = {0};   // coarse ms since watch start
+    uint8_t  m_eventLogLen = 0;
+    bool     m_sawPortRelease = false;
     uint16_t m_framesSeen     = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;

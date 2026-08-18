@@ -900,6 +900,83 @@ SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
     return SdioHost::CMD_TIMEOUT;
 }
 
+// Full-window connect watcher.  Unlike diagConnect/waitForConnect, this does
+// NOT return on the first event -- it drains command-port events for the whole
+// window and logs each one, so a connect-then-drop is visible as a sequence:
+//   [t=820ms 0x2B(port-release)] [t=1900ms 0x08(deauth) info=..02]
+// which is exactly the "link went green for ~1 s then dropped" case.  It stops
+// early only once it has BOTH seen a port-release AND then a deauth/disassoc
+// (the drop), since there is nothing more to learn after that.
+SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
+    static uint8_t rx[SDIO_BLOCK_SIZE * 4];
+    m_eventLogLen = 0; m_sawPortRelease = false; m_lastEvent = 0;
+    bool sawDrop = false;
+    for (uint32_t waited = 0; waited < timeoutMs; waited++) {
+        uint8_t st = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        if (s != SdioHost::OK) return s;
+        m_intSeen |= st;
+        if (st & HOST_INT_UP_LD) {                 // drain data port, ignore body
+            uint8_t bl = 0, bu = 0;
+            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
+            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
+            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
+            for (uint8_t p = 0; p < 16; p++) {
+                if (!((bm >> p) & 1u)) continue;
+                uint8_t lo = 0, hi = 0;
+                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
+                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
+                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+                if (len == 0 || len > sizeof(rx)) continue;
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks);
+                m_diagDataFrames++;
+            }
+        }
+        if (st & CMD_PORT_UPLD) {
+            uint8_t lo = 0, hi = 0;
+            m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
+            m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
+            uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+            if (len && len <= sizeof(rx)) {
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                if (m_host.cmd53Read(1, m_ioPort | CMD_PORT_SLCT, false, rx, SDIO_BLOCK_SIZE, blocks) == SdioHost::OK) {
+                    uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
+                    if (pkttype == MLAN_TYPE_EVENT) {
+                        uint32_t ev = (uint32_t)rx[INTF_HEADER_LEN] | ((uint32_t)rx[INTF_HEADER_LEN+1] << 8) |
+                                      ((uint32_t)rx[INTF_HEADER_LEN+2] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+3] << 24);
+                        uint32_t info = 0;
+                        if (len >= INTF_HEADER_LEN + 8)
+                            info = (uint32_t)rx[INTF_HEADER_LEN+4] | ((uint32_t)rx[INTF_HEADER_LEN+5] << 8) |
+                                   ((uint32_t)rx[INTF_HEADER_LEN+6] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+7] << 24);
+                        m_lastEvent = ev; m_lastEventInfo = info;
+                        if (m_eventLogLen < EVENT_LOG_CAP) {
+                            m_eventLog[m_eventLogLen]  = ev;
+                            m_eventLogI[m_eventLogLen] = info;
+                            m_eventLogT[m_eventLogLen] = (uint16_t)waited;
+                            m_eventLogLen++;
+                        }
+                        if (ev == EVENT_PORT_RELEASE) m_sawPortRelease = true;
+                        if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED) sawDrop = true;
+                        if (m_sawPortRelease && sawDrop) break;   // connect-then-drop captured
+                    }
+                }
+            }
+        }
+        if (m_sawPortRelease && sawDrop) break;
+        if (!(st & (HOST_INT_UP_LD | CMD_PORT_UPLD))) delay(1);
+    }
+    if (m_sawPortRelease) return SdioHost::OK;
+    // any deauth/mic without a release => failure; nothing at all => timeout
+    for (uint8_t i = 0; i < m_eventLogLen; i++) {
+        uint32_t e = m_eventLog[i];
+        if (e == EVENT_DEAUTHENTICATED || e == EVENT_DISASSOCIATED ||
+            e == EVENT_MIC_ERR_UNICAST || e == EVENT_MIC_ERR_MULTICAST)
+            return SdioHost::CMD_CRC;
+    }
+    return SdioHost::CMD_TIMEOUT;
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
