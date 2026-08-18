@@ -641,6 +641,17 @@ SdioHost::Status Iw416::associate(const ScanResult &ap) {
     body[o++] = 0x01; body[o++] = 0x00;
     body[o++] = ap.ratesLen; body[o++] = 0;
     memcpy(&body[o], ap.rates, ap.ratesLen); o = (uint16_t)(o + ap.ratesLen);
+    // Auth-type TLV (TLV_TYPE_AUTH_TYPE 0x011F): tells the firmware's assoc
+    // agent which auth to run.  For WPA2-PSK, NXP's wlan_update_rsn_ie maps the
+    // PSK AKM suite (00-0F-AC-02) to AssocAgentAuth_Open (0) -- WPA2-PSK uses
+    // open-system 802.11 auth, then the embedded supplicant does the 4-way
+    // handshake.  OMITTING this TLV is why association succeeded but the
+    // supplicant never engaged and the AP deauthenticated.
+    if (ap.security == SEC_WPA2 || ap.security == SEC_WPA) {
+        body[o++] = 0x1F; body[o++] = 0x01;      // 0x011F
+        body[o++] = 2; body[o++] = 0;
+        body[o++] = 0x00; body[o++] = 0x00;      // AssocAgentAuth_Open
+    }
     // RSN TLV: re-emit the scanned RSN IE as a TLV whose type is the IE id
     // (48) -- exactly what NXP does from pmpriv->wpa_ie.  rsnIe = [48][len][body].
     if (ap.rsnLen >= 2) {
@@ -765,6 +776,9 @@ SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
                         uint32_t ev = (uint32_t)rx[INTF_HEADER_LEN] | ((uint32_t)rx[INTF_HEADER_LEN+1] << 8) |
                                       ((uint32_t)rx[INTF_HEADER_LEN+2] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+3] << 24);
                         m_lastEvent = ev;
+                        if (len >= INTF_HEADER_LEN + 8)
+                            m_lastEventInfo = (uint32_t)rx[INTF_HEADER_LEN+4] | ((uint32_t)rx[INTF_HEADER_LEN+5] << 8) |
+                                              ((uint32_t)rx[INTF_HEADER_LEN+6] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+7] << 24);
                         if (ev == EVENT_PORT_RELEASE) return SdioHost::OK;
                         if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED ||
                             ev == EVENT_MIC_ERR_UNICAST || ev == EVENT_MIC_ERR_MULTICAST)
