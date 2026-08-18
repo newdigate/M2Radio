@@ -55,6 +55,42 @@ public:
     uint32_t chunksSent()  const { return m_chunksSent; }
     uint16_t lastRequest() const { return m_lastRequest; }
 
+    // --- host command interface (available once firmware is running) ---
+    //
+    // Framing, from NXP's wifi-sdio.c SDIOPkt:
+    //   [u16 total_size][u16 pkttype=MLAN_TYPE_CMD]
+    //   [u16 command][u16 size][u16 seq_num][u16 result][body...]
+    // The whole thing is written to the I/O port with CMD53 and the reply is
+    // read back the same way once the card raises UP_LD_HOST_INT_STATUS.
+    static const uint16_t MLAN_TYPE_CMD  = 1;
+    static const uint16_t INTF_HEADER_LEN = 4;
+    static const uint32_t HOST_INT_UP_LD  = 0x01;   // data-port upload
+    // A reply to a command sent via CMD_PORT_SLCT is flagged by the COMMAND
+    // port's own bit, not the data-port UP_LD bit.  Polling UP_LD for a command
+    // response waits forever.
+    static const uint32_t CMD_PORT_UPLD    = (1u << 6);
+    static const uint32_t CMD_PORT_DNLD    = (1u << 7);
+    static const uint32_t HIM_ENABLE       = 0x01 | 0x02 | (1u << 6) | (1u << 7);
+    static const uint32_t RD_LEN_P0_L_REG = 0x18;   // 0x08 is SD8801, not this part
+    static const uint32_t RD_LEN_P0_U_REG = 0x19;
+    // Commands go to ioport | CMD_PORT_SLCT, not the bare I/O port.  The
+    // bootloader accepts the bare port during firmware download; the running
+    // firmware does not, and a command sent there is simply never answered.
+    static const uint32_t CMD_PORT_SLCT   = 0x8000;
+    static const uint16_t CMD_FUNC_INIT   = 0x00A9;
+    static const uint16_t CMD_GET_HW_SPEC = 0x0003;
+
+    SdioHost::Status sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen);
+    SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen);
+
+    // FUNC_INIT then GET_HW_SPEC.  Fills in the card's burned-in MAC and the
+    // running firmware's release number -- neither of which this code knows.
+    SdioHost::Status getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion);
+
+    // Re-read the I/O port after firmware boot; the bootloader's value need not
+    // survive the jump into the image.
+    SdioHost::Status refreshIoPort();
+
     SdioHost::Status readFwStatus(uint16_t *out);
     SdioHost::Status readCardStatus(uint8_t *out);
     SdioHost::Status readRequestedLen(uint16_t *out);
@@ -69,4 +105,5 @@ private:
     uint32_t m_bytesSent    = 0;
     uint32_t m_chunksSent   = 0;
     uint16_t m_lastRequest  = 0;
+    uint16_t m_seq          = 0;
 };
