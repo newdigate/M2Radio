@@ -587,6 +587,59 @@ SdioHost::Status Iw416::setPassphrase(const char *ssid, const char *psk) {
     return SdioHost::OK;
 }
 
+// Build the ASSOCIATE-request RSN IE from the beacon RSN IE, reproducing the
+// parts of NXP's wlan_update_rsn_ie() that matter for WPA2-PSK:
+//   * one pairwise cipher (prefer CCMP 00-0F-AC-04 over TKIP), one AKM suite
+//     (prefer PSK 00-0F-AC-02),
+//   * RSN Capabilities with the PMF bits forced to the STA's posture
+//     MFPC=1 / MFPR=0 (capable, not required) -- MFPC_BIT 7, MFPR_BIT 6,
+//     PMF_MASK 0xC0: caps = (caps | 0xC0) & ((1<<7)|(0<<6) | ~0xC0).
+// PMKID and group-mgmt-cipher tails are dropped (absent on the target APs).
+// Returns the full IE length (id+len+body), or 0 on parse failure.
+uint8_t Iw416::buildAssocRsnIe(const uint8_t *beacon, uint8_t beaconLen,
+                               uint8_t *out, uint8_t outCap) {
+    if (beaconLen < 2 + 2 + 4 + 2) return 0;         // id+len+ver+group+pwcount
+    const uint8_t *b = beacon + 2;                    // skip id, len -> body
+    uint8_t bodyLen = beacon[1];
+    const uint8_t *end = b + bodyLen;
+    const uint8_t *ver = b;                            // version (2)
+    const uint8_t *group = b + 2;                      // group cipher (4)
+    const uint8_t *p = b + 6;
+    if (p + 2 > end) return 0;
+    uint16_t pwCount = (uint16_t)(p[0] | (p[1] << 8)); p += 2;
+    if (pwCount == 0 || p + pwCount * 4 > end) return 0;
+    // Select pairwise: CCMP (id 4) if offered, else the first suite.
+    const uint8_t *pwSel = p;
+    for (uint16_t i = 0; i < pwCount; i++) if (p[i*4+3] == 4) { pwSel = p + i*4; break; }
+    p += pwCount * 4;
+    if (p + 2 > end) return 0;
+    uint16_t akmCount = (uint16_t)(p[0] | (p[1] << 8)); p += 2;
+    if (akmCount == 0 || p + akmCount * 4 > end) return 0;
+    // Select AKM: PSK (id 2) if offered, else the first suite.
+    const uint8_t *akmSel = p;
+    for (uint16_t i = 0; i < akmCount; i++) if (p[i*4+3] == 2) { akmSel = p + i*4; break; }
+    p += akmCount * 4;
+    uint16_t caps = 0;
+    if (p + 2 <= end) caps = (uint16_t)(p[0] | (p[1] << 8));
+    // Force PMF posture MFPC=1, MFPR=0, preserving other capability bits.
+    const uint16_t pmfMask = (uint16_t)((1u << 7) | (0u << 6) | (uint16_t)~0xC0u);
+    caps = (uint16_t)((caps | 0xC0u) & pmfMask);
+
+    // Emit: id(48) len ver(2) group(4) pwcount(1) pw(4) akmcount(1) akm(4) caps(2)
+    uint8_t need = 2 + 2 + 4 + 2 + 4 + 2 + 4 + 2;      // = 22 (id+len+20 body)
+    if (need > outCap) return 0;
+    uint8_t o = 0;
+    out[o++] = 48; out[o++] = 20;
+    out[o++] = ver[0]; out[o++] = ver[1];
+    memcpy(&out[o], group, 4); o += 4;
+    out[o++] = 1; out[o++] = 0;
+    memcpy(&out[o], pwSel, 4); o += 4;
+    out[o++] = 1; out[o++] = 0;
+    memcpy(&out[o], akmSel, 4); o += 4;
+    out[o++] = (uint8_t)caps; out[o++] = (uint8_t)(caps >> 8);
+    return o;
+}
+
 SdioHost::Status Iw416::deauthenticate(const uint8_t bssid[6]) {
     // HostCmd_DS_802_11_DEAUTHENTICATE: mac_addr[6] + reason_code(2).
     // Reason 3 = "STA is leaving".  Best-effort -- clears any prior
@@ -603,9 +656,11 @@ SdioHost::Status Iw416::deauthenticate(const uint8_t bssid[6]) {
 SdioHost::Status Iw416::associate(const ScanResult &ap) {
     m_assocStatus = 0xFFFF;
     m_assocCapInfo = 0;
-    // Clear any stale association first -- NXP's connect flow deauthenticates
-    // before every new attempt.  A card that associated in a prior boot leaves
-    // the AP holding that state, and a fresh association then times out.
+    // Clear any stale association first (NXP's connect flow does this).  Tested
+    // whether this clears the SSID-keyed PMK cache and breaks the handshake:
+    // it does NOT -- removing it left the handshake failing identically -- so
+    // it is kept for its original purpose (a card associated in a prior boot
+    // leaves the AP holding state, and a fresh association then times out).
     (void)deauthenticate(ap.bssid);
     delay(100);
 
@@ -645,20 +700,30 @@ SdioHost::Status Iw416::associate(const ScanResult &ap) {
     // agent which auth to run.  For WPA2-PSK, NXP's wlan_update_rsn_ie maps the
     // PSK AKM suite (00-0F-AC-02) to AssocAgentAuth_Open (0) -- WPA2-PSK uses
     // open-system 802.11 auth, then the embedded supplicant does the 4-way
-    // handshake.  OMITTING this TLV is why association succeeded but the
-    // supplicant never engaged and the AP deauthenticated.
+    // handshake.
     if (ap.security == SEC_WPA2 || ap.security == SEC_WPA) {
         body[o++] = 0x1F; body[o++] = 0x01;      // 0x011F
         body[o++] = 2; body[o++] = 0;
         body[o++] = 0x00; body[o++] = 0x00;      // AssocAgentAuth_Open
     }
-    // RSN TLV: re-emit the scanned RSN IE as a TLV whose type is the IE id
-    // (48) -- exactly what NXP does from pmpriv->wpa_ie.  rsnIe = [48][len][body].
+    // RSN TLV: NORMALISE the beacon RSN IE the way NXP's wlan_update_rsn_ie
+    // does -- do NOT echo it verbatim.  The critical difference is the RSN
+    // Capabilities PMF bits: the association request must carry the STA's own
+    // PMF posture (MFPC=1, MFPR=0 -- capable, not required), not the AP's
+    // advertised bits.  Echoing the AP's bits is why the 4-way handshake
+    // deauthed (iPhone reason 2, Onestream reason 15).  buildAssocRsnIe also
+    // reduces the pairwise/AKM lists to the single selected suite.
     if (ap.rsnLen >= 2) {
-        uint8_t rsnBodyLen = ap.rsnIe[1];
-        body[o++] = 48; body[o++] = 0;
-        body[o++] = rsnBodyLen; body[o++] = 0;
-        memcpy(&body[o], &ap.rsnIe[2], rsnBodyLen); o = (uint16_t)(o + rsnBodyLen);
+        uint8_t rsn[64];
+        uint8_t rsnLen = buildAssocRsnIe(ap.rsnIe, ap.rsnLen, rsn, sizeof(rsn));
+        if (rsnLen >= 2) {
+            m_assocRsnLen = (rsnLen > sizeof(m_assocRsn)) ? sizeof(m_assocRsn) : rsnLen;
+            memcpy(m_assocRsn, rsn, m_assocRsnLen);   // evidence for the report
+            uint8_t rsnBodyLen = rsn[1];
+            body[o++] = 48; body[o++] = 0;
+            body[o++] = rsnBodyLen; body[o++] = 0;
+            memcpy(&body[o], &rsn[2], rsnBodyLen); o = (uint16_t)(o + rsnBodyLen);
+        }
     }
 
     SdioHost::Status s = sendHostCmd(CMD_802_11_ASSOCIATE, body, o);

@@ -201,6 +201,10 @@ public:
     // AP status; 0xFFFB..0xFFFF means an internal error/timeout and status is
     // a firmware sub-code (0xFFFC = timed out waiting for the AP).
     uint16_t assocCapInfo() const { return m_assocCapInfo; }
+    // The normalised RSN IE actually sent in the last ASSOCIATE (id+len+body),
+    // for verifying the PMF-cap rewrite.
+    const uint8_t *assocRsnIe() const { return m_assocRsn; }
+    uint8_t assocRsnIeLen()   const { return m_assocRsnLen; }
     // Deauthenticate from a BSS (0x0024).  Called automatically before
     // associate() to clear stale state; exposed for explicit disconnects.
     SdioHost::Status deauthenticate(const uint8_t bssid[6]);
@@ -311,6 +315,10 @@ public:
 private:
     SdioHost::Status setCardBits(uint32_t reg, uint8_t bits,
                                  uint8_t *preOut, uint8_t *postOut);
+    // Normalise a beacon RSN IE into the association-request form (single
+    // cipher/AKM, PMF caps forced to MFPC=1/MFPR=0), per wlan_update_rsn_ie.
+    uint8_t buildAssocRsnIe(const uint8_t *beacon, uint8_t beaconLen,
+                            uint8_t *out, uint8_t outCap);
 
     SdioHost &m_host;
     SdioFunc &m_func;
@@ -323,6 +331,8 @@ private:
     uint8_t  m_scanSets       = 0;
     uint16_t m_assocStatus    = 0xFFFF;
     uint16_t m_assocCapInfo   = 0;
+    uint8_t  m_assocRsn[24]   = {0};
+    uint8_t  m_assocRsnLen    = 0;
     uint32_t m_lastEvent      = 0;
     uint32_t m_lastEventInfo  = 0;
     bool     m_diagEapol      = false;
