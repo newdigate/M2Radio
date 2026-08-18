@@ -105,6 +105,15 @@ public:
     static const uint32_t CMD_PORT_SLCT   = 0x8000;
     static const uint16_t CMD_FUNC_INIT   = 0x00A9;
     static const uint16_t CMD_GET_HW_SPEC = 0x0003;
+    static const uint16_t CMD_MAC_CONTROL = 0x0028;
+    static const uint16_t CMD_802_11_SCAN = 0x0006;
+    // MAC_CONTROL action bits (HostCmd_ACT_MAC_*): the minimum a scan needs.
+    static const uint32_t MAC_RX_ON       = 0x0001;
+    static const uint32_t MAC_TX_ON       = 0x0002;
+    static const uint32_t MAC_ETHERNETII  = 0x0010;
+    // Scan request pieces (mlan_fw.h)
+    static const uint8_t  BSS_MODE_ANY    = 0x03;
+    static const uint16_t TLV_CHANLIST    = 0x0101;  // PROPRIETARY_TLV_BASE_ID+1
 
     // Unmask HIM_ENABLE.  Call AFTER firmware download reports FIRMWARE_READY,
     // never before -- NXP's sd_wifi_post_init() is the reference.  Everything
@@ -112,12 +121,33 @@ public:
     SdioHost::Status enableHostInt();
 
     SdioHost::Status sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen);
-    SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen);
+    SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                  uint32_t timeoutMs = 2000);
     // Read command-port packets until the response to `cmd` arrives.  The port
     // also carries EVENT packets and the replies to earlier commands, so the
     // first packet read is NOT necessarily the answer -- taking it on faith is
     // how GET_HW_SPEC first "succeeded" with an all-zero MAC.
-    SdioHost::Status waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen);
+    SdioHost::Status waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                 uint32_t timeoutMs = 2000);
+
+    // MAC_CONTROL (0x0028): body is a single LE u32 of MAC_* action bits.
+    // NXP's wlan_fw_init_cfg() sends this before anything RF-facing; a scan
+    // without it is the first thing to suspect if scan() returns no sets.
+    SdioHost::Status macControl(uint32_t action);
+
+    // One 802.11 scan over the command port (legacy HostCmd 0x0006): active
+    // scan of 2.4 GHz channels 1..13, 100 ms dwell each.  Fills `out` with up
+    // to maxOut results; *outCount is what fit, scanSetsSeen() is what the
+    // card actually reported.  The response wait is long (default 15 s): 13
+    // channels x 100 ms plus firmware overhead exceeds the 2 s default.
+    struct ScanResult {
+        uint8_t bssid[6];
+        uint8_t rssi;        // raw byte from the response; dBm is -rssi
+        uint8_t channel;     // from the DS Param Set IE; 0 if absent
+        char    ssid[33];    // NUL-terminated; empty for hidden SSIDs
+    };
+    SdioHost::Status scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount);
+    uint8_t scanSetsSeen() const { return m_scanSets; }
 
     // Header fields of the last command-port packet seen by waitCmdResp:
     // pkttype (1=cmd resp, 3=event), the command/event id, and the result.
@@ -166,6 +196,7 @@ private:
     uint16_t m_lastRespType   = 0;
     uint16_t m_lastRespCmd    = 0;
     uint16_t m_lastRespResult = 0;
+    uint8_t  m_scanSets       = 0;
     uint8_t  m_cfgPre[CFG_REG_COUNT]  = {0};
     uint8_t  m_cfgPost[CFG_REG_COUNT] = {0};
     uint32_t m_ioPort       = 0;

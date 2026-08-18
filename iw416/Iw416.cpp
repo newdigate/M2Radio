@@ -210,14 +210,15 @@ SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t 
     return m_host.cmd53Write(1, m_ioPort | CMD_PORT_SLCT, false, txBuf, SDIO_BLOCK_SIZE, blocks);
 }
 
-SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen) {
+SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                     uint32_t timeoutMs) {
     // Wait for the card to flag a COMMAND-port upload.  HOST_INT_RSR was
     // configured in begin(), so HOST_INT_STATUS clears on read -- capture each
     // sample and keep the union as evidence; never write the register (NXP
     // never does, anywhere).
     uint8_t st = 0;
     bool up = false;
-    for (uint32_t i = 0; i < 2000; i++) {
+    for (uint32_t i = 0; i < timeoutMs; i++) {
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
         if (s != SdioHost::OK) return s;
         m_intSeen |= st;
@@ -247,10 +248,11 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
 // Read command-port packets until the response to `cmd` (its id with
 // HOSTCMD_RET_BIT set) arrives, discarding events and stale replies.  The
 // header of every packet seen is recorded for the probe's report.
-SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen) {
+SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                    uint32_t timeoutMs) {
     for (int tries = 0; tries < 4; tries++) {
         uint16_t len = 0;
-        SdioHost::Status s = readHostResp(buf, bufLen, &len);
+        SdioHost::Status s = readHostResp(buf, bufLen, &len, timeoutMs);
         if (s != SdioHost::OK) return s;
         if (len < 12) continue;                    // shorter than the two headers
         m_lastRespType   = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
@@ -263,6 +265,99 @@ SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen,
         }
     }
     return SdioHost::BAD_CIS;   // packets kept coming, none was the answer
+}
+
+SdioHost::Status Iw416::macControl(uint32_t action) {
+    // Body is a single LE u32 of action bits (HostCmd_DS_MAC_CONTROL).
+    uint8_t body[4] = { (uint8_t)action, (uint8_t)(action >> 8),
+                        (uint8_t)(action >> 16), (uint8_t)(action >> 24) };
+    SdioHost::Status s = sendHostCmd(CMD_MAC_CONTROL, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    return waitCmdResp(CMD_MAC_CONTROL, rx, sizeof(rx), nullptr);
+}
+
+SdioHost::Status Iw416::scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount) {
+    if (outCount) *outCount = 0;
+    m_scanSets = 0;
+
+    // Request: bss_mode + zero BSSID + one ChanList TLV, 2.4 GHz channels
+    // 1..13, active scan, 100 ms dwell (MRVDRV_ACTIVE_SCAN_CHAN_TIME).
+    const uint8_t  CHANNELS  = 13;
+    const uint16_t DWELL_MS  = 100;
+    uint8_t body[7 + 4 + CHANNELS * 7];
+    memset(body, 0, sizeof(body));
+    body[0] = BSS_MODE_ANY;                          // bssid[1..6] stay zero
+    body[7] = (uint8_t)(TLV_CHANLIST & 0xFF);
+    body[8] = (uint8_t)(TLV_CHANLIST >> 8);
+    const uint16_t tlvLen = CHANNELS * 7;
+    body[9]  = (uint8_t)(tlvLen & 0xFF);
+    body[10] = (uint8_t)(tlvLen >> 8);
+    for (uint8_t c = 0; c < CHANNELS; c++) {
+        uint8_t *p = &body[11 + c * 7];
+        p[0] = 0;                                    // radio_type: 2.4 GHz
+        p[1] = (uint8_t)(c + 1);                     // channel number
+        p[2] = 0;                                    // active, no flags
+        p[3] = (uint8_t)(DWELL_MS & 0xFF); p[4] = (uint8_t)(DWELL_MS >> 8);
+        p[5] = (uint8_t)(DWELL_MS & 0xFF); p[6] = (uint8_t)(DWELL_MS >> 8);
+    }
+
+    SdioHost::Status s = sendHostCmd(CMD_802_11_SCAN, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+
+    // The single response arrives only after every channel has been dwelt on:
+    // 13 x 100 ms plus firmware overhead, so the default 2 s wait is too
+    // short.  4 KB because a busy bench overflows the 1 KB command buffer.
+    static uint8_t rx[4096];
+    uint16_t rxLen = 0;
+    s = waitCmdResp(CMD_802_11_SCAN, rx, sizeof(rx), &rxLen, 15000);
+    if (s != SdioHost::OK) return s;
+
+    // Bound parsing by the SDIOPkt's own size field -- the CMD_RD_LEN value
+    // is block-padded and the tail of the last block is garbage.
+    uint16_t pktSize = (uint16_t)(rx[0] | ((uint16_t)rx[1] << 8));
+    if (pktSize < rxLen) rxLen = pktSize;
+
+    // Legacy response body: u16 bss_descript_size, u8 number_of_sets, then
+    // per set [u16 beacon_size][6 BSSID][1 RSSI][8 ts][2 interval][2 cap][IEs].
+    const uint16_t bodyOff = INTF_HEADER_LEN + 8;
+    if (rxLen < bodyOff + 3) return SdioHost::BAD_CIS;
+    uint8_t sets = rx[bodyOff + 2];
+    m_scanSets = sets;
+
+    const uint8_t *p = &rx[bodyOff + 3];
+    uint32_t left = (uint32_t)rxLen - (bodyOff + 3);
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < sets && left >= 2; i++) {
+        uint16_t beaconSize = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+        p += 2; left -= 2;
+        if (beaconSize == 0 || beaconSize > left) break;
+        const uint8_t *e = p;
+        p += beaconSize; left -= beaconSize;
+
+        const uint32_t FIXED = 6 + 1 + 8 + 2 + 2;    // BSSID RSSI ts intvl cap
+        if (beaconSize < FIXED) continue;
+        ScanResult r;
+        memset(&r, 0, sizeof(r));
+        memcpy(r.bssid, e, 6);
+        r.rssi = e[6];
+        const uint8_t *ie = e + FIXED;
+        uint32_t ieLeft = beaconSize - FIXED;
+        while (ieLeft >= 2) {
+            uint8_t id = ie[0], ilen = ie[1];
+            if ((uint32_t)ilen + 2 > ieLeft) break;
+            if (id == 0) {                           // SSID
+                uint8_t cpy = (ilen > 32) ? 32 : ilen;
+                memcpy(r.ssid, ie + 2, cpy);
+            } else if (id == 3 && ilen >= 1) {       // DS Param Set: channel
+                r.channel = ie[2];
+            }
+            ie += 2 + ilen; ieLeft -= 2 + (uint32_t)ilen;
+        }
+        if (n < maxOut) out[n++] = r;
+    }
+    if (outCount) *outCount = n;
+    return SdioHost::OK;
 }
 
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
