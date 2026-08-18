@@ -354,10 +354,21 @@ SdioHost::Status Iw416::scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount)
             if (id == 0) {                           // SSID
                 uint8_t cpy = (ilen > 32) ? 32 : ilen;
                 memcpy(r.ssid, ie + 2, cpy);
+            } else if (id == 1 && ilen <= 8) {       // supported rates
+                memcpy(r.rates, ie + 2, ilen);
+                r.ratesLen = ilen;
+            } else if (id == 50) {                   // extended rates -> append
+                uint8_t room = (uint8_t)(sizeof(r.rates) - r.ratesLen);
+                uint8_t cpy = (ilen > room) ? room : ilen;
+                memcpy(r.rates + r.ratesLen, ie + 2, cpy);
+                r.ratesLen = (uint8_t)(r.ratesLen + cpy);
             } else if (id == 3 && ilen >= 1) {       // DS Param Set: channel
                 r.channel = ie[2];
             } else if (id == 48) {                   // RSN IE -> WPA2/WPA3
                 hasRsn = true;
+                // Keep the whole IE (id + len + body) for ASSOCIATE.
+                uint16_t full = (uint16_t)(ilen + 2);
+                if (full <= sizeof(r.rsnIe)) { memcpy(r.rsnIe, ie, full); r.rsnLen = (uint8_t)full; }
             } else if (id == 221 && ilen >= 4 &&     // vendor IE: WPA = 00:50:F2:01
                        ie[2] == 0x00 && ie[3] == 0x50 && ie[4] == 0xF2 && ie[5] == 0x01) {
                 hasWpa = true;
@@ -540,6 +551,39 @@ SdioHost::Status Iw416::captureMonitor(MonitorFrame *out, uint8_t maxOut, uint8_
 
     if (count) *count = n;
     (void)netMonitor(false, channel);          // leave monitor mode
+    return SdioHost::OK;
+}
+
+// ---------------------------------------------------------------------------
+// W6: WPA2 association via the embedded supplicant.
+
+SdioHost::Status Iw416::setPassphrase(const char *ssid, const char *psk) {
+    // HostCmd_DS_802_11_SUPPLICANT_PMK: u16 action, u16 cache_result, then
+    // TLVs.  For a passphrase (not a precomputed PMK) send SSID + Passphrase.
+    uint16_t ssidLen = (uint16_t)strlen(ssid);
+    uint16_t pskLen  = (uint16_t)strlen(psk);
+    if (ssidLen == 0 || ssidLen > 32) return SdioHost::BAD_CIS;
+    if (pskLen < 8 || pskLen > 63)    return SdioHost::BAD_CIS;   // WPA2-PSK range
+
+    uint8_t body[4 + (4 + 32) + (4 + 63)];
+    uint16_t o = 0;
+    body[o++] = (uint8_t)ACT_GEN_SET; body[o++] = (uint8_t)(ACT_GEN_SET >> 8);
+    body[o++] = 0; body[o++] = 0;                        // cache_result
+    // SSID TLV (type 0x0000)
+    body[o++] = (uint8_t)TLV_TYPE_SSID_ID; body[o++] = (uint8_t)(TLV_TYPE_SSID_ID >> 8);
+    body[o++] = (uint8_t)ssidLen; body[o++] = (uint8_t)(ssidLen >> 8);
+    memcpy(&body[o], ssid, ssidLen); o = (uint16_t)(o + ssidLen);
+    // Passphrase TLV (type 0x013C)
+    body[o++] = (uint8_t)TLV_TYPE_PASSPHRASE; body[o++] = (uint8_t)(TLV_TYPE_PASSPHRASE >> 8);
+    body[o++] = (uint8_t)pskLen; body[o++] = (uint8_t)(pskLen >> 8);
+    memcpy(&body[o], psk, pskLen); o = (uint16_t)(o + pskLen);
+
+    SdioHost::Status s = sendHostCmd(CMD_SUPPLICANT_PMK, body, o);
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_SUPPLICANT_PMK, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    if (m_lastRespResult != 0) return SdioHost::BAD_CIS;    // firmware rejected it
     return SdioHost::OK;
 }
 

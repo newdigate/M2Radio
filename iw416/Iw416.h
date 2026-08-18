@@ -108,6 +108,10 @@ public:
     static const uint16_t CMD_MAC_CONTROL = 0x0028;
     static const uint16_t CMD_802_11_SCAN = 0x0006;
     static const uint16_t CMD_NET_MONITOR = 0x0102;
+    static const uint16_t CMD_SUPPLICANT_PMK = 0x00C4;   // embedded supplicant
+    static const uint16_t CMD_802_11_ASSOCIATE = 0x0012;
+    static const uint16_t TLV_TYPE_SSID_ID    = 0x0000;
+    static const uint16_t TLV_TYPE_PASSPHRASE = 0x013C;  // PROPRIETARY_BASE+0x3C
     // MAC_CONTROL action bits (HostCmd_ACT_MAC_*): the minimum a scan needs.
     static const uint32_t MAC_RX_ON       = 0x0001;
     static const uint32_t MAC_TX_ON       = 0x0002;
@@ -162,9 +166,27 @@ public:
         uint8_t  security;    // Security enum
         uint16_t capability;  // raw capability field (bit 4 = Privacy)
         char     ssid[33];    // NUL-terminated; empty for hidden SSIDs
+        // The full RSN IE (id 48 + len + body), kept for W6 ASSOCIATE which
+        // echoes it back to the firmware.  rsnLen is 0 for open/WEP/WPA.
+        uint8_t  rsnIe[64];
+        uint8_t  rsnLen;
+        // Supported + extended rates (IE 1 and IE 50 bodies concatenated),
+        // for the ASSOCIATE rates TLV.
+        uint8_t  rates[16];
+        uint8_t  ratesLen;
     };
     SdioHost::Status scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount);
     uint8_t scanSetsSeen() const { return m_scanSets; }
+
+    // --- W6: WPA2 association via the firmware's embedded supplicant ---
+    //
+    // Hand the firmware the SSID + passphrase (SUPPLICANT_PMK 0x00C4): it
+    // derives the PMK (PBKDF2 internally) and will run the 4-way handshake
+    // during ASSOCIATE, so the host performs no WPA2 crypto.  Must be sent
+    // before associate().  resp_result names a firmware that lacks the
+    // embedded supplicant, or a malformed request.
+    SdioHost::Status setPassphrase(const char *ssid, const char *psk);
+    uint16_t lastSuppResult() const { return m_lastRespResult; }
 
     // --- W5: data-path RX via monitor mode ---
     //
