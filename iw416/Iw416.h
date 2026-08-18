@@ -110,6 +110,7 @@ public:
     static const uint16_t CMD_NET_MONITOR = 0x0102;
     static const uint16_t CMD_SUPPLICANT_PMK = 0x00C4;   // embedded supplicant
     static const uint16_t CMD_802_11_ASSOCIATE = 0x0012;
+    static const uint16_t CMD_DEAUTHENTICATE   = 0x0024;
     static const uint16_t TLV_TYPE_SSID_ID    = 0x0000;
     static const uint16_t TLV_TYPE_PASSPHRASE = 0x013C;  // PROPRIETARY_BASE+0x3C
     // MAC_CONTROL action bits (HostCmd_ACT_MAC_*): the minimum a scan needs.
@@ -187,6 +188,41 @@ public:
     // embedded supplicant, or a malformed request.
     SdioHost::Status setPassphrase(const char *ssid, const char *psk);
     uint16_t lastSuppResult() const { return m_lastRespResult; }
+
+    // Associate to a scanned BSS (ASSOCIATE 0x0012).  For WPA2 the firmware
+    // completes the 4-way handshake using the PMK cached by setPassphrase(),
+    // so this one call both associates AND authenticates.  The 802.11
+    // association status code lands in assocStatus() -- 0 = success (a wrong
+    // PSK fails the handshake and shows here as a non-zero status).
+    SdioHost::Status associate(const ScanResult &ap);
+    uint16_t assocStatus() const { return m_assocStatus; }
+    // The ASSOCIATE response's cap_info/error-return field.  A normal IEEE
+    // capability (small value, Privacy bit maybe set) means status is a real
+    // AP status; 0xFFFB..0xFFFF means an internal error/timeout and status is
+    // a firmware sub-code (0xFFFC = timed out waiting for the AP).
+    uint16_t assocCapInfo() const { return m_assocCapInfo; }
+    // Deauthenticate from a BSS (0x0024).  Called automatically before
+    // associate() to clear stale state; exposed for explicit disconnects.
+    SdioHost::Status deauthenticate(const uint8_t bssid[6]);
+
+    // Firmware events that report the WPA2 handshake outcome.
+    static const uint32_t EVENT_PORT_RELEASE     = 0x0000002B;  // handshake OK
+    static const uint32_t EVENT_MIC_ERR_UNICAST  = 0x0000000E;
+    static const uint32_t EVENT_MIC_ERR_MULTICAST = 0x0000000D;
+    // After associate(), wait for the 4-way handshake result on the command
+    // port.  OK = EVENT_PORT_RELEASE (authenticated, port open -- proves the
+    // PSK); CMD_CRC = a MIC-error event (wrong PSK); CMD_TIMEOUT = neither in
+    // time.  lastEvent() is the last event id seen, for the report.
+    SdioHost::Status waitForConnect(uint32_t timeoutMs = 5000);
+    uint32_t lastEvent() const { return m_lastEvent; }
+    // The 4 bytes after the last event's cause -- for EVENT_DEAUTHENTICATED,
+    // the low 16 bits are (near) the IEEE reason code.
+    uint32_t lastEventInfo() const { return m_lastEventInfo; }
+    // Disassociate the retry loop should NOT keep hammering when the failure is
+    // a wrong PSK: EVENT_DEAUTHENTICATED with reason 15 means the handshake
+    // timed out, which more attempts will not fix.
+    static const uint32_t EVENT_DEAUTHENTICATED = 0x00000008;
+    static const uint32_t EVENT_DISASSOCIATED   = 0x00000009;
 
     // --- W5: data-path RX via monitor mode ---
     //
@@ -278,6 +314,10 @@ private:
     uint16_t m_lastRespCmd    = 0;
     uint16_t m_lastRespResult = 0;
     uint8_t  m_scanSets       = 0;
+    uint16_t m_assocStatus    = 0xFFFF;
+    uint16_t m_assocCapInfo   = 0;
+    uint32_t m_lastEvent      = 0;
+    uint32_t m_lastEventInfo  = 0;
     uint16_t m_framesSeen     = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;

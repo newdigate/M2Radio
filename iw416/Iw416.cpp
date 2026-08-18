@@ -587,6 +587,130 @@ SdioHost::Status Iw416::setPassphrase(const char *ssid, const char *psk) {
     return SdioHost::OK;
 }
 
+SdioHost::Status Iw416::deauthenticate(const uint8_t bssid[6]) {
+    // HostCmd_DS_802_11_DEAUTHENTICATE: mac_addr[6] + reason_code(2).
+    // Reason 3 = "STA is leaving".  Best-effort -- clears any prior
+    // association the AP (or firmware) still holds before a fresh connect.
+    uint8_t body[8];
+    memcpy(body, bssid, 6);
+    body[6] = 3; body[7] = 0;
+    SdioHost::Status s = sendHostCmd(CMD_DEAUTHENTICATE, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    return waitCmdResp(CMD_DEAUTHENTICATE, rx, sizeof(rx), nullptr, 3000);
+}
+
+SdioHost::Status Iw416::associate(const ScanResult &ap) {
+    m_assocStatus = 0xFFFF;
+    m_assocCapInfo = 0;
+    // Clear any stale association first -- NXP's connect flow deauthenticates
+    // before every new attempt.  A card that associated in a prior boot leaves
+    // the AP holding that state, and a fresh association then times out.
+    (void)deauthenticate(ap.bssid);
+    delay(100);
+
+    // HostCmd_DS_802_11_ASSOCIATE fixed head, then TLVs, mirroring NXP's
+    // wlan_cmd_802_11_associate (mlan_join.c).
+    static uint8_t body[256];
+    uint16_t o = 0;
+    // peer_sta_addr (BSSID)
+    memcpy(&body[o], ap.bssid, 6); o += 6;
+    // cap_info: the scanned capability, reserved bits masked (CAPINFO_MASK =
+    // ~(bit15|bit14|bit11|bit9)).  The Privacy bit (4) is preserved -- WPA2.
+    uint16_t cap = (uint16_t)(ap.capability & ~((1u<<15)|(1u<<14)|(1u<<11)|(1u<<9)));
+    body[o++] = (uint8_t)cap; body[o++] = (uint8_t)(cap >> 8);
+    // listen_interval, beacon_period, dtim_period
+    body[o++] = 10; body[o++] = 0;        // listen_interval = 10
+    body[o++] = 100; body[o++] = 0;       // beacon_period = 100 (informational)
+    body[o++] = 0;                        // dtim_period
+
+    uint16_t ssidLen = (uint16_t)strlen(ap.ssid);
+    // SSID TLV (0x0000)
+    body[o++] = 0x00; body[o++] = 0x00;
+    body[o++] = (uint8_t)ssidLen; body[o++] = (uint8_t)(ssidLen >> 8);
+    memcpy(&body[o], ap.ssid, ssidLen); o = (uint16_t)(o + ssidLen);
+    // PHY DS TLV (0x0003): current channel
+    body[o++] = 0x03; body[o++] = 0x00;
+    body[o++] = 1; body[o++] = 0;
+    body[o++] = ap.channel;
+    // CF/SS param TLV (0x0004): 6 zero bytes (ignored by an infrastructure STA)
+    body[o++] = 0x04; body[o++] = 0x00;
+    body[o++] = 6; body[o++] = 0;
+    memset(&body[o], 0, 6); o = (uint16_t)(o + 6);
+    // Rates TLV (0x0001): the AP's advertised rates (a safe common subset)
+    body[o++] = 0x01; body[o++] = 0x00;
+    body[o++] = ap.ratesLen; body[o++] = 0;
+    memcpy(&body[o], ap.rates, ap.ratesLen); o = (uint16_t)(o + ap.ratesLen);
+    // RSN TLV: re-emit the scanned RSN IE as a TLV whose type is the IE id
+    // (48) -- exactly what NXP does from pmpriv->wpa_ie.  rsnIe = [48][len][body].
+    if (ap.rsnLen >= 2) {
+        uint8_t rsnBodyLen = ap.rsnIe[1];
+        body[o++] = 48; body[o++] = 0;
+        body[o++] = rsnBodyLen; body[o++] = 0;
+        memcpy(&body[o], &ap.rsnIe[2], rsnBodyLen); o = (uint16_t)(o + rsnBodyLen);
+    }
+
+    SdioHost::Status s = sendHostCmd(CMD_802_11_ASSOCIATE, body, o);
+    if (s != SdioHost::OK) return s;
+
+    // The 4-way handshake happens inside this command; give it room.
+    static uint8_t rx[SDIO_BLOCK_SIZE * 4];
+    uint16_t rxLen = 0;
+    s = waitCmdResp(CMD_802_11_ASSOCIATE, rx, sizeof(rx), &rxLen, 8000);
+    if (s != SdioHost::OK) return s;
+
+    // Response body (after 4 SDIO + 8 HostCmd header) = IEEEtypes_AssocRsp:
+    // capability(2) status_code(2) a_id(2).  status_code 0 = 802.11 association
+    // succeeded.  NOTE: for WPA2 this does NOT yet prove the PSK -- open-system
+    // 802.11 auth + association complete before the 4-way handshake, so a wrong
+    // PSK still associates here and fails the handshake afterwards.  The
+    // handshake result is proven by waitForConnect() (EVENT_PORT_RELEASE).
+    const uint16_t bodyOff = INTF_HEADER_LEN + 8;
+    if (rxLen < bodyOff + 4) return SdioHost::BAD_CIS;
+    // cap_info doubles as an error return: 0xFFFF..0xFFFB are internal-error /
+    // timeout codes (e.g. 0xFFFC = timeout waiting for the AP), in which case
+    // status_code is a firmware sub-code, NOT an IEEE reject.  Capture both.
+    m_assocCapInfo = (uint16_t)(rx[bodyOff + 0] | ((uint16_t)rx[bodyOff + 1] << 8));
+    m_assocStatus  = (uint16_t)(rx[bodyOff + 2] | ((uint16_t)rx[bodyOff + 3] << 8));
+    return (m_assocStatus == 0) ? SdioHost::OK : SdioHost::BAD_CIS;
+}
+
+// Wait for the firmware to signal the WPA2 4-way handshake outcome.  Events
+// arrive on the command port (pkttype MLAN_TYPE_EVENT); the event id is the
+// u32 at INTF_HEADER_LEN.  EVENT_PORT_RELEASE (0x2B) = handshake done, port
+// authorized -- this is the un-fakeable proof the PSK was correct (a wrong PSK
+// yields a MIC-error event or a deauth, never a port release).
+SdioHost::Status Iw416::waitForConnect(uint32_t timeoutMs) {
+    static uint8_t rx[SDIO_BLOCK_SIZE * 4];
+    m_lastEvent = 0;
+    uint32_t waited = 0;
+    while (waited < timeoutMs) {
+        uint16_t len = 0;
+        SdioHost::Status s = readHostResp(rx, sizeof(rx), &len, 500);
+        if (s == SdioHost::CMD_TIMEOUT) { waited += 500; continue; }
+        if (s != SdioHost::OK) return s;
+        uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
+        if (pkttype != MLAN_TYPE_EVENT) continue;              // a cmd response
+        uint32_t ev = (uint32_t)rx[INTF_HEADER_LEN] | ((uint32_t)rx[INTF_HEADER_LEN+1] << 8) |
+                      ((uint32_t)rx[INTF_HEADER_LEN+2] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+3] << 24);
+        m_lastEvent = ev;
+        // The 4 bytes after the event cause, for diagnosis.  For
+        // EVENT_DEAUTHENTICATED this carries the IEEE reason code (its exact
+        // offset varies by event, so keep the raw word): reason 15 = 4-way
+        // handshake timeout (a wrong PSK), 2 = prior auth invalid, etc.
+        if (len >= INTF_HEADER_LEN + 8)
+            m_lastEventInfo = (uint32_t)rx[INTF_HEADER_LEN+4] | ((uint32_t)rx[INTF_HEADER_LEN+5] << 8) |
+                              ((uint32_t)rx[INTF_HEADER_LEN+6] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+7] << 24);
+        if (ev == EVENT_PORT_RELEASE) return SdioHost::OK;
+        if (ev == EVENT_MIC_ERR_UNICAST || ev == EVENT_MIC_ERR_MULTICAST)
+            return SdioHost::CMD_CRC;                          // handshake failed
+        if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED)
+            return SdioHost::CMD_CRC;                          // kicked off -- handshake failed
+        // other events (e.g. link stats) -- keep waiting
+    }
+    return SdioHost::CMD_TIMEOUT;
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
