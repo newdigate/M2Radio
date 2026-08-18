@@ -17,6 +17,7 @@
 #define INT_STATUS   REG(0x30)
 #define INT_STATUS_EN REG(0x34)
 #define INT_SIGNAL_EN REG(0x38)
+#define DATPORT      REG(0x20)
 #define MIX_CTRL     REG(0x48)
 #define VEND_SPEC    REG(0xC0)
 
@@ -167,6 +168,11 @@ SdioHost::Status SdioHost::begin() {
         *(volatile uint32_t *)0x400E8194u = 4u;   // ALT4 = USDHC1_VSELECT
         VEND_SPEC |= (1u << 1);                   // VSELECT: drive the rail to 1.8 V
         delay(10);                                // let NVCC_SD settle
+        // Read both back.  Asserting a rail switch and not checking it is how
+        // the 2026-08-17 session spent a cycle unable to say whether 1.8 V had
+        // been tested at all.
+        m_lastVendSpec = VEND_SPEC;
+        m_lastVselMux  = *(volatile uint32_t *)0x400E8194u;
     }
 
     Status s = setClock(400000);       // identification clock
@@ -290,4 +296,74 @@ SdioHost::Status SdioHost::readManfId(uint16_t *manufacturer, uint16_t *card) {
         addr += 2 + link;
     }
     return BAD_CIS;
+}
+
+// ---------------------------------------------------------------------------
+// CMD53 IO_RW_EXTENDED (block mode, PIO)
+//
+// Argument layout: bit31 R/W, bits30:28 function, bit27 block mode,
+// bit26 op code (1 = incrementing address), bits25:9 register address,
+// bits8:0 block count (0 = 512).
+static inline uint32_t cmd53Arg(bool write, uint8_t fn, uint32_t addr,
+                                bool incrAddr, bool blockMode, uint16_t count) {
+    return ((uint32_t)write << 31) | ((uint32_t)(fn & 0x7) << 28) |
+           ((uint32_t)blockMode << 27) | ((uint32_t)incrAddr << 26) |
+           ((addr & 0x1FFFFu) << 9) | (count & 0x1FFu);
+}
+
+SdioHost::Status SdioHost::cmd53(uint8_t fn, uint32_t addr, bool incrAddr, bool write,
+                                 uint8_t *buf, uint16_t blockSize, uint16_t blocks) {
+    // Program the transfer before issuing the command: BLK_ATT carries the
+    // block size and count, MIX_CTRL the direction and multi-block flags.
+    BLK_ATT  = ((uint32_t)blocks << 16) | blockSize;
+    uint32_t mix = (1u << 1);                        // BCEN, block count enable
+    if (blocks > 1) mix |= (1u << 5);                // MSBSEL, multi-block
+    if (!write)     mix |= (1u << 4);                // DTDSEL, 1 = card -> host
+    MIX_CTRL = (MIX_CTRL & ~0x3Fu) | mix;
+
+    INT_STATUS = 0xFFFFFFFFu;
+    CMD_ARG = cmd53Arg(write, fn, addr, incrAddr, true, blocks);
+    // DPSEL (bit 21) tells the controller a data phase follows.
+    CMD_XFR_TYP = ((uint32_t)53 << 24) | (1u << 21) | RSP_48 | CHK_CRC | CHK_IDX;
+
+    // Wait for command completion before touching the data port.
+    for (uint32_t i = 0; ; i++) {
+        uint32_t st = INT_STATUS;
+        if (st & INT_CMD_ERR) { m_lastIntStatus = st; INT_STATUS = st;
+                                return (st & INT_CTOE) ? CMD_TIMEOUT : CMD_CRC; }
+        if (st & INT_CC) { INT_STATUS = INT_CC; break; }
+        if (i > 1000000) { m_lastIntStatus = st; return CMD_TIMEOUT; }
+    }
+
+    // PIO the payload a word at a time, gated on the buffer-ready flags:
+    // BWEN (bit 10) for writes, BREN (bit 11) for reads.
+    uint32_t words = ((uint32_t)blockSize * blocks) / 4u;
+    uint32_t *p32 = (uint32_t *)(void *)buf;
+    const uint32_t readyBit = write ? (1u << 10) : (1u << 11);
+    for (uint32_t w = 0; w < words; w++) {
+        for (uint32_t i = 0; !(PRES_STATE & readyBit); i++) {
+            uint32_t st = INT_STATUS;
+            if (st & (1u << 15)) { m_lastIntStatus = st; return CMD_CRC; }  // ERR
+            if (i > 1000000) { m_lastIntStatus = INT_STATUS; return CMD_TIMEOUT; }
+        }
+        if (write) DATPORT = p32[w]; else p32[w] = DATPORT;
+    }
+
+    // Transfer Complete is bit 1.
+    for (uint32_t i = 0; ; i++) {
+        uint32_t st = INT_STATUS;
+        if (st & (1u << 1)) { INT_STATUS = st; m_lastIntStatus = st; return OK; }
+        if (st & (1u << 15)) { m_lastIntStatus = st; INT_STATUS = st; return CMD_CRC; }
+        if (i > 1000000) { m_lastIntStatus = st; return CMD_TIMEOUT; }
+    }
+}
+
+SdioHost::Status SdioHost::cmd53Write(uint8_t fn, uint32_t addr, bool incrAddr,
+                                      const uint8_t *src, uint16_t blockSize, uint16_t blocks) {
+    return cmd53(fn, addr, incrAddr, true, (uint8_t *)(void *)(uintptr_t)src, blockSize, blocks);
+}
+
+SdioHost::Status SdioHost::cmd53Read(uint8_t fn, uint32_t addr, bool incrAddr,
+                                     uint8_t *dst, uint16_t blockSize, uint16_t blocks) {
+    return cmd53(fn, addr, incrAddr, false, dst, blockSize, blocks);
 }

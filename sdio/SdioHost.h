@@ -61,6 +61,19 @@ public:
     // and pull-ups present these read high, so a low reading means something
     // is holding the bus down rather than merely declining to answer.
     uint32_t lastPresState()   const { return m_lastPresState; }
+    // Read back after a useIoVoltage1V8(true) request: VEND_SPEC should show
+    // bit 1 set and the mux register should read 4 (ALT4 = USDHC1_VSELECT).
+    // Both zero means the switch never happened.
+    uint32_t lastVendSpec()    const { return m_lastVendSpec; }
+    uint32_t lastVselMux()     const { return m_lastVselMux; }
+
+    // CMD53 IO_RW_EXTENDED, block mode, PIO through the USDHC data port.
+    // `incrAddr` false = fixed address, which is what a card FIFO port wants.
+    // No DMA: W2 is about proving the protocol, not throughput.
+    Status cmd53Write(uint8_t fn, uint32_t addr, bool incrAddr,
+                      const uint8_t *src, uint16_t blockSize, uint16_t blocks);
+    Status cmd53Read(uint8_t fn, uint32_t addr, bool incrAddr,
+                     uint8_t *dst, uint16_t blockSize, uint16_t blocks);
 
     // CMD52 IO_RW_DIRECT.  `fn` is the SDIO function number (0 = CCCR/CIS).
     Status cmd52Read(uint8_t fn, uint32_t addr, uint8_t *out);
@@ -72,6 +85,8 @@ public:
 
 private:
     Status sendCommand(uint8_t index, uint32_t arg, uint32_t xferFlags, uint32_t *resp);
+    Status cmd53(uint8_t fn, uint32_t addr, bool incrAddr, bool write,
+                 uint8_t *buf, uint16_t blockSize, uint16_t blocks);
     Status setClock(uint32_t hz);
 
     uint8_t  m_ioFunctions = 0;
@@ -82,4 +97,6 @@ private:
     uint32_t m_lastR4        = 0;
     uint32_t m_lastPresState = 0;
     bool     m_use1V8        = false;
+    uint32_t m_lastVendSpec  = 0;
+    uint32_t m_lastVselMux   = 0;
 };
