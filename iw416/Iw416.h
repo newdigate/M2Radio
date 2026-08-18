@@ -107,6 +107,7 @@ public:
     static const uint16_t CMD_GET_HW_SPEC = 0x0003;
     static const uint16_t CMD_MAC_CONTROL = 0x0028;
     static const uint16_t CMD_802_11_SCAN = 0x0006;
+    static const uint16_t CMD_NET_MONITOR = 0x0102;
     // MAC_CONTROL action bits (HostCmd_ACT_MAC_*): the minimum a scan needs.
     static const uint32_t MAC_RX_ON       = 0x0001;
     static const uint32_t MAC_TX_ON       = 0x0002;
@@ -114,6 +115,16 @@ public:
     // Scan request pieces (mlan_fw.h)
     static const uint8_t  BSS_MODE_ANY    = 0x03;
     static const uint16_t TLV_CHANLIST    = 0x0101;  // PROPRIETARY_TLV_BASE_ID+1
+    // NET_MONITOR request pieces (mlan_fw.h / mlan_misc.c)
+    static const uint16_t ACT_GEN_SET     = 0x0001;
+    static const uint16_t MON_FILTER_ALL  = 0x0007;  // mgmt|ctrl|data
+    static const uint16_t TLV_CHAN_BAND   = 0x012A;  // TLV_TYPE_UAP_CHAN_BAND_CONFIG
+    static const uint16_t TLV_MON_FILTER  = 0x0138;  // TLV_TYPE_UAP_STA_MAC_ADDR_FILTER
+    // Data-port RX (mlan_sdio_defs.h, SD8978 arm)
+    static const uint32_t RD_BITMAP_L_REG = 0x10;
+    static const uint32_t RD_BITMAP_U_REG = 0x11;
+    static const uint16_t MLAN_TYPE_DATA  = 0x0000;  // SDIOPkt pkttype for data
+    static const uint16_t PKT_TYPE_802DOT11 = 0x0005; // RxPD rx_pkt_type in monitor
 
     // Unmask HIM_ENABLE.  Call AFTER firmware download reports FIRMWARE_READY,
     // never before -- NXP's sd_wifi_post_init() is the reference.  Everything
@@ -148,6 +159,48 @@ public:
     };
     SdioHost::Status scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount);
     uint8_t scanSetsSeen() const { return m_scanSets; }
+
+    // --- W5: data-path RX via monitor mode ---
+    //
+    // NET_MONITOR (0x0102): put the firmware in promiscuous capture on one
+    // 2.4 GHz channel with no association.  action SET, activity 1, filter
+    // 0x07 (mgmt|ctrl|data).  resp_result names a firmware that lacks the
+    // feature rather than hanging.
+    SdioHost::Status netMonitor(bool enable, uint8_t channel);
+
+    // Reusable data-port read: poll HOST_INT_STATUS for the DATA UP_LD bit,
+    // find the lowest set RD_BITMAP port, read its RD_LEN_P<n>, CMD53-read the
+    // packet at ioport|port.  *outLen is the SDIOPkt size, *port the port used,
+    // *rxType the RxPD rx_pkt_type (valid only for MLAN_TYPE_DATA packets).
+    SdioHost::Status readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                    uint8_t *port, uint16_t *rxType, uint32_t timeoutMs = 2000);
+
+    struct MonitorFrame {
+        uint16_t frameControl;   // little-endian; 0x80 = beacon
+        uint8_t  rssi;           // dBm = -rssi (snr - nf from the RxPD)
+        uint8_t  channel;        // the monitored channel
+        uint8_t  ta[6];          // transmitter address (802.11 addr2)
+        uint8_t  bssid[6];       // addr3; meaningful for beacon/probe-resp
+        char     ssid[33];       // from IE 0 on beacon/probe-resp; else empty
+        uint16_t len;            // 802.11 frame length
+    };
+    // Enable monitor on `channel`, capture 802.11 frames for windowMs, disable.
+    // Fills up to maxOut; *count is what fit, framesSeen() is the total.
+    SdioHost::Status captureMonitor(MonitorFrame *out, uint8_t maxOut, uint8_t *count,
+                                    uint32_t windowMs, uint8_t channel);
+    uint16_t framesSeen() const { return m_framesSeen; }
+    uint16_t lastMonResult() const { return m_lastRespResult; }
+    // Capture diagnostics, for locating a frames=0 result: how many DATA
+    // UP_LD interrupts fired, how many packets were CMD53-read, the OR of all
+    // RD_BITMAP / HOST_INT_STATUS / RxPD-rx_pkt_type / SDIOPkt-pkttype values
+    // seen.  uploads=0 -> firmware uploaded nothing; reads>0 with rxtype_or
+    // lacking bit for 0x05 -> frames arrive but not as PKT_TYPE_802DOT11.
+    uint16_t dbgUploads()    const { return m_dbgUploads; }
+    uint16_t dbgReads()      const { return m_dbgReads; }
+    uint16_t dbgBitmapOr()   const { return m_dbgBitmapOr; }
+    uint8_t  dbgStatusOr()   const { return m_dbgStatusOr; }
+    uint16_t dbgRxTypeOr()   const { return m_dbgRxTypeOr; }
+    uint16_t dbgLastPktType() const { return m_dbgLastPktType; }
 
     // Header fields of the last command-port packet seen by waitCmdResp:
     // pkttype (1=cmd resp, 3=event), the command/event id, and the result.
@@ -197,6 +250,13 @@ private:
     uint16_t m_lastRespCmd    = 0;
     uint16_t m_lastRespResult = 0;
     uint8_t  m_scanSets       = 0;
+    uint16_t m_framesSeen     = 0;
+    uint16_t m_dbgUploads     = 0;
+    uint16_t m_dbgReads       = 0;
+    uint16_t m_dbgBitmapOr    = 0;
+    uint8_t  m_dbgStatusOr    = 0;
+    uint16_t m_dbgRxTypeOr    = 0;
+    uint16_t m_dbgLastPktType = 0;
     uint8_t  m_cfgPre[CFG_REG_COUNT]  = {0};
     uint8_t  m_cfgPost[CFG_REG_COUNT] = {0};
     uint32_t m_ioPort       = 0;

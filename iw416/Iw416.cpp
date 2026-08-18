@@ -360,6 +360,173 @@ SdioHost::Status Iw416::scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount)
     return SdioHost::OK;
 }
 
+// ---------------------------------------------------------------------------
+// W5: monitor mode + data-port RX.
+
+SdioHost::Status Iw416::netMonitor(bool enable, uint8_t channel) {
+    // HostCmd_DS_802_11_NET_MONITOR (mlan_misc.c wlan_cmd_802_11_net_monitor):
+    //   u16 action, u16 monitor_activity, u16 filter_flags,
+    //   ChanBand TLV [type,len,radio_type,chan_number],
+    //   Filter TLV  [type,len,filter_num].
+    uint8_t body[6 + 6 + 5];
+    memset(body, 0, sizeof(body));
+    uint16_t act = ACT_GEN_SET;
+    uint16_t on  = enable ? 1 : 0;
+    uint16_t flt = MON_FILTER_ALL;
+    body[0] = (uint8_t)act;  body[1] = (uint8_t)(act >> 8);
+    body[2] = (uint8_t)on;   body[3] = (uint8_t)(on >> 8);
+    body[4] = (uint8_t)flt;  body[5] = (uint8_t)(flt >> 8);
+    // ChanBand TLV: len=2, radio_type=0 (2.4 GHz), chan_number=channel.
+    body[6]  = (uint8_t)(TLV_CHAN_BAND & 0xFF); body[7] = (uint8_t)(TLV_CHAN_BAND >> 8);
+    body[8]  = 2; body[9] = 0;
+    body[10] = 0;             // radio_type 2.4 GHz
+    body[11] = channel;
+    // Filter TLV: len=1, filter_num=0 (capture everything, no MAC filter).
+    body[12] = (uint8_t)(TLV_MON_FILTER & 0xFF); body[13] = (uint8_t)(TLV_MON_FILTER >> 8);
+    body[14] = 1; body[15] = 0;
+    body[16] = 0;             // filter_num
+
+    SdioHost::Status s = sendHostCmd(CMD_NET_MONITOR, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_NET_MONITOR, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    // A firmware without CONFIG_NET_MONITOR answers with a non-zero result.
+    if (m_lastRespResult != 0) return SdioHost::BAD_CIS;
+    return SdioHost::OK;
+}
+
+SdioHost::Status Iw416::readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
+                                       uint8_t *port, uint16_t *rxType, uint32_t timeoutMs) {
+    // Wait for a DATA-port upload (UP_LD bit 0), distinct from the command
+    // port's bit 6.  HOST_INT_STATUS is clear-on-READ.
+    uint8_t st = 0;
+    bool up = false;
+    for (uint32_t i = 0; i < timeoutMs; i++) {
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        if (s != SdioHost::OK) return s;
+        m_intSeen |= st;
+        m_dbgStatusOr |= st;
+        if (st & HOST_INT_UP_LD) { up = true; break; }
+        delay(1);
+    }
+    if (!up) return SdioHost::CMD_TIMEOUT;
+    m_dbgUploads++;
+
+    // Which data port(s) have a packet?  Low word of RD_BITMAP is enough here.
+    uint8_t bl = 0, bu = 0;
+    SdioHost::Status s = m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);                  if (s != SdioHost::OK) return s;
+    uint16_t bitmap = (uint16_t)(bl | ((uint16_t)bu << 8));
+    m_dbgBitmapOr |= bitmap;
+    if (bitmap == 0) return SdioHost::CMD_TIMEOUT;
+
+    // Lowest set port; its length is at RD_LEN_P0 + (port << 1).
+    uint8_t p = 0;
+    while (p < 16 && !((bitmap >> p) & 1u)) p++;
+    if (p >= 16) return SdioHost::CMD_TIMEOUT;
+    if (port) *port = p;
+
+    uint8_t lo = 0, hi = 0;
+    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi); if (s != SdioHost::OK) return s;
+    uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+    if (len == 0 || len > bufLen) return SdioHost::BAD_CIS;
+
+    uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+    s = m_host.cmd53Read(1, m_ioPort | p, false, buf, SDIO_BLOCK_SIZE, blocks);
+    if (s != SdioHost::OK) return s;
+    m_dbgReads++;
+
+    // Trust the SDIOPkt's own size field, not the block-padded read length.
+    uint16_t pktSize = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
+    m_dbgLastPktType = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));   // SDIOPkt pkttype
+    if (outLen) *outLen = pktSize;
+    if (rxType) {
+        // rx_pkt_type lives in the RxPD at offset 6 (after the 4-byte SDIOPkt
+        // header): bss_type(1) bss_num(1) rx_pkt_length(2) rx_pkt_offset(2)
+        // rx_pkt_type(2).  Only meaningful for MLAN_TYPE_DATA packets.
+        *rxType = (uint16_t)(buf[INTF_HEADER_LEN + 6] |
+                             ((uint16_t)buf[INTF_HEADER_LEN + 7] << 8));
+    }
+    return SdioHost::OK;
+}
+
+SdioHost::Status Iw416::captureMonitor(MonitorFrame *out, uint8_t maxOut, uint8_t *count,
+                                       uint32_t windowMs, uint8_t channel) {
+    if (count) *count = 0;
+    m_framesSeen = 0;
+    m_dbgUploads = 0; m_dbgReads = 0; m_dbgBitmapOr = 0; m_dbgStatusOr = 0;
+    m_dbgRxTypeOr = 0; m_dbgLastPktType = 0;
+
+    SdioHost::Status s = netMonitor(true, channel);
+    if (s != SdioHost::OK) return s;
+
+    // Stop early once plenty of frames have been seen so a busy channel does
+    // not run the whole window; a quiet channel runs it out via the 200 ms
+    // per-read timeouts.  Both cases are bounded.
+    const uint16_t FRAME_CAP = 64;
+    static uint8_t rx[2048];
+    uint8_t n = 0;
+    for (uint32_t elapsed = 0; elapsed < windowMs && m_framesSeen < FRAME_CAP; ) {
+        uint16_t pktLen = 0, rxType = 0; uint8_t port = 0;
+        // Short per-read timeout so the window is honoured even when quiet.
+        SdioHost::Status rs = readDataPacket(rx, sizeof(rx), &pktLen, &port, &rxType, 200);
+        if (rs == SdioHost::CMD_TIMEOUT) { elapsed += 200; continue; }
+        if (rs != SdioHost::OK) { elapsed += 1; continue; }   // skip a bad read
+        elapsed += 1;
+        m_dbgRxTypeOr |= rxType;
+        if (rxType != PKT_TYPE_802DOT11) continue;            // not a monitor frame
+
+        // RxPD at INTF_HEADER_LEN: rx_pkt_length@2, rx_pkt_offset@4, snr@12,
+        // nf@13.  The 802.11 frame is at INTF_HEADER_LEN + rx_pkt_offset.
+        const uint8_t *rxpd = &rx[INTF_HEADER_LEN];
+        uint16_t frameLen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
+        uint16_t frameOff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
+        int8_t snr = (int8_t)rxpd[12];
+        int8_t nf  = (int8_t)rxpd[13];
+        uint32_t frameStart = (uint32_t)INTF_HEADER_LEN + frameOff;
+        if (frameLen < 24 || frameStart + frameLen > pktLen) continue;  // need a MAC hdr
+        const uint8_t *f = &rx[frameStart];
+
+        m_framesSeen++;
+        if (n >= maxOut) continue;
+
+        MonitorFrame mf;
+        memset(&mf, 0, sizeof(mf));
+        mf.frameControl = (uint16_t)(f[0] | ((uint16_t)f[1] << 8));
+        mf.rssi    = (uint8_t)(nf - snr);      // dBm = snr - nf, so -rssi
+        mf.channel = channel;
+        mf.len     = frameLen;
+        memcpy(mf.ta, &f[10], 6);              // addr2 (transmitter)
+        memcpy(mf.bssid, &f[16], 6);           // addr3 (BSSID for mgmt frames)
+
+        // Beacon (0x80) / probe response (0x50): SSID is IE 0 after the
+        // 24-byte MAC header + 12-byte fixed params (ts, interval, cap).
+        uint8_t subtype = (uint8_t)(mf.frameControl & 0xFC);
+        if (subtype == 0x80 || subtype == 0x50) {
+            uint32_t ieOff = 24 + 12;
+            const uint8_t *ie = f + ieOff;
+            uint32_t ieLeft = (frameLen > ieOff) ? (frameLen - ieOff) : 0;
+            while (ieLeft >= 2) {
+                uint8_t id = ie[0], ilen = ie[1];
+                if ((uint32_t)ilen + 2 > ieLeft) break;
+                if (id == 0) {                 // SSID
+                    uint8_t cpy = (ilen > 32) ? 32 : ilen;
+                    memcpy(mf.ssid, ie + 2, cpy);
+                    break;
+                }
+                ie += 2 + ilen; ieLeft -= 2 + (uint32_t)ilen;
+            }
+        }
+        out[n++] = mf;
+    }
+
+    if (count) *count = n;
+    (void)netMonitor(false, channel);          // leave monitor mode
+    return SdioHost::OK;
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
