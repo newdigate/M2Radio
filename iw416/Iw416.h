@@ -109,6 +109,10 @@ public:
     static const uint16_t CMD_802_11_SCAN = 0x0006;
     static const uint16_t CMD_NET_MONITOR = 0x0102;
     static const uint16_t CMD_SUPPLICANT_PMK = 0x00C4;   // embedded supplicant
+    static const uint16_t CMD_RECONF_TX_BUF  = 0x00D9;   // host TX buffer size
+    static const uint16_t CMD_11N_CFG        = 0x00CD;
+    static const uint16_t CMD_AMSDU_AGGR_CTRL = 0x00DF;
+    static const uint32_t MAC_RTS_CTS        = 0x0200;   // HostCmd_ACT_MAC_RTS_CTS_ENABLE
     static const uint16_t CMD_802_11_ASSOCIATE = 0x0012;
     static const uint16_t CMD_DEAUTHENTICATE   = 0x0024;
     static const uint16_t TLV_TYPE_SSID_ID    = 0x0000;
@@ -132,6 +136,17 @@ public:
     static const uint32_t RD_BITMAP_U_REG = 0x11;
     static const uint16_t MLAN_TYPE_DATA  = 0x0000;  // SDIOPkt pkttype for data
     static const uint16_t PKT_TYPE_802DOT11 = 0x0005; // RxPD rx_pkt_type in monitor
+    // Data-port TX (W7).  The card publishes free download ports in WR_BITMAP;
+    // the host picks a set bit and CMD53-writes to ioport|port, exactly
+    // mirroring the RD_BITMAP scheme above.  (0x14/0x15 is the SD8978 address;
+    // SD8801 uses 0x06/0x07.)
+    static const uint32_t WR_BITMAP_L_REG = 0x14;
+    static const uint32_t WR_BITMAP_U_REG = 0x15;
+    static const uint32_t HOST_INT_DN_LD  = 0x02;    // tx ports freed
+    // sizeof(TxPD) in NXP's mlan_fw.h.  Their process_pkt_hdrs() hardcodes
+    // tx_pkt_offset = 0x16 ("we'll just make this constant"), so the 802.3
+    // frame always starts 22 bytes after the SDIOPkt header.
+    static const uint16_t TXPD_LEN        = 22;
 
     // Unmask HIM_ENABLE.  Call AFTER firmware download reports FIRMWARE_READY,
     // never before -- NXP's sd_wifi_post_init() is the reference.  Everything
@@ -256,6 +271,11 @@ public:
     // timed out, which more attempts will not fix.
     static const uint32_t EVENT_DEAUTHENTICATED = 0x00000008;
     static const uint32_t EVENT_DISASSOCIATED   = 0x00000009;
+    // The AP disappearing (powered off / rebooted) is not a deauth -- the
+    // firmware reports it as LINK_LOST.  A link watcher that only knows
+    // deauth/disassoc keeps "servicing" a dead link forever (measured: the
+    // ESP AP was reflashed mid-run and the probe held connected=1 for minutes).
+    static const uint32_t EVENT_LINK_LOST       = 0x00000003;
 
     // --- W5: data-path RX via monitor mode ---
     //
@@ -271,6 +291,45 @@ public:
     // *rxType the RxPD rx_pkt_type (valid only for MLAN_TYPE_DATA packets).
     SdioHost::Status readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                     uint8_t *port, uint16_t *rxType, uint32_t timeoutMs = 2000);
+
+    // --- W7: data-path TX + connected-link service ---
+    //
+    // Send one 802.3 frame (dst[6] src[6] ethertype[2] payload) down the data
+    // path: SDIOPkt header + zeroed TxPD (tx_pkt_type 0 = ethernet) + frame,
+    // CMD53-written to the lowest free WR_BITMAP port.  CMD_TIMEOUT means the
+    // card never freed a TX buffer inside timeoutMs -- lastWrBitmap() carries
+    // the final bitmap read as evidence.
+    SdioHost::Status sendDataFrame(const uint8_t *frame, uint16_t frameLen,
+                                   uint32_t timeoutMs = 1000);
+    // RECONFIGURE_TX_BUFF (0x00D9): tell the firmware the host's per-port TX
+    // buffer size.  NXP's wlan_fw_init_cfg() sends this UNCONDITIONALLY between
+    // GET_HW_SPEC and MAC_CONTROL ("firmware looses alignment of SDIO Tx
+    // buffers" without it) -- and W7 measured exactly that: without this
+    // command every data write is accepted on the wire but never consumed, so
+    // each send permanently eats one WR_BITMAP port until the bitmap is 0.
+    SdioHost::Status reconfigureTxBuffers(uint16_t bufSize = 2048);
+    // 11N_CFG (0x00CD): HT TX capability, exactly NXP's wlan_set_11n_cfg
+    // values (GREENFIELD|SGI20|SGI40, RIFS, band both).  Part of the
+    // unconditional init sequence between MAC_CONTROL and first traffic.
+    SdioHost::Status set11nCfg();
+    // AMSDU_AGGR_CTRL (0x00DF): enable A-MSDU aggregation handling, NXP's
+    // wlan_enable_amsdu (SET, enable=1).
+    SdioHost::Status amsduAggrCtrl();
+    uint16_t lastWrBitmap() const { return m_lastWrBitmap; }
+    uint32_t dataTxCount() const { return m_dataTxCount; }
+
+    // One connected-link service poll, servicing BOTH ports from a single
+    // HOST_INT_STATUS read (the register is clear-on-read, so split polling
+    // loses bits -- same rationale as diagConnect).  Data packets: the first
+    // 802.3 frame seen is copied to frameBuf/*frameLen (later frames in the
+    // same pass are read and counted in rxDropped()).  Command-port events:
+    // recorded in lastEvent()/lastEventInfo(); a DEAUTHENTICATED/DISASSOCIATED
+    // sets *dropped.  Returns OK as soon as a frame or a drop is captured,
+    // CMD_TIMEOUT when waitMs passed quietly (not an error), else a bus error.
+    SdioHost::Status pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
+                              bool *dropped, uint32_t waitMs);
+    uint32_t rxDropped()   const { return m_rxDropped; }
+    uint32_t rxDataCount() const { return m_rxDataCount; }
 
     struct MonitorFrame {
         uint16_t frameControl;   // little-endian; 0x80 = beacon
@@ -367,6 +426,10 @@ private:
     uint8_t  m_eventLogLen = 0;
     bool     m_sawPortRelease = false;
     uint16_t m_framesSeen     = 0;
+    uint16_t m_lastWrBitmap   = 0;
+    uint32_t m_dataTxCount    = 0;
+    uint32_t m_rxDropped      = 0;
+    uint32_t m_rxDataCount    = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
     uint16_t m_dbgBitmapOr    = 0;

@@ -977,6 +977,184 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
     return SdioHost::CMD_TIMEOUT;
 }
 
+// ---------------------------------------------------------------------------
+// W7: data-path TX + connected-link service.
+
+// TX framing (NXP wifi-sdio.c process_pkt_hdrs / wlan_xmit_pkt):
+//   [u16 size][u16 pkttype=MLAN_TYPE_DATA] [TxPD, 22 bytes] [802.3 frame]
+// with TxPD.tx_pkt_offset = 22 (their hardcoded 0x16) and tx_pkt_length = the
+// frame length.  Every other TxPD field is zero for plain ethernet data
+// (tx_pkt_type 0 = 802.3, bss_type/num 0 = the STA interface).  The write
+// goes to a port whose WR_BITMAP bit the card has set; NXP round-robins
+// through them, but always-lowest-set is equivalent at this traffic level.
+SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
+                                      uint32_t timeoutMs) {
+    static uint8_t tx[SDIO_BLOCK_SIZE * 8];
+    const uint16_t total = (uint16_t)(INTF_HEADER_LEN + TXPD_LEN + frameLen);
+    if (total > sizeof(tx)) return SdioHost::BAD_CIS;
+
+    // Wait for the card to publish a free download port.
+    uint16_t bitmap = 0;
+    for (uint32_t waited = 0;; waited++) {
+        uint8_t bl = 0, bu = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, WR_BITMAP_L_REG, &bl);
+        if (s != SdioHost::OK) return s;
+        s = m_host.cmd52Read(1, WR_BITMAP_U_REG, &bu);
+        if (s != SdioHost::OK) return s;
+        bitmap = (uint16_t)(bl | ((uint16_t)bu << 8));
+        m_lastWrBitmap = bitmap;
+        if (bitmap != 0) break;
+        if (waited >= timeoutMs) return SdioHost::CMD_TIMEOUT;
+        delay(1);
+    }
+    uint8_t p = 0;
+    while (p < 16 && !((bitmap >> p) & 1u)) p++;
+
+    uint16_t blocks = (uint16_t)((total + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+    memset(tx, 0, (uint32_t)blocks * SDIO_BLOCK_SIZE);
+    tx[0] = (uint8_t)(total & 0xFF); tx[1] = (uint8_t)(total >> 8);
+    tx[2] = (uint8_t)MLAN_TYPE_DATA; tx[3] = 0;
+    // TxPD: only tx_pkt_length (offset 2) and tx_pkt_offset (offset 4) are
+    // non-zero.
+    tx[INTF_HEADER_LEN + 2] = (uint8_t)(frameLen & 0xFF);
+    tx[INTF_HEADER_LEN + 3] = (uint8_t)(frameLen >> 8);
+    tx[INTF_HEADER_LEN + 4] = (uint8_t)TXPD_LEN;
+    tx[INTF_HEADER_LEN + 5] = 0;
+    memcpy(&tx[INTF_HEADER_LEN + TXPD_LEN], frame, frameLen);
+
+    SdioHost::Status s = m_host.cmd53Write(1, m_ioPort | p, false, tx,
+                                           SDIO_BLOCK_SIZE, blocks);
+    if (s != SdioHost::OK) return s;
+    m_dataTxCount++;
+    return SdioHost::OK;
+}
+
+// HostCmd_DS_TXBUF_CFG: action(2) buff_size(2) mp_end_port(2) reserved(2).
+// NXP's wifi_prepare_reconfigure_tx_buf_cmd hardcodes SET + 2048 and leaves
+// the rest zero.
+SdioHost::Status Iw416::reconfigureTxBuffers(uint16_t bufSize) {
+    uint8_t body[8];
+    memset(body, 0, sizeof(body));
+    body[0] = (uint8_t)ACT_GEN_SET; body[1] = (uint8_t)(ACT_GEN_SET >> 8);
+    body[2] = (uint8_t)(bufSize & 0xFF); body[3] = (uint8_t)(bufSize >> 8);
+    SdioHost::Status s = sendHostCmd(CMD_RECONF_TX_BUF, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_RECONF_TX_BUF, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    if (m_lastRespResult != 0) return SdioHost::BAD_CIS;
+    return SdioHost::OK;
+}
+
+// HostCmd_DS_11N_CFG: action(2) ht_tx_cap(2) ht_tx_info(2) misc_config(2).
+// Values from NXP's wrapper_wlan_cmd_11n_cfg: httxcap = GREENFIELD(0x10) |
+// SHORT_GI_20(0x20) | SHORT_GI_40(0x40), httxinfo = RIFS(0x08), misc =
+// BAND_SELECT_BOTH(0).
+SdioHost::Status Iw416::set11nCfg() {
+    uint8_t body[8];
+    memset(body, 0, sizeof(body));
+    body[0] = (uint8_t)ACT_GEN_SET;
+    body[2] = 0x70;                    // ht_tx_cap
+    body[4] = 0x08;                    // ht_tx_info
+    SdioHost::Status s = sendHostCmd(CMD_11N_CFG, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_11N_CFG, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    return (m_lastRespResult == 0) ? SdioHost::OK : SdioHost::BAD_CIS;
+}
+
+// HostCmd_DS_AMSDU_AGGR_CTRL: action(2) enable(2) curr_buf_size(2).
+SdioHost::Status Iw416::amsduAggrCtrl() {
+    uint8_t body[6];
+    memset(body, 0, sizeof(body));
+    body[0] = (uint8_t)ACT_GEN_SET;
+    body[2] = 0x01;                    // enable
+    SdioHost::Status s = sendHostCmd(CMD_AMSDU_AGGR_CTRL, body, sizeof(body));
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_AMSDU_AGGR_CTRL, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    return (m_lastRespResult == 0) ? SdioHost::OK : SdioHost::BAD_CIS;
+}
+
+SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
+                                 bool *dropped, uint32_t waitMs) {
+    static uint8_t rx[SDIO_BLOCK_SIZE * 8];
+    if (frameLen) *frameLen = 0;
+    if (dropped) *dropped = false;
+    bool gotFrame = false, gotDrop = false;
+    for (uint32_t waited = 0; waited <= waitMs; waited++) {
+        uint8_t st = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        if (s != SdioHost::OK) return s;
+        m_intSeen |= st;
+
+        if (st & HOST_INT_UP_LD) {
+            uint8_t bl = 0, bu = 0;
+            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
+            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
+            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
+            for (uint8_t p = 0; p < 16; p++) {
+                if (!((bm >> p) & 1u)) continue;
+                uint8_t lo = 0, hi = 0;
+                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
+                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
+                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+                if (len == 0 || len > sizeof(rx)) continue;
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                if (m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks) != SdioHost::OK)
+                    continue;
+                uint16_t pktSize = (uint16_t)(rx[0] | ((uint16_t)rx[1] << 8));
+                uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
+                if (pkttype != MLAN_TYPE_DATA) continue;
+                m_rxDataCount++;
+                // RxPD: rx_pkt_length at +2, rx_pkt_offset at +4; the 802.3
+                // frame at INTF_HEADER_LEN + rx_pkt_offset.
+                const uint8_t *rxpd = &rx[INTF_HEADER_LEN];
+                uint16_t plen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
+                uint16_t poff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
+                if ((uint32_t)INTF_HEADER_LEN + poff + plen > pktSize) continue;
+                if (!gotFrame && frameBuf && plen <= bufCap) {
+                    memcpy(frameBuf, &rx[INTF_HEADER_LEN + poff], plen);
+                    if (frameLen) *frameLen = plen;
+                    gotFrame = true;
+                } else {
+                    m_rxDropped++;     // a second frame in the same pass
+                }
+            }
+        }
+        if (st & CMD_PORT_UPLD) {
+            uint8_t lo = 0, hi = 0;
+            m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
+            m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
+            uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+            if (len && len <= sizeof(rx)) {
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                if (m_host.cmd53Read(1, m_ioPort | CMD_PORT_SLCT, false, rx, SDIO_BLOCK_SIZE, blocks) == SdioHost::OK) {
+                    uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
+                    if (pkttype == MLAN_TYPE_EVENT) {
+                        uint32_t ev = (uint32_t)rx[INTF_HEADER_LEN] | ((uint32_t)rx[INTF_HEADER_LEN+1] << 8) |
+                                      ((uint32_t)rx[INTF_HEADER_LEN+2] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+3] << 24);
+                        m_lastEvent = ev;
+                        if (len >= INTF_HEADER_LEN + 8)
+                            m_lastEventInfo = (uint32_t)rx[INTF_HEADER_LEN+4] | ((uint32_t)rx[INTF_HEADER_LEN+5] << 8) |
+                                              ((uint32_t)rx[INTF_HEADER_LEN+6] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+7] << 24);
+                        if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED ||
+                            ev == EVENT_LINK_LOST) {
+                            gotDrop = true;
+                            if (dropped) *dropped = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (gotFrame || gotDrop) return SdioHost::OK;
+        if (!(st & (HOST_INT_UP_LD | CMD_PORT_UPLD))) delay(1);
+    }
+    return SdioHost::CMD_TIMEOUT;      // a quiet poll, not an error
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
