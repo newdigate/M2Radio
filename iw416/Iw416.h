@@ -151,11 +151,17 @@ public:
     // to maxOut results; *outCount is what fit, scanSetsSeen() is what the
     // card actually reported.  The response wait is long (default 15 s): 13
     // channels x 100 ms plus firmware overhead exceeds the 2 s default.
+    // Security classification of a scanned BSS, from the beacon capability
+    // Privacy bit and the RSN / WPA IEs.  W6 associates to OPEN networks
+    // first, so this is the field that decides which APs are candidates.
+    enum Security : uint8_t { SEC_OPEN = 0, SEC_WEP = 1, SEC_WPA = 2, SEC_WPA2 = 3 };
     struct ScanResult {
-        uint8_t bssid[6];
-        uint8_t rssi;        // raw byte from the response; dBm is -rssi
-        uint8_t channel;     // from the DS Param Set IE; 0 if absent
-        char    ssid[33];    // NUL-terminated; empty for hidden SSIDs
+        uint8_t  bssid[6];
+        uint8_t  rssi;        // raw byte from the response; dBm is -rssi
+        uint8_t  channel;     // from the DS Param Set IE; 0 if absent
+        uint8_t  security;    // Security enum
+        uint16_t capability;  // raw capability field (bit 4 = Privacy)
+        char     ssid[33];    // NUL-terminated; empty for hidden SSIDs
     };
     SdioHost::Status scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount);
     uint8_t scanSetsSeen() const { return m_scanSets; }

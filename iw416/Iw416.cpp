@@ -341,6 +341,11 @@ SdioHost::Status Iw416::scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount)
         memset(&r, 0, sizeof(r));
         memcpy(r.bssid, e, 6);
         r.rssi = e[6];
+        // Capability is the last 2 bytes of FIXED (offset 17..18).  Bit 4
+        // (Privacy) set means the network is encrypted; the RSN/WPA IEs below
+        // say which scheme.
+        r.capability = (uint16_t)(e[17] | ((uint16_t)e[18] << 8));
+        bool hasRsn = false, hasWpa = false;
         const uint8_t *ie = e + FIXED;
         uint32_t ieLeft = beaconSize - FIXED;
         while (ieLeft >= 2) {
@@ -351,9 +356,20 @@ SdioHost::Status Iw416::scan(ScanResult *out, uint8_t maxOut, uint8_t *outCount)
                 memcpy(r.ssid, ie + 2, cpy);
             } else if (id == 3 && ilen >= 1) {       // DS Param Set: channel
                 r.channel = ie[2];
+            } else if (id == 48) {                   // RSN IE -> WPA2/WPA3
+                hasRsn = true;
+            } else if (id == 221 && ilen >= 4 &&     // vendor IE: WPA = 00:50:F2:01
+                       ie[2] == 0x00 && ie[3] == 0x50 && ie[4] == 0xF2 && ie[5] == 0x01) {
+                hasWpa = true;
             }
             ie += 2 + ilen; ieLeft -= 2 + (uint32_t)ilen;
         }
+        // Classify most-secure-first: RSN wins, then WPA, then the bare
+        // Privacy bit (WEP), else the network is OPEN -- a W6 candidate.
+        if (hasRsn)                    r.security = SEC_WPA2;
+        else if (hasWpa)               r.security = SEC_WPA;
+        else if (r.capability & 0x0010) r.security = SEC_WEP;
+        else                           r.security = SEC_OPEN;
         if (n < maxOut) out[n++] = r;
     }
     if (outCount) *outCount = n;
