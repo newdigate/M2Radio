@@ -215,6 +215,13 @@ public:
     // time.  lastEvent() is the last event id seen, for the report.
     SdioHost::Status waitForConnect(uint32_t timeoutMs = 5000);
     uint32_t lastEvent() const { return m_lastEvent; }
+    // Diagnostic connect watcher: monitors the data port for EAPOL (0x888E)
+    // as well as the command-port event, to distinguish an embedded supplicant
+    // (no EAPOL to us) from a host supplicant (EAPOL forwarded up).
+    SdioHost::Status diagConnect(uint32_t timeoutMs = 6000);
+    bool     diagEapolSeen()      const { return m_diagEapol; }
+    uint16_t diagDataFrames()     const { return m_diagDataFrames; }
+    uint16_t diagFirstEthertype() const { return m_diagFirstEthertype; }
     // The 4 bytes after the last event's cause -- for EVENT_DEAUTHENTICATED,
     // the low 16 bits are (near) the IEEE reason code.
     uint32_t lastEventInfo() const { return m_lastEventInfo; }
@@ -318,6 +325,9 @@ private:
     uint16_t m_assocCapInfo   = 0;
     uint32_t m_lastEvent      = 0;
     uint32_t m_lastEventInfo  = 0;
+    bool     m_diagEapol      = false;
+    uint16_t m_diagDataFrames = 0;
+    uint16_t m_diagFirstEthertype = 0;
     uint16_t m_framesSeen     = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;

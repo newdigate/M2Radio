@@ -711,6 +711,73 @@ SdioHost::Status Iw416::waitForConnect(uint32_t timeoutMs) {
     return SdioHost::CMD_TIMEOUT;
 }
 
+// Diagnostic: after association, watch BOTH ports so we can tell an EMBEDDED
+// supplicant (firmware runs the 4-way handshake; EAPOL never reaches us) from a
+// HOST supplicant (firmware forwards EAPOL-Key frames, ethertype 0x888E, up the
+// data port for us to answer).  HOST_INT_STATUS is clear-on-read, so we peek it
+// once per iteration and service whichever bit is set -- delegating to the
+// per-port readers would re-poll and lose the other bit.
+SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
+    static uint8_t rx[SDIO_BLOCK_SIZE * 4];
+    m_lastEvent = 0; m_diagDataFrames = 0; m_diagEapol = false; m_diagFirstEthertype = 0;
+    for (uint32_t waited = 0; waited < timeoutMs; waited++) {
+        uint8_t st = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        if (s != SdioHost::OK) return s;
+        m_intSeen |= st;
+
+        if (st & HOST_INT_UP_LD) {                     // data port -- maybe EAPOL
+            uint8_t bl = 0, bu = 0;
+            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
+            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
+            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
+            for (uint8_t p = 0; p < 16; p++) {
+                if (!((bm >> p) & 1u)) continue;
+                uint8_t lo = 0, hi = 0;
+                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
+                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
+                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+                if (len == 0 || len > sizeof(rx)) continue;
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                if (m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks) != SdioHost::OK) continue;
+                m_diagDataFrames++;
+                // Data packet: RxPD at +4; the 802.3 frame at +4+rx_pkt_offset;
+                // ethertype at frame+12 (dest[6] src[6] ethertype[2]).
+                uint16_t frameOff = (uint16_t)(rx[INTF_HEADER_LEN+4] | ((uint16_t)rx[INTF_HEADER_LEN+5] << 8));
+                uint32_t fs = (uint32_t)INTF_HEADER_LEN + frameOff;
+                if (fs + 14 <= len) {
+                    uint16_t et = (uint16_t)((rx[fs+12] << 8) | rx[fs+13]);   // big-endian
+                    if (m_diagFirstEthertype == 0) m_diagFirstEthertype = et;
+                    if (et == 0x888E) m_diagEapol = true;                     // EAPOL
+                }
+            }
+        }
+        if (st & CMD_PORT_UPLD) {                       // command port -- event/resp
+            uint8_t lo = 0, hi = 0;
+            m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
+            m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
+            uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+            if (len && len <= sizeof(rx)) {
+                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                if (m_host.cmd53Read(1, m_ioPort | CMD_PORT_SLCT, false, rx, SDIO_BLOCK_SIZE, blocks) == SdioHost::OK) {
+                    uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
+                    if (pkttype == MLAN_TYPE_EVENT) {
+                        uint32_t ev = (uint32_t)rx[INTF_HEADER_LEN] | ((uint32_t)rx[INTF_HEADER_LEN+1] << 8) |
+                                      ((uint32_t)rx[INTF_HEADER_LEN+2] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+3] << 24);
+                        m_lastEvent = ev;
+                        if (ev == EVENT_PORT_RELEASE) return SdioHost::OK;
+                        if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED ||
+                            ev == EVENT_MIC_ERR_UNICAST || ev == EVENT_MIC_ERR_MULTICAST)
+                            return SdioHost::CMD_CRC;
+                    }
+                }
+            }
+        }
+        if (!(st & (HOST_INT_UP_LD | CMD_PORT_UPLD))) delay(1);
+    }
+    return SdioHost::CMD_TIMEOUT;
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
