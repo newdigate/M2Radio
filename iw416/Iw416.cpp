@@ -47,12 +47,35 @@ SdioHost::Status Iw416::begin() {
     s = m_host.cmd52Read(1, IO_PORT_0_REG + 2, &p2); if (s != SdioHost::OK) return s;
     m_ioPort = (uint32_t)p0 | ((uint32_t)p1 << 8) | ((uint32_t)p2 << 16);
 
-    // Ack any interrupt the bootloader already raised, then unmask.
-    uint8_t dummy = 0;
-    (void)m_host.cmd52Read(1, HOST_INT_STATUS, &dummy);
-    // Unmask the interrupts the firmware uses to flag uploads. Without this the
-    // status bits never set and every command response times out.
-    (void)m_host.cmd52Write(1, HOST_INT_MASK_REG, (uint8_t)HIM_ENABLE);
+    // Evidence: the firmware-status scratch BEFORE any configuration write.
+    // The 2026-08-18 W3 run read 0xF00B here where every earlier run read
+    // 0xFEDC, and could not say whether its own config writes had done that.
+    (void)readFwStatus(&m_fwStatusPre);
+
+    // Card-side interrupt and command-port configuration, mirroring NXP's
+    // wlan_sdio_init_ioport() (wifidriver/sdio.c, SD8978 arm) step for step.
+    // Every interrupt stays MASKED until the firmware is running --
+    // sd_wifi_post_init() is what writes HIM_ENABLE, via enableHostInt().
+    s = m_host.cmd52Write(1, HOST_INT_MASK_REG, 0x00);
+    if (s != SdioHost::OK) return s;
+    // CMD53 "new mode": without this the command port (ioport | CMD_PORT_SLCT)
+    // is not functional at all.
+    s = setCardBits(CARD_CONFIG_2_1_REG, CMD53_NEW_MODE, &m_cfgPre[0], &m_cfgPost[0]);
+    if (s != SdioHost::OK) return s;
+    // Publish command-reply lengths in CMD_RD_LEN_0/1.  Without this bit the
+    // length register never updates and a reply can never be sized.
+    s = setCardBits(CMD_CONFIG_0, CMD_PORT_RD_LEN_EN, &m_cfgPre[1], &m_cfgPost[1]);
+    if (s != SdioHost::OK) return s;
+    // Auto-reset the cmd-port Dnld/Upld ready bits when the CMD53 completes.
+    s = setCardBits(CMD_CONFIG_1, CMD_PORT_AUTO_EN, &m_cfgPre[2], &m_cfgPost[2]);
+    if (s != SdioHost::OK) return s;
+    // HOST_INT_STATUS becomes clear-on-READ.  NXP never writes that register
+    // anywhere -- the earlier ~mask write here was wrong on every axis.
+    s = setCardBits(HOST_INT_RSR_REG, HOST_INT_RSR_MASK, &m_cfgPre[3], &m_cfgPost[3]);
+    if (s != SdioHost::OK) return s;
+    // Data-path Dnld/Upld ready auto-reset.
+    s = setCardBits(CARD_MISC_CFG_REG, AUTO_RE_ENABLE_INT, &m_cfgPre[4], &m_cfgPost[4]);
+    if (s != SdioHost::OK) return s;
 
     (void)readFwStatus(nullptr);
     (void)readCardStatus(nullptr);
@@ -95,7 +118,10 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
         m_lastRequest = want;
         // A zero request after we have made progress means it stopped asking:
         // the image is in. Zero on the very first pass is a real failure.
-        if (want == 0) return (offset > 0) ? SdioHost::OK : SdioHost::CMD_TIMEOUT;
+        if (want == 0) {
+            if (offset == 0) return SdioHost::CMD_TIMEOUT;
+            break;                      // done -- fall through to the READY wait
+        }
         if (want > maxChunk) return SdioHost::BAD_CIS;   // request we cannot stage
 
         uint32_t txlen = want;
@@ -113,14 +139,45 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
         m_bytesSent = offset; m_chunksSent++;
     }
 
-    // The bootloader jumps to the image and raises FIRMWARE_READY.  Give it
-    // real time: the image is ~273 KB and the ROM verifies before starting.
+    // The bootloader jumps to the image and raises FIRMWARE_READY.  This wait
+    // runs on EVERY exit path -- including "stopped asking" -- because a
+    // caller that trusts OK and immediately sends a host command into a
+    // still-booting firmware kills it.  The 2026-08-18 W3 run did exactly
+    // that (commands ~50 ms after the last chunk) and the firmware never
+    // reached READY; NXP's sdio_post_fwdnld_check_conn_ready() polls this
+    // same register for up to 5 s before anything else may touch the card.
     for (uint32_t i = 0; i < 4000; i++) {
         uint16_t st = 0;
         if (readFwStatus(&st) == SdioHost::OK && st == FIRMWARE_READY) return SdioHost::OK;
         delay(5);
     }
     return SdioHost::CMD_TIMEOUT;
+}
+
+// Read-modify-write of a function-1 card register, as NXP's init does for
+// every configuration register it touches.  The pre-write value and a
+// read-back are kept as evidence: a register that reads the same before and
+// after, or reads 0xFF both times, is a register that did not take the write.
+SdioHost::Status Iw416::setCardBits(uint32_t reg, uint8_t bits,
+                                    uint8_t *preOut, uint8_t *postOut) {
+    uint8_t v = 0;
+    SdioHost::Status s = m_host.cmd52Read(1, reg, &v);
+    if (s != SdioHost::OK) return s;
+    if (preOut) *preOut = v;
+    s = m_host.cmd52Write(1, reg, (uint8_t)(v | bits));
+    if (s != SdioHost::OK) return s;
+    uint8_t rb = 0;
+    s = m_host.cmd52Read(1, reg, &rb);
+    if (s != SdioHost::OK) return s;
+    if (postOut) *postOut = rb;
+    return SdioHost::OK;
+}
+
+// Unmask the card's upload/download interrupts, including the command port's.
+// NXP does this only AFTER FIRMWARE_READY (sd_wifi_post_init); during the
+// bootloader phase everything stays masked.
+SdioHost::Status Iw416::enableHostInt() {
+    return m_host.cmd52Write(1, HOST_INT_MASK_REG, (uint8_t)HIM_ENABLE);
 }
 
 SdioHost::Status Iw416::refreshIoPort() {
@@ -154,24 +211,30 @@ SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t 
 }
 
 SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen) {
-    // Wait for the card to flag an upload, then take the length it publishes.
+    // Wait for the card to flag a COMMAND-port upload.  HOST_INT_RSR was
+    // configured in begin(), so HOST_INT_STATUS clears on read -- capture each
+    // sample and keep the union as evidence; never write the register (NXP
+    // never does, anywhere).
     uint8_t st = 0;
     bool up = false;
     for (uint32_t i = 0; i < 2000; i++) {
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
         if (s != SdioHost::OK) return s;
-        if (st & (HOST_INT_UP_LD | CMD_PORT_UPLD)) { up = true; break; }
+        m_intSeen |= st;
+        if (st & CMD_PORT_UPLD) { up = true; break; }
         delay(1);
     }
     if (!up) return SdioHost::CMD_TIMEOUT;
-    // Status bits are write-1-to-clear on this card too.
-    (void)m_host.cmd52Write(1, HOST_INT_STATUS,
-                            (uint8_t)~(uint8_t)(HOST_INT_UP_LD | CMD_PORT_UPLD));
 
+    // A command-port reply publishes its length in CMD_RD_LEN_0/1 (enabled by
+    // CMD_PORT_RD_LEN_EN in begin()).  RD_LEN_P0 is the DATA port's register
+    // and never updates for command replies -- reading it here is the mistake
+    // that made every W3 variant time out.
     uint8_t lo = 0, hi = 0;
-    SdioHost::Status s = m_host.cmd52Read(1, RD_LEN_P0_L_REG, &lo); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG, &hi);                  if (s != SdioHost::OK) return s;
+    SdioHost::Status s = m_host.cmd52Read(1, CMD_RD_LEN_0, &lo); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);                  if (s != SdioHost::OK) return s;
     uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+    m_lastRdLen = len;
     if (len == 0 || len > bufLen) return SdioHost::BAD_CIS;
 
     uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
@@ -181,18 +244,40 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
     return SdioHost::OK;
 }
 
+// Read command-port packets until the response to `cmd` (its id with
+// HOSTCMD_RET_BIT set) arrives, discarding events and stale replies.  The
+// header of every packet seen is recorded for the probe's report.
+SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen) {
+    for (int tries = 0; tries < 4; tries++) {
+        uint16_t len = 0;
+        SdioHost::Status s = readHostResp(buf, bufLen, &len);
+        if (s != SdioHost::OK) return s;
+        if (len < 12) continue;                    // shorter than the two headers
+        m_lastRespType   = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
+        m_lastRespCmd    = (uint16_t)(buf[4] | ((uint16_t)buf[5] << 8));
+        m_lastRespResult = (uint16_t)(buf[10] | ((uint16_t)buf[11] << 8));
+        if (m_lastRespType == MLAN_TYPE_CMD &&
+            m_lastRespCmd == (uint16_t)(cmd | HOSTCMD_RET_BIT)) {
+            if (outLen) *outLen = len;
+            return SdioHost::OK;
+        }
+    }
+    return SdioHost::BAD_CIS;   // packets kept coming, none was the answer
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;
 
-    // FUNC_INIT first, as NXP's driver does; its reply is discarded.
+    // FUNC_INIT first, as NXP's driver does.  Wait for its response (not just
+    // any packet) before the next command; its content is discarded.
     SdioHost::Status s = sendHostCmd(CMD_FUNC_INIT, nullptr, 0);
     if (s != SdioHost::OK) return s;
-    (void)readHostResp(rx, sizeof(rx), &rxLen);
+    (void)waitCmdResp(CMD_FUNC_INIT, rx, sizeof(rx), &rxLen);
 
     s = sendHostCmd(CMD_GET_HW_SPEC, nullptr, 0);
     if (s != SdioHost::OK) return s;
-    s = readHostResp(rx, sizeof(rx), &rxLen);
+    s = waitCmdResp(CMD_GET_HW_SPEC, rx, sizeof(rx), &rxLen);
     if (s != SdioHost::OK) return s;
 
     // Layout: 4 SDIO header + 8 HostCmd header, then the body:

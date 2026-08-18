@@ -60,9 +60,13 @@ public:
     // Framing, from NXP's wifi-sdio.c SDIOPkt:
     //   [u16 total_size][u16 pkttype=MLAN_TYPE_CMD]
     //   [u16 command][u16 size][u16 seq_num][u16 result][body...]
-    // The whole thing is written to the I/O port with CMD53 and the reply is
-    // read back the same way once the card raises UP_LD_HOST_INT_STATUS.
-    static const uint16_t MLAN_TYPE_CMD  = 1;
+    // The whole thing is CMD53-written to ioport | CMD_PORT_SLCT and the reply
+    // is read back the same way once the card raises CMD_PORT_UPLD (bit 6) --
+    // the data-port UP_LD bit (0) never fires for command traffic.
+    static const uint16_t MLAN_TYPE_CMD   = 1;
+    static const uint16_t MLAN_TYPE_EVENT = 3;
+    // A response echoes the request's command id with this bit set.
+    static const uint16_t HOSTCMD_RET_BIT = 0x8000;
     static const uint16_t INTF_HEADER_LEN = 4;
     static const uint32_t HOST_INT_UP_LD  = 0x01;   // data-port upload
     // A reply to a command sent via CMD_PORT_SLCT is flagged by the COMMAND
@@ -71,8 +75,30 @@ public:
     static const uint32_t CMD_PORT_UPLD    = (1u << 6);
     static const uint32_t CMD_PORT_DNLD    = (1u << 7);
     static const uint32_t HIM_ENABLE       = 0x01 | 0x02 | (1u << 6) | (1u << 7);
-    static const uint32_t RD_LEN_P0_L_REG = 0x18;   // 0x08 is SD8801, not this part
+    // DATA-port read lengths (port 0 of the multiport scheme).  A COMMAND-port
+    // reply does NOT publish its length here -- that is CMD_RD_LEN_0/1 below.
+    // (0x18/0x19 is the SD8978 address; 0x08/0x09 is SD8801.)
+    static const uint32_t RD_LEN_P0_L_REG = 0x18;
     static const uint32_t RD_LEN_P0_U_REG = 0x19;
+    // --- SD8978 "new mode" command-port configuration ---
+    // NXP's wlan_sdio_init_ioport() (wifidriver/sdio.c) performs ALL of these
+    // read-modify-writes before the firmware download, and never talks to the
+    // command port without them.  Omitting them is why W3 initially saw no
+    // response ever: CMD_PORT_RD_LEN_EN is what makes the card publish a
+    // reply's length at CMD_RD_LEN_0/1, and HOST_INT_RSR makes HOST_INT_STATUS
+    // clear on READ -- NXP never writes that register anywhere.
+    static const uint32_t HOST_INT_RSR_REG    = 0x04;
+    static const uint8_t  HOST_INT_RSR_MASK   = 0xFF;   // all bits read-to-clear
+    static const uint32_t CARD_CONFIG_2_1_REG = 0xD9;
+    static const uint8_t  CMD53_NEW_MODE      = 0x01;
+    static const uint32_t CMD_CONFIG_0        = 0xC4;
+    static const uint8_t  CMD_PORT_RD_LEN_EN  = (1u << 2);
+    static const uint32_t CMD_CONFIG_1        = 0xC5;
+    static const uint8_t  CMD_PORT_AUTO_EN    = 0x01;
+    static const uint32_t CARD_MISC_CFG_REG   = 0xD8;
+    static const uint8_t  AUTO_RE_ENABLE_INT  = (1u << 4);
+    static const uint32_t CMD_RD_LEN_0        = 0xC0;   // command-port reply length
+    static const uint32_t CMD_RD_LEN_1        = 0xC1;
     // Commands go to ioport | CMD_PORT_SLCT, not the bare I/O port.  The
     // bootloader accepts the bare port during firmware download; the running
     // firmware does not, and a command sent there is simply never answered.
@@ -80,8 +106,41 @@ public:
     static const uint16_t CMD_FUNC_INIT   = 0x00A9;
     static const uint16_t CMD_GET_HW_SPEC = 0x0003;
 
+    // Unmask HIM_ENABLE.  Call AFTER firmware download reports FIRMWARE_READY,
+    // never before -- NXP's sd_wifi_post_init() is the reference.  Everything
+    // is masked during begin(), matching wlan_sdio_init_ioport().
+    SdioHost::Status enableHostInt();
+
     SdioHost::Status sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen);
     SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen);
+    // Read command-port packets until the response to `cmd` arrives.  The port
+    // also carries EVENT packets and the replies to earlier commands, so the
+    // first packet read is NOT necessarily the answer -- taking it on faith is
+    // how GET_HW_SPEC first "succeeded" with an all-zero MAC.
+    SdioHost::Status waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen);
+
+    // Header fields of the last command-port packet seen by waitCmdResp:
+    // pkttype (1=cmd resp, 3=event), the command/event id, and the result.
+    uint16_t lastRespType()   const { return m_lastRespType; }
+    uint16_t lastRespCmd()    const { return m_lastRespCmd; }
+    uint16_t lastRespResult() const { return m_lastRespResult; }
+
+    // Evidence from the response path, for the probe's report: every
+    // HOST_INT_STATUS bit ever observed (ORed -- reads clear the register), and
+    // the last CMD_RD_LEN value.  A timeout with int_seen=0 says the card never
+    // flagged anything; int_seen with bit 6 clear says it flagged the WRONG
+    // thing; a bad cmd_rd_len says the flag came but the length did not.
+    uint8_t  intStatusSeen() const { return m_intSeen; }
+    uint16_t lastCmdRdLen()  const { return m_lastRdLen; }
+    // Evidence from begin(): the fw-status scratch BEFORE the config writes,
+    // and each config register before/after its read-modify-write, in write
+    // order: CARD_CONFIG_2_1, CMD_CONFIG_0, CMD_CONFIG_1, HOST_INT_RSR,
+    // CARD_MISC_CFG.  A register whose post value lacks the requested bits
+    // did not take the write.
+    uint16_t fwStatusPre() const { return m_fwStatusPre; }
+    const uint8_t *cfgPre()  const { return m_cfgPre; }
+    const uint8_t *cfgPost() const { return m_cfgPost; }
+    static const int CFG_REG_COUNT = 5;
 
     // FUNC_INIT then GET_HW_SPEC.  Fills in the card's burned-in MAC and the
     // running firmware's release number -- neither of which this code knows.
@@ -96,8 +155,19 @@ public:
     SdioHost::Status readRequestedLen(uint16_t *out);
 
 private:
+    SdioHost::Status setCardBits(uint32_t reg, uint8_t bits,
+                                 uint8_t *preOut, uint8_t *postOut);
+
     SdioHost &m_host;
     SdioFunc &m_func;
+    uint8_t  m_intSeen      = 0;
+    uint16_t m_lastRdLen    = 0;
+    uint16_t m_fwStatusPre  = 0;
+    uint16_t m_lastRespType   = 0;
+    uint16_t m_lastRespCmd    = 0;
+    uint16_t m_lastRespResult = 0;
+    uint8_t  m_cfgPre[CFG_REG_COUNT]  = {0};
+    uint8_t  m_cfgPost[CFG_REG_COUNT] = {0};
     uint32_t m_ioPort       = 0;
     uint16_t m_fwStatus     = 0;
     uint8_t  m_cardStatus   = 0;
