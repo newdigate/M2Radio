@@ -84,6 +84,9 @@ SdioHost::Status Iw416::begin() {
 }
 
 SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
+    // A fresh firmware starts both data-port rings at slot 0.
+    m_txPort = 0;
+    m_rxPort = 0;
     // One 256-byte staging block, zero-padded for the final short chunk.
     // NXP always writes whole blocks (calculate_sdio_write_params sets
     // buflen = SDIO_BLOCK_SIZE regardless of txlen), so we do the same.
@@ -423,6 +426,78 @@ SdioHost::Status Iw416::netMonitor(bool enable, uint8_t channel) {
     return SdioHost::OK;
 }
 
+SdioHost::Status Iw416::readRdBitmap32(uint32_t *out) {
+    uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+    SdioHost::Status s;
+    s = m_host.cmd52Read(1, RD_BITMAP_L_REG,  &b0); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_U_REG,  &b1); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_1L_REG, &b2); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_1U_REG, &b3); if (s != SdioHost::OK) return s;
+    *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    return SdioHost::OK;
+}
+
+SdioHost::Status Iw416::readWrBitmap32(uint32_t *out) {
+    uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+    SdioHost::Status s;
+    s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); if (s != SdioHost::OK) return s;
+    *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    return SdioHost::OK;
+}
+
+SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
+                                       uint8_t *portOut) {
+    // The firmware uploads to ports strictly in ring order, so the only port
+    // worth checking is m_rxPort.  (Verified against NXP's own stack with
+    // CONFIG_WIFI_IO_DEBUG: rd_bitmap walks 0x100, 0x200, 0x400... as the
+    // ESP's 1 Hz broadcasts arrive -- see transcript_hw_evkb.txt W8.)
+    uint32_t bitmap = 0;
+    SdioHost::Status s = readRdBitmap32(&bitmap);
+    if (s != SdioHost::OK) return s;
+    m_dbgBitmapOr |= bitmap;
+    if (!(bitmap & (1u << m_rxPort))) {
+        if (bitmap != 0) {
+            // Bitmap has a packet somewhere else: the ring model was wrong or
+            // the firmware restarted.  Resync (counted) rather than starve.
+            uint8_t p = 0;
+            while (p < MAX_DATA_PORTS && !((bitmap >> p) & 1u)) p++;
+            m_rxPort = p;
+            m_rxRingResyncs++;
+        } else {
+            return SdioHost::CMD_TIMEOUT;      // nothing pending
+        }
+    }
+    const uint8_t p = m_rxPort;
+    if (portOut) *portOut = p;
+
+    uint8_t lo = 0, hi = 0;
+    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); if (s != SdioHost::OK) return s;
+    uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+    if (len == 0) return SdioHost::CMD_TIMEOUT;
+
+    // Always read into scratch and consume the ring slot -- an unread port
+    // stalls every later upload, so "too big" must still drain the packet.
+    static uint8_t scratch[SDIO_BLOCK_SIZE * 16];
+    if (len > sizeof(scratch)) return SdioHost::BAD_CIS;   // cannot drain; bug
+    uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+    s = m_host.cmd53Read(1, m_ioPort | p, false, scratch, SDIO_BLOCK_SIZE, blocks);
+    if (s != SdioHost::OK) return s;
+    m_rxPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
+    m_dbgReads++;
+
+    // Trust the SDIOPkt's own size field, not the block-padded read length.
+    uint16_t pktSize = (uint16_t)(scratch[0] | ((uint16_t)scratch[1] << 8));
+    if (pktSize > len) pktSize = len;
+    if (outLen) *outLen = pktSize;
+    if (pktSize > bufCap) return SdioHost::BAD_CIS;        // read+dropped
+    memcpy(buf, scratch, pktSize);
+    return SdioHost::OK;
+}
+
 SdioHost::Status Iw416::readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                        uint8_t *port, uint16_t *rxType, uint32_t timeoutMs) {
     // Wait for a DATA-port upload (UP_LD bit 0), distinct from the command
@@ -440,33 +515,12 @@ SdioHost::Status Iw416::readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *
     if (!up) return SdioHost::CMD_TIMEOUT;
     m_dbgUploads++;
 
-    // Which data port(s) have a packet?  Low word of RD_BITMAP is enough here.
-    uint8_t bl = 0, bu = 0;
-    SdioHost::Status s = m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);                  if (s != SdioHost::OK) return s;
-    uint16_t bitmap = (uint16_t)(bl | ((uint16_t)bu << 8));
-    m_dbgBitmapOr |= bitmap;
-    if (bitmap == 0) return SdioHost::CMD_TIMEOUT;
-
-    // Lowest set port; its length is at RD_LEN_P0 + (port << 1).
-    uint8_t p = 0;
-    while (p < 16 && !((bitmap >> p) & 1u)) p++;
-    if (p >= 16) return SdioHost::CMD_TIMEOUT;
-    if (port) *port = p;
-
-    uint8_t lo = 0, hi = 0;
-    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi); if (s != SdioHost::OK) return s;
-    uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-    if (len == 0 || len > bufLen) return SdioHost::BAD_CIS;
-
-    uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-    s = m_host.cmd53Read(1, m_ioPort | p, false, buf, SDIO_BLOCK_SIZE, blocks);
+    // Read the upload at the RX ring position (W8: the ports are a 32-slot
+    // ring, not a pick-lowest-bit pool).
+    uint16_t pktSize = 0;
+    SdioHost::Status s = readRingPacket(buf, bufLen, &pktSize, port);
     if (s != SdioHost::OK) return s;
-    m_dbgReads++;
 
-    // Trust the SDIOPkt's own size field, not the block-padded read length.
-    uint16_t pktSize = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
     m_dbgLastPktType = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));   // SDIOPkt pkttype
     if (outLen) *outLen = pktSize;
     if (rxType) {
@@ -846,19 +900,10 @@ SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
         m_intSeen |= st;
 
         if (st & HOST_INT_UP_LD) {                     // data port -- maybe EAPOL
-            uint8_t bl = 0, bu = 0;
-            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
-            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
-            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
-            for (uint8_t p = 0; p < 16; p++) {
-                if (!((bm >> p) & 1u)) continue;
-                uint8_t lo = 0, hi = 0;
-                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
-                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
-                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-                if (len == 0 || len > sizeof(rx)) continue;
-                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-                if (m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks) != SdioHost::OK) continue;
+            for (;;) {
+                uint16_t len = 0;
+                SdioHost::Status rs = readRingPacket(rx, sizeof(rx), &len, nullptr);
+                if (rs != SdioHost::OK) break;         // drained or dropped
                 m_diagDataFrames++;
                 // Data packet: RxPD at +4; the 802.3 frame at +4+rx_pkt_offset;
                 // ethertype at frame+12 (dest[6] src[6] ethertype[2]).
@@ -917,19 +962,9 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
         if (s != SdioHost::OK) return s;
         m_intSeen |= st;
         if (st & HOST_INT_UP_LD) {                 // drain data port, ignore body
-            uint8_t bl = 0, bu = 0;
-            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
-            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
-            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
-            for (uint8_t p = 0; p < 16; p++) {
-                if (!((bm >> p) & 1u)) continue;
-                uint8_t lo = 0, hi = 0;
-                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
-                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
-                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-                if (len == 0 || len > sizeof(rx)) continue;
-                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-                m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks);
+            for (;;) {
+                uint16_t len = 0;
+                if (readRingPacket(rx, sizeof(rx), &len, nullptr) != SdioHost::OK) break;
                 m_diagDataFrames++;
             }
         }
@@ -993,22 +1028,22 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     const uint16_t total = (uint16_t)(INTF_HEADER_LEN + TXPD_LEN + frameLen);
     if (total > sizeof(tx)) return SdioHost::BAD_CIS;
 
-    // Wait for the card to publish a free download port.
-    uint16_t bitmap = 0;
+    // Wait for OUR ring port to be free.  W8: the 32 download ports are a
+    // ring; the firmware transmits each write promptly but only re-publishes
+    // freed ports in a batch once the host has written the ring's top (NXP's
+    // own comment: DN_LD "is usually when we write to port most significant
+    // port").  So the port to watch is m_txPort, and picking "lowest set bit"
+    // instead permanently stalls at 16 sends on a 16-bit bitmap view.
+    uint32_t bitmap = 0;
     for (uint32_t waited = 0;; waited++) {
-        uint8_t bl = 0, bu = 0;
-        SdioHost::Status s = m_host.cmd52Read(1, WR_BITMAP_L_REG, &bl);
+        SdioHost::Status s = readWrBitmap32(&bitmap);
         if (s != SdioHost::OK) return s;
-        s = m_host.cmd52Read(1, WR_BITMAP_U_REG, &bu);
-        if (s != SdioHost::OK) return s;
-        bitmap = (uint16_t)(bl | ((uint16_t)bu << 8));
         m_lastWrBitmap = bitmap;
-        if (bitmap != 0) break;
+        if (bitmap & (1u << m_txPort)) break;
         if (waited >= timeoutMs) return SdioHost::CMD_TIMEOUT;
         delay(1);
     }
-    uint8_t p = 0;
-    while (p < 16 && !((bitmap >> p) & 1u)) p++;
+    const uint8_t p = m_txPort;
 
     uint16_t blocks = (uint16_t)((total + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
     memset(tx, 0, (uint32_t)blocks * SDIO_BLOCK_SIZE);
@@ -1025,6 +1060,7 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     SdioHost::Status s = m_host.cmd53Write(1, m_ioPort | p, false, tx,
                                            SDIO_BLOCK_SIZE, blocks);
     if (s != SdioHost::OK) return s;
+    m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
     m_dataTxCount++;
     return SdioHost::OK;
 }
@@ -1091,21 +1127,13 @@ SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *f
         m_intSeen |= st;
 
         if (st & HOST_INT_UP_LD) {
-            uint8_t bl = 0, bu = 0;
-            m_host.cmd52Read(1, RD_BITMAP_L_REG, &bl);
-            m_host.cmd52Read(1, RD_BITMAP_U_REG, &bu);
-            uint16_t bm = (uint16_t)(bl | ((uint16_t)bu << 8));
-            for (uint8_t p = 0; p < 16; p++) {
-                if (!((bm >> p) & 1u)) continue;
-                uint8_t lo = 0, hi = 0;
-                m_host.cmd52Read(1, RD_LEN_P0_L_REG + (p << 1), &lo);
-                m_host.cmd52Read(1, RD_LEN_P0_U_REG + (p << 1), &hi);
-                uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-                if (len == 0 || len > sizeof(rx)) continue;
-                uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-                if (m_host.cmd53Read(1, m_ioPort | p, false, rx, SDIO_BLOCK_SIZE, blocks) != SdioHost::OK)
-                    continue;
-                uint16_t pktSize = (uint16_t)(rx[0] | ((uint16_t)rx[1] << 8));
+            // Drain every upload queued at the ring position (W8: the 32
+            // ports are a ring; the packets sit at consecutive slots).
+            for (;;) {
+                uint16_t pktSize = 0;
+                SdioHost::Status rs = readRingPacket(rx, sizeof(rx), &pktSize, nullptr);
+                if (rs == SdioHost::CMD_TIMEOUT) break;         // ring drained
+                if (rs != SdioHost::OK) break;                  // dropped/bus error
                 uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
                 if (pkttype != MLAN_TYPE_DATA) continue;
                 m_rxDataCount++;

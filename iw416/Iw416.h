@@ -131,17 +131,28 @@ public:
     static const uint16_t MON_FILTER_ALL  = 0x0007;  // mgmt|ctrl|data
     static const uint16_t TLV_CHAN_BAND   = 0x012A;  // TLV_TYPE_UAP_CHAN_BAND_CONFIG
     static const uint16_t TLV_MON_FILTER  = 0x0138;  // TLV_TYPE_UAP_STA_MAC_ADDR_FILTER
-    // Data-port RX (mlan_sdio_defs.h, SD8978 arm)
-    static const uint32_t RD_BITMAP_L_REG = 0x10;
-    static const uint32_t RD_BITMAP_U_REG = 0x11;
+    // Data-port RX (mlan_sdio_defs.h, SD8978 arm).
+    // ★ W8: the SD8978 has THIRTY-TWO data ports, not sixteen, and both
+    // directions are RINGS.  The firmware uploads each successive RX packet to
+    // the NEXT port (0,1,2,...,31, wrap), and only recycles TX download ports
+    // in a batch when the host has written the ring's top.  A driver that only
+    // reads the low 16 bitmap bits loses every upload after the ring position
+    // passes 15 -- which is exactly what the W5 monitor capture did (16 frames
+    // = ring slots 0..15), leaving W6/W7 blind to EAPOL and every data frame.
+    static const uint32_t RD_BITMAP_L_REG  = 0x10;
+    static const uint32_t RD_BITMAP_U_REG  = 0x11;
+    static const uint32_t RD_BITMAP_1L_REG = 0x12;
+    static const uint32_t RD_BITMAP_1U_REG = 0x13;
+    static const uint8_t  MAX_DATA_PORTS   = 32;     // mlan MAX_PORT for SD8978
     static const uint16_t MLAN_TYPE_DATA  = 0x0000;  // SDIOPkt pkttype for data
     static const uint16_t PKT_TYPE_802DOT11 = 0x0005; // RxPD rx_pkt_type in monitor
     // Data-port TX (W7).  The card publishes free download ports in WR_BITMAP;
-    // the host picks a set bit and CMD53-writes to ioport|port, exactly
-    // mirroring the RD_BITMAP scheme above.  (0x14/0x15 is the SD8978 address;
-    // SD8801 uses 0x06/0x07.)
-    static const uint32_t WR_BITMAP_L_REG = 0x14;
-    static const uint32_t WR_BITMAP_U_REG = 0x15;
+    // the host writes the ring port (m_txPort) at ioport|port.  (0x14..0x17 is
+    // the SD8978 address; SD8801 uses 0x06/0x07 and has only 16 ports.)
+    static const uint32_t WR_BITMAP_L_REG  = 0x14;
+    static const uint32_t WR_BITMAP_U_REG  = 0x15;
+    static const uint32_t WR_BITMAP_1L_REG = 0x16;
+    static const uint32_t WR_BITMAP_1U_REG = 0x17;
     static const uint32_t HOST_INT_DN_LD  = 0x02;    // tx ports freed
     // sizeof(TxPD) in NXP's mlan_fw.h.  Their process_pkt_hdrs() hardcodes
     // tx_pkt_offset = 0x16 ("we'll just make this constant"), so the 802.3
@@ -315,8 +326,16 @@ public:
     // AMSDU_AGGR_CTRL (0x00DF): enable A-MSDU aggregation handling, NXP's
     // wlan_enable_amsdu (SET, enable=1).
     SdioHost::Status amsduAggrCtrl();
-    uint16_t lastWrBitmap() const { return m_lastWrBitmap; }
+    uint32_t lastWrBitmap() const { return m_lastWrBitmap; }
     uint32_t dataTxCount() const { return m_dataTxCount; }
+    // Ring positions, for the probe's report: which TX/RX port the driver will
+    // use next.  Both reset to 0 when the firmware is (re)downloaded.
+    uint8_t  txPort() const { return m_txPort; }
+    uint8_t  rxPort() const { return m_rxPort; }
+    // Times the RX ring position disagreed with the bitmap and was resynced to
+    // the lowest set bit.  Zero is the expected value; non-zero says the ring
+    // model missed something and the resync kept data flowing anyway.
+    uint16_t rxRingResyncs() const { return m_rxRingResyncs; }
 
     // One connected-link service poll, servicing BOTH ports from a single
     // HOST_INT_STATUS read (the register is clear-on-read, so split polling
@@ -353,7 +372,7 @@ public:
     // lacking bit for 0x05 -> frames arrive but not as PKT_TYPE_802DOT11.
     uint16_t dbgUploads()    const { return m_dbgUploads; }
     uint16_t dbgReads()      const { return m_dbgReads; }
-    uint16_t dbgBitmapOr()   const { return m_dbgBitmapOr; }
+    uint32_t dbgBitmapOr()   const { return m_dbgBitmapOr; }
     uint8_t  dbgStatusOr()   const { return m_dbgStatusOr; }
     uint16_t dbgRxTypeOr()   const { return m_dbgRxTypeOr; }
     uint16_t dbgLastPktType() const { return m_dbgLastPktType; }
@@ -396,6 +415,17 @@ public:
 private:
     SdioHost::Status setCardBits(uint32_t reg, uint8_t bits,
                                  uint8_t *preOut, uint8_t *postOut);
+    // Full 32-bit multiport bitmaps (all four bytes each).
+    SdioHost::Status readRdBitmap32(uint32_t *out);
+    SdioHost::Status readWrBitmap32(uint32_t *out);
+    // Read the upload waiting at the RX ring position, if any: check the
+    // rd-bitmap bit at m_rxPort, read RD_LEN_P<m_rxPort>, CMD53-read the
+    // packet (into an internal scratch so an oversized packet still CONSUMES
+    // its ring slot -- skipping a port wedges the ring), advance the ring,
+    // copy out.  CMD_TIMEOUT = nothing at the ring position (not an error).
+    // BAD_CIS = packet read and dropped (did not fit bufCap).
+    SdioHost::Status readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
+                                    uint8_t *portOut);
     // Normalise a beacon RSN IE into the association-request form (single
     // cipher/AKM, PMF caps forced to MFPC=1/MFPR=0), per wlan_update_rsn_ie.
     uint8_t buildAssocRsnIe(const uint8_t *beacon, uint8_t beaconLen,
@@ -426,13 +456,16 @@ private:
     uint8_t  m_eventLogLen = 0;
     bool     m_sawPortRelease = false;
     uint16_t m_framesSeen     = 0;
-    uint16_t m_lastWrBitmap   = 0;
+    uint32_t m_lastWrBitmap   = 0;
     uint32_t m_dataTxCount    = 0;
     uint32_t m_rxDropped      = 0;
     uint32_t m_rxDataCount    = 0;
+    uint8_t  m_txPort         = 0;   // TX download-port ring position
+    uint8_t  m_rxPort         = 0;   // RX upload-port ring position
+    uint16_t m_rxRingResyncs  = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
-    uint16_t m_dbgBitmapOr    = 0;
+    uint32_t m_dbgBitmapOr    = 0;
     uint8_t  m_dbgStatusOr    = 0;
     uint16_t m_dbgRxTypeOr    = 0;
     uint16_t m_dbgLastPktType = 0;
