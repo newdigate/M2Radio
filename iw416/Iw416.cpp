@@ -587,6 +587,49 @@ SdioHost::Status Iw416::setPassphrase(const char *ssid, const char *psk) {
     return SdioHost::OK;
 }
 
+SdioHost::Status Iw416::queryPmk(const char *ssid, uint8_t out32[32],
+                                 bool *pmkFound, bool *pmkNonZero) {
+    if (pmkFound) *pmkFound = false;
+    if (pmkNonZero) *pmkNonZero = false;
+    // SUPPLICANT_PMK, action GET, with just an SSID TLV -> the firmware returns
+    // the cached PMK for that SSID as a PMK TLV (0x0144) if it has derived one.
+    uint16_t ssidLen = (uint16_t)strlen(ssid);
+    if (ssidLen == 0 || ssidLen > 32) return SdioHost::BAD_CIS;
+    uint8_t body[4 + 4 + 32];
+    uint16_t o = 0;
+    body[o++] = (uint8_t)HostCmd_ACT_GET; body[o++] = (uint8_t)(HostCmd_ACT_GET >> 8);
+    body[o++] = 0; body[o++] = 0;                        // cache_result
+    body[o++] = (uint8_t)TLV_TYPE_SSID_ID; body[o++] = (uint8_t)(TLV_TYPE_SSID_ID >> 8);
+    body[o++] = (uint8_t)ssidLen; body[o++] = (uint8_t)(ssidLen >> 8);
+    memcpy(&body[o], ssid, ssidLen); o = (uint16_t)(o + ssidLen);
+
+    SdioHost::Status s = sendHostCmd(CMD_SUPPLICANT_PMK, body, o);
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    uint16_t rxLen = 0;
+    s = waitCmdResp(CMD_SUPPLICANT_PMK, rx, sizeof(rx), &rxLen);
+    if (s != SdioHost::OK) return s;
+
+    // Response body (after 4 SDIO + 8 HostCmd header): action(2) cache_result(2)
+    // then TLVs.  Walk them for the PMK TLV (0x0144).
+    uint16_t p = INTF_HEADER_LEN + 8 + 4;
+    while (p + 4 <= rxLen) {
+        uint16_t t = (uint16_t)(rx[p] | (rx[p+1] << 8));
+        uint16_t l = (uint16_t)(rx[p+2] | (rx[p+3] << 8));
+        if (p + 4 + l > rxLen) break;
+        if (t == TLV_TYPE_PMK && l >= 32) {
+            if (pmkFound) *pmkFound = true;
+            memcpy(out32, &rx[p + 4], 32);
+            bool nz = false;
+            for (int i = 0; i < 32; i++) if (out32[i]) { nz = true; break; }
+            if (pmkNonZero) *pmkNonZero = nz;
+            return SdioHost::OK;
+        }
+        p = (uint16_t)(p + 4 + l);
+    }
+    return SdioHost::OK;   // no PMK TLV -> pmkFound stays false
+}
+
 // Build the ASSOCIATE-request RSN IE from the beacon RSN IE, reproducing the
 // parts of NXP's wlan_update_rsn_ie() that matter for WPA2-PSK:
 //   * one pairwise cipher (prefer CCMP 00-0F-AC-04 over TKIP), one AKM suite

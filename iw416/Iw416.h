@@ -113,6 +113,7 @@ public:
     static const uint16_t CMD_DEAUTHENTICATE   = 0x0024;
     static const uint16_t TLV_TYPE_SSID_ID    = 0x0000;
     static const uint16_t TLV_TYPE_PASSPHRASE = 0x013C;  // PROPRIETARY_BASE+0x3C
+    static const uint16_t TLV_TYPE_PMK        = 0x0144;  // PROPRIETARY_BASE+0x44
     // MAC_CONTROL action bits (HostCmd_ACT_MAC_*): the minimum a scan needs.
     static const uint32_t MAC_RX_ON       = 0x0001;
     static const uint32_t MAC_TX_ON       = 0x0002;
@@ -122,6 +123,7 @@ public:
     static const uint16_t TLV_CHANLIST    = 0x0101;  // PROPRIETARY_TLV_BASE_ID+1
     // NET_MONITOR request pieces (mlan_fw.h / mlan_misc.c)
     static const uint16_t ACT_GEN_SET     = 0x0001;
+    static const uint16_t HostCmd_ACT_GET = 0x0000;
     static const uint16_t MON_FILTER_ALL  = 0x0007;  // mgmt|ctrl|data
     static const uint16_t TLV_CHAN_BAND   = 0x012A;  // TLV_TYPE_UAP_CHAN_BAND_CONFIG
     static const uint16_t TLV_MON_FILTER  = 0x0138;  // TLV_TYPE_UAP_STA_MAC_ADDR_FILTER
@@ -188,6 +190,14 @@ public:
     // embedded supplicant, or a malformed request.
     SdioHost::Status setPassphrase(const char *ssid, const char *psk);
     uint16_t lastSuppResult() const { return m_lastRespResult; }
+
+    // Query the PMK the firmware cached for `ssid` (SUPPLICANT_PMK, action GET).
+    // Decisive test of the embedded supplicant: a non-zero 32-byte PMK proves
+    // the firmware derived it (supplicant present + keyed); an absent/zero PMK
+    // proves SUPPLICANT_PMK is inert (no embedded supplicant in this blob).
+    // *pmkNonZero and *pmkFound report the outcome; out32 gets the bytes.
+    SdioHost::Status queryPmk(const char *ssid, uint8_t out32[32],
+                              bool *pmkFound, bool *pmkNonZero);
 
     // Associate to a scanned BSS (ASSOCIATE 0x0012).  For WPA2 the firmware
     // completes the 4-way handshake using the PMK cached by setPassphrase(),
