@@ -1213,26 +1213,48 @@ SdioHost::Status Iw416::connectStation(const char *ssid, const char *psk,
     if (s != SdioHost::OK) return s;
     int idx = -1;
     for (uint8_t i = 0; i < n; i++) {
+        // First match wins -- fine for the single-AP bench; a multi-BSSID
+        // SSID would deterministically pick the first scan entry, not the
+        // strongest.
         if (strcmp(aps[i].ssid, ssid) == 0) { idx = i; break; }
     }
     if (idx < 0) return SdioHost::BAD_CIS;         // SSID not in the scan
-    m_connectedAp = aps[idx];
+    // Local, not m_connectedAp: a failed connect must not clobber the last
+    // successful AP (or leave a half-set one if there's never been one).
+    const ScanResult *found = &aps[idx];
 
     if (psk && psk[0]) {
         // Use the SCANNED SSID bytes as the PBKDF2 salt (authoritative --
         // they are what the AP beacons), not the caller's spelling.
-        s = setPassphrase(m_connectedAp.ssid, psk);
+        s = setPassphrase(found->ssid, psk);
         if (s != SdioHost::OK) return s;
+        // The firmware derives the PMK (PBKDF2) asynchronously after
+        // SUPPLICANT_PMK; associating before it's cached races the
+        // handshake.  W6 measured the derivation completing within ~300 ms;
+        // 50 ms plus associate()'s own internal deauth delay has been
+        // reliable on silicon.
         delay(50);
     }
+    SdioHost::Status lastFail = SdioHost::CMD_CRC;
     for (uint8_t a = 0; a < attempts; a++) {
-        s = associate(m_connectedAp);
-        if (s != SdioHost::OK) continue;
+        s = associate(*found);
+        if (s != SdioHost::OK) { lastFail = s; continue; }
         SdioHost::Status w = watchConnect(2500);
         // Probe rule: OK or a quiet TIMEOUT = up; CMD_CRC = rejected.
-        if (w != SdioHost::CMD_CRC) return SdioHost::OK;
+        if (w != SdioHost::CMD_CRC) {
+            m_connectedAp = *found;   // success-gated: only path that sets it
+            return SdioHost::OK;
+        }
+        lastFail = SdioHost::CMD_CRC;
+        // Per the EVENT_DEAUTHENTICATED comment above (lastEventInfo()'s low
+        // 16 bits carry the IEEE reason code): reason 15 means the handshake
+        // timed out, which more attempts will not fix -- stop retrying.
+        if (lastEvent() == EVENT_DEAUTHENTICATED &&
+            (lastEventInfo() & 0xFFFFu) == 15u) {
+            break;
+        }
     }
-    return SdioHost::CMD_CRC;
+    return lastFail;
 }
 
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {

@@ -246,12 +246,23 @@ public:
     SdioHost::Status deauthenticate(const uint8_t bssid[6]);
 
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
-    // against the beacon SSID) -> setPassphrase (skipped when psk is NULL or
-    // empty -> open network) -> associate -> watchConnect, retrying the
-    // associate up to `attempts` times on a rejection (CMD_CRC).  OK means
-    // associated and settled (probe rule: no deauth in the watch window; a
-    // port-release is not required here).  BAD_CIS = SSID not found in the
-    // scan.  connectedAp() is valid after OK.
+    // against the beacon SSID; first match wins -- fine for a single-AP
+    // bench, but a multi-BSSID SSID deterministically picks the first scan
+    // entry, not the strongest) -> setPassphrase (skipped when psk is NULL
+    // or empty -> open network) -> associate -> watchConnect, retrying the
+    // associate up to `attempts` times on a rejection (CMD_CRC).
+    // Short-circuits the retry loop early on EVENT_DEAUTHENTICATED reason 15
+    // (handshake timeout -- see the EVENT_DEAUTHENTICATED comment below;
+    // more attempts won't fix it).  OK means associated and settled (probe
+    // rule: no deauth in the watch window; a port-release is not required
+    // here) -- connectedAp() is updated ONLY on this path, immediately
+    // before returning OK.  BAD_CIS = SSID not found in the scan.  Any other
+    // return is the transport failure that stopped the last attempt:
+    // CMD_CRC means the last attempt was rejected/handshake-refused, other
+    // codes are the underlying bus/command error that associate() or
+    // watchConnect() reported.  After a non-OK return, connectedAp() still
+    // holds the LAST SUCCESSFUL connect's AP (or an empty ScanResult if
+    // there has never been one) -- never the failed attempt's AP.
     SdioHost::Status connectStation(const char *ssid, const char *psk,
                                     uint8_t attempts = 3);
     const ScanResult &connectedAp() const { return m_connectedAp; }
