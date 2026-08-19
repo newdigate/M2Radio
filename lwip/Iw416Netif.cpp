@@ -41,7 +41,13 @@ static void frameSink(void *vctx, const uint8_t *frame, uint16_t len) {
 bool iw416NetifPoll(struct netif *netif) {
     Iw416 *iw = (Iw416 *)netif->state;
     bool dropped = false;
-    (void)iw->serviceLink(frameSink, netif, &dropped, 0);
-    if (dropped) { netif_set_link_down(netif); return false; }
+    SdioHost::Status st = iw->serviceLink(frameSink, netif, &dropped, 0);
+    // A bus error (anything but OK/CMD_TIMEOUT) has to present as link-down
+    // too: otherwise a wedged card just stops incrementing rx/tx counters
+    // while the netif and DHCP lease keep sitting there looking healthy.
+    if (dropped || (st != SdioHost::OK && st != SdioHost::CMD_TIMEOUT)) {
+        netif_set_link_down(netif);
+        return false;
+    }
     return true;
 }

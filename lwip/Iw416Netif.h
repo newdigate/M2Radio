@@ -7,7 +7,7 @@
 //             &iw416 /* state */, iw416NetifInit, ethernet_input);
 //   ...
 //   loop: if (!iw416NetifPoll(&nif)) { /* link dropped: reconnect, then
-//            netif_set_link_up(&nif); } sys_check_timeouts();
+//            netif_set_link_up(&nif); */ } sys_check_timeouts();
 #pragma once
 #include "lwip/netif.h"
 #include "lwip/err.h"
@@ -18,6 +18,7 @@ class Iw416;
 err_t iw416NetifInit(struct netif *netif);
 
 // One driver service pass: deliver every pending RX frame into lwip and
-// record link events.  Returns false when the link dropped (the netif is
-// marked link-down; the caller owns reconnect + netif_set_link_up).
+// record link events.  Returns false when the link dropped OR the SDIO bus
+// errored (the netif is marked link-down; the caller owns reconnect +
+// netif_set_link_up).
 bool iw416NetifPoll(struct netif *netif);
