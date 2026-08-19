@@ -463,10 +463,13 @@ SdioHost::Status Iw416::netMonitor(bool enable, uint8_t channel) {
 SdioHost::Status Iw416::readRdBitmap32(uint32_t *out) {
     uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     SdioHost::Status s;
-    s = m_host.cmd52Read(1, RD_BITMAP_L_REG,  &b0); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_BITMAP_U_REG,  &b1); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_BITMAP_1L_REG, &b2); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_BITMAP_1U_REG, &b3); if (s != SdioHost::OK) return s;
+    // W11: counted at the call site into m_cmd52PollsSvc -- see that
+    // counter's comment in Iw416.h for why (this helper is shared beyond
+    // serviceLink()).
+    s = m_host.cmd52Read(1, RD_BITMAP_L_REG,  &b0); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_U_REG,  &b1); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_1L_REG, &b2); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_BITMAP_1U_REG, &b3); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
     *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
     return SdioHost::OK;
 }
@@ -474,10 +477,12 @@ SdioHost::Status Iw416::readRdBitmap32(uint32_t *out) {
 SdioHost::Status Iw416::readWrBitmap32(uint32_t *out) {
     uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     SdioHost::Status s;
-    s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); if (s != SdioHost::OK) return s;
+    // W11: this is the CMD52 traffic sendDataFrame's wait loop pays per poll
+    // -- see m_cmd52PollsTx's comment in Iw416.h.
+    s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
     *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
     return SdioHost::OK;
 }
@@ -508,8 +513,8 @@ SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *
     if (portOut) *portOut = p;
 
     uint8_t lo = 0, hi = 0;
-    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
     uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
     if (len == 0) return SdioHost::CMD_TIMEOUT;
 
@@ -518,7 +523,11 @@ SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *
     static uint8_t scratch[SDIO_BLOCK_SIZE * 16];
     if (len > sizeof(scratch)) return SdioHost::BAD_CIS;   // cannot drain; bug
     uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+    // W11: the RX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
+    // counters' comment in Iw416.h.  Counted only on a successful read, to
+    // match m_dbgReads/m_rxPort's own success-only bookkeeping just below.
     s = m_host.cmd53Read(1, m_ioPort | p, false, scratch, SDIO_BLOCK_SIZE, blocks);
+    if (s == SdioHost::OK) { m_cmd53Count++; m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE; }
     if (s != SdioHost::OK) return s;
     m_rxPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
     m_dbgReads++;
@@ -1095,6 +1104,11 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     SdioHost::Status s = m_host.cmd53Write(1, m_ioPort | p, false, tx,
                                            SDIO_BLOCK_SIZE, blocks);
     if (s != SdioHost::OK) return s;
+    // W11: the TX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
+    // counters' comment in Iw416.h.  m_cmd53Bytes takes the block-padded
+    // length actually issued (blocks * SDIO_BLOCK_SIZE), not frameLen.
+    m_cmd53Count++;
+    m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE;
     m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
     m_dataTxCount++;
     return SdioHost::OK;
@@ -1157,6 +1171,7 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
     for (uint32_t waited = 0; waited <= waitMs; waited++) {
         uint8_t st = 0;
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        m_cmd52PollsSvc++;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
         if (s != SdioHost::OK) return s;
         m_intSeen |= st;
 
@@ -1185,9 +1200,13 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
             uint8_t lo = 0, hi = 0;
             m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
             m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
+            m_cmd52PollsSvc += 2;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
             uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
             if (len && len <= sizeof(rx)) {
                 uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
+                // NOTE (W11): this CMD53 is the command/event port, not data --
+                // deliberately excluded from m_cmd53Count/m_cmd53Bytes, which
+                // are data-port-only (see their comment in Iw416.h).
                 if (m_host.cmd53Read(1, m_ioPort | CMD_PORT_SLCT, false, rx, SDIO_BLOCK_SIZE, blocks) == SdioHost::OK) {
                     uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
                     if (pkttype == MLAN_TYPE_EVENT) {

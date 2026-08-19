@@ -293,6 +293,18 @@ public:
     uint32_t psConfirmFails() const { return m_psConfirmFails; } // sendSleepConfirm's send failed
     uint32_t psHostWakes()    const { return m_psHostWakes; }    // wakeCardIfSleeping actually wrote HOST_POWER_UP
 
+    // W11: bus-attribution counters, for throughput work -- how much of the
+    // SDIO bus a frame actually costs.  See the m_cmd52PollsTx/m_cmd52PollsSvc/
+    // m_cmd53Count/m_cmd53Bytes/m_cmd53ByteMode declarations below for the
+    // exact attribution rules (what counts as "Tx" vs "Svc", why
+    // wakeCardIfSleeping()'s write is excluded, and why the RX helpers are
+    // counted at the CMD52/CMD53 call site rather than by caller).
+    uint32_t cmd52PollsTx()   const { return m_cmd52PollsTx; }   // sendDataFrame's wr_bitmap wait
+    uint32_t cmd52PollsSvc()  const { return m_cmd52PollsSvc; }  // serviceLink + its RX helpers
+    uint32_t cmd53Count()     const { return m_cmd53Count; }     // data CMD53s, both directions
+    uint32_t cmd53Bytes()     const { return m_cmd53Bytes; }     // bytes actually issued on the bus
+    uint32_t cmd53ByteMode()  const { return m_cmd53ByteMode; }  // of those, how many were BYTE mode
+
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
     // against the beacon SSID; first match wins -- fine for a single-AP
     // bench, but a multi-BSSID SSID deterministically picks the first scan
@@ -597,6 +609,40 @@ private:
     uint32_t m_psWakes   = 0;
     uint32_t m_psConfirmFails = 0;   // sendSleepConfirm's sendHostCmd failed
     uint32_t m_psHostWakes    = 0;   // wakeCardIfSleeping actually wrote HOST_POWER_UP
+    // W11: bus-attribution counters (throughput work) -- per-frame SDIO bus
+    // cost, split by call path.  Attribution rules:
+    //  - wakeCardIfSleeping()'s CMD52 write is deliberately NOT counted in
+    //    either cmd52Polls* counter -- it is PS overhead already visible via
+    //    psHostWakes(), and counting it here would conflate PS wake cost
+    //    with steady-state polling cost.
+    //  - m_cmd52PollsTx counts only readWrBitmap32()'s CMD52 reads, which is
+    //    called solely from sendDataFrame's wr_bitmap wait loop.
+    //  - m_cmd52PollsSvc counts serviceLink()'s own HOST_INT_STATUS and
+    //    CMD_RD_LEN_0/1 reads, plus readRdBitmap32()/readRingPacket()'s CMD52
+    //    reads.  The latter two are also reached from diagConnect(),
+    //    watchConnect() and readDataPacket() (connection-setup/monitor
+    //    diagnostics, not serviceLink) -- splitting that by caller would need
+    //    an extra parameter threaded through a hot RX path for no throughput
+    //    benefit, so these are counted at the CMD52 call site instead of by
+    //    call path; m_cmd52PollsSvc is therefore "RX/service-side CMD52
+    //    polling", not strictly "polls issued while inside serviceLink()".
+    //  - m_cmd53Count/m_cmd53Bytes count only DATA-port CMD53s: sendDataFrame's
+    //    TX write and readRingPacket's RX read (both directions of actual
+    //    frame traffic).  Command/event-port CMD53s (sendHostCmd,
+    //    serviceLink's own command-port read, readHostResp, ...) are out of
+    //    scope -- they carry no data-plane payload.  m_cmd53Bytes is the
+    //    block-padded transfer length actually issued on the bus
+    //    (blockSize * blocks), not the caller's unpadded frame/packet length.
+    //  - m_cmd53ByteMode counts data CMD53s issued in SDIO byte mode.
+    //    SdioHost::cmd53() hardcodes block mode (cmd53Arg's blockMode
+    //    argument is always `true` -- see sdio/SdioHost.cpp), so this driver
+    //    can never issue one; the counter exists to prove that rather than
+    //    assume it, and is expected to read 0 always.
+    uint32_t m_cmd52PollsTx   = 0;
+    uint32_t m_cmd52PollsSvc  = 0;
+    uint32_t m_cmd53Count     = 0;
+    uint32_t m_cmd53Bytes     = 0;
+    uint32_t m_cmd53ByteMode  = 0;
     bool     m_diagEapol      = false;
     uint16_t m_diagDataFrames = 0;
     uint16_t m_diagFirstEthertype = 0;
