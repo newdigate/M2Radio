@@ -193,6 +193,7 @@ SdioHost::Status Iw416::refreshIoPort() {
 }
 
 SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen) {
+    wakeCardIfSleeping();
     static uint8_t txBuf[SDIO_BLOCK_SIZE * 4];
     const uint16_t hostLen = (uint16_t)(8 + bodyLen);          // HostCmd header + body
     const uint16_t total   = (uint16_t)(INTF_HEADER_LEN + hostLen);
@@ -1024,6 +1025,7 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
 // through them, but always-lowest-set is equivalent at this traffic level.
 SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                       uint32_t timeoutMs) {
+    wakeCardIfSleeping();
     static uint8_t tx[SDIO_BLOCK_SIZE * 8];
     const uint16_t total = (uint16_t)(INTF_HEADER_LEN + TXPD_LEN + frameLen);
     if (total > sizeof(tx)) return SdioHost::BAD_CIS;
@@ -1162,6 +1164,12 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                         if (len >= INTF_HEADER_LEN + 8)
                             m_lastEventInfo = (uint32_t)rx[INTF_HEADER_LEN+4] | ((uint32_t)rx[INTF_HEADER_LEN+5] << 8) |
                                               ((uint32_t)rx[INTF_HEADER_LEN+6] << 16) | ((uint32_t)rx[INTF_HEADER_LEN+7] << 24);
+                        if (ev == EVENT_PS_SLEEP && m_psEnabled) {
+                            sendSleepConfirm();
+                        } else if (ev == EVENT_PS_AWAKE) {
+                            m_psState = PS_AWAKE;
+                            m_psWakes++;
+                        }
                         if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED ||
                             ev == EVENT_LINK_LOST) {
                             gotDrop = true;
@@ -1205,8 +1213,66 @@ void Iw416::pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
     }
 }
 
+void Iw416::wakeCardIfSleeping() {
+    if (!m_psEnabled || m_psState == PS_AWAKE) return;
+    (void)m_host.cmd52Write(1, 0x00, HOST_POWER_UP);
+    // The fw raises EVENT_PS_AWAKE via the normal event path; state flips
+    // there.  2 ms covers the measured wake latency; the caller's own
+    // timeout/retry handles a slow wake.
+    delay(2);
+    m_psState = PS_AWAKE;   // optimistic: the next event will re-assert truth
+}
+
+SdioHost::Status Iw416::setIeeePs(bool enable) {
+    uint8_t body[24];
+    uint16_t len = 0;
+    memset(body, 0, sizeof(body));
+    if (enable) {
+        // action, ps_bitmap, then the PS_PARAM TLV with NXP's defaults.
+        body[0] = (uint8_t)PS_EN_AUTO_PS; body[1] = (uint8_t)(PS_EN_AUTO_PS >> 8);
+        body[2] = (uint8_t)PS_BITMAP_STA; body[3] = (uint8_t)(PS_BITMAP_STA >> 8);
+        body[4] = (uint8_t)TLV_TYPE_PS_PARAM; body[5] = (uint8_t)(TLV_TYPE_PS_PARAM >> 8);
+        body[6] = 14; body[7] = 0;                        // TLV len: 7 u16 fields
+        // ps_param, STRUCT order (mlan_fw.h __ps_param): null_pkt_interval=0,
+        // multiple_dtims=1, bcn_miss_timeout=5, local_listen_interval=0,
+        // adhoc_wake_period=0, mode=1 (fw picks PS_POLL vs NULL), delay_to_ps=1000.
+        body[10] = 1;                                     // multiple_dtims
+        body[12] = 5;                                     // bcn_miss_timeout
+        body[18] = 1;                                     // mode = auto
+        body[20] = (uint8_t)(1000 & 0xFF); body[21] = (uint8_t)(1000 >> 8);  // delay_to_ps
+        len = 22;
+    } else {
+        body[0] = (uint8_t)PS_DIS_AUTO_PS; body[1] = (uint8_t)(PS_DIS_AUTO_PS >> 8);
+        body[2] = (uint8_t)PS_BITMAP_STA; body[3] = (uint8_t)(PS_BITMAP_STA >> 8);
+        len = 4;
+    }
+    SdioHost::Status s = sendHostCmd(CMD_PS_MODE_ENH, body, len);
+    if (s != SdioHost::OK) return s;
+    static uint8_t rx[SDIO_BLOCK_SIZE * 2];
+    s = waitCmdResp(CMD_PS_MODE_ENH, rx, sizeof(rx), nullptr);
+    if (s != SdioHost::OK) return s;
+    if (m_lastRespResult != 0) return SdioHost::BAD_CIS;
+    m_psEnabled = enable;
+    m_psState   = PS_AWAKE;
+    return SdioHost::OK;
+}
+
+// Sent in direct answer to EVENT_PS_SLEEP.  Body: action=SLEEP_CONFIRM,
+// resp_ctrl=1 (RESP_NEEDED).  The fw acks with a 0x80E4/action-5 response on
+// the command port and THEN sleeps; the ack flows through the normal demux
+// (it is not a tracked command, so waitCmdResp is not used here).
+void Iw416::sendSleepConfirm() {
+    uint8_t body[4];
+    body[0] = (uint8_t)PS_SLEEP_CONFIRM; body[1] = (uint8_t)(PS_SLEEP_CONFIRM >> 8);
+    body[2] = 1; body[3] = 0;            // resp_ctrl = RESP_NEEDED
+    if (sendHostCmd(CMD_PS_MODE_ENH, body, sizeof(body)) == SdioHost::OK) {
+        m_psState = PS_SLEEPING;
+        m_psSleeps++;
+    }
+}
+
 SdioHost::Status Iw416::connectStation(const char *ssid, const char *psk,
-                                       uint8_t attempts) {
+                                       uint8_t attempts, bool psOn) {
     static ScanResult aps[12];
     uint8_t n = 0;
     SdioHost::Status s = scan(aps, 12, &n);
@@ -1243,6 +1309,11 @@ SdioHost::Status Iw416::connectStation(const char *ssid, const char *psk,
         // Probe rule: OK or a quiet TIMEOUT = up; CMD_CRC = rejected.
         if (w != SdioHost::CMD_CRC) {
             m_connectedAp = *found;   // success-gated: only path that sets it
+            // W10: IEEE PS on by default -- the idle RX-death workaround
+            // (see the PS constants block in the header).  Best-effort: a
+            // failure is recorded in lastRespResult but does not fail the
+            // connect.
+            if (psOn) (void)setIeeePs(true);
             return SdioHost::OK;
         }
         lastFail = SdioHost::CMD_CRC;

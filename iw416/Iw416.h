@@ -245,6 +245,34 @@ public:
     // associate() to clear stale state; exposed for explicit disconnects.
     SdioHost::Status deauthenticate(const uint8_t bssid[6]);
 
+    // --- W10: IEEE power save (the fw idle RX-death workaround) ---
+    // The firmware's data-RX engine dies stochastically after ~14-44 min of
+    // SPARSE traffic when IEEE PS is off (silicon A/B incl. NXP's own stack,
+    // 2026-08-19; PS on survived 60 min clean -- see the W10 handoff in the
+    // rt1176-evkb repo).  NXP ships PS on by default; so do we, from
+    // connectStation().
+    static const uint16_t CMD_PS_MODE_ENH   = 0x00E4;
+    static const uint16_t PS_EN_AUTO_PS     = 0x00FF;
+    static const uint16_t PS_DIS_AUTO_PS    = 0x00FE;
+    static const uint16_t PS_SLEEP_CONFIRM  = 0x0005;
+    static const uint16_t PS_BITMAP_STA     = 0x0010;
+    static const uint16_t TLV_TYPE_PS_PARAM = 0x0172;
+    static const uint32_t EVENT_PS_AWAKE    = 0x0000000A;
+    static const uint32_t EVENT_PS_SLEEP    = 0x0000000B;
+    static const uint8_t  HOST_POWER_UP     = 0x02;   // fn1 reg 0x00 wake write
+    enum PsState : uint8_t { PS_AWAKE = 0, PS_SLEEPING = 1 };
+
+    // Enable/disable IEEE PS (EN_AUTO_PS/DIS_AUTO_PS with the STA bitmap and
+    // NXP's default ps_param).  Call while associated; the sleep/confirm
+    // handshake then runs inside serviceLink()'s event demux, so the app must
+    // keep servicing the link (both examples do).  wakeCard() is applied
+    // automatically before host-initiated traffic while sleeping.
+    SdioHost::Status setIeeePs(bool enable);
+    bool     ieeePsEnabled() const { return m_psEnabled; }
+    uint8_t  psState()       const { return (uint8_t)m_psState; }
+    uint32_t psSleeps()      const { return m_psSleeps; }   // confirms sent
+    uint32_t psWakes()       const { return m_psWakes; }    // awake events seen
+
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
     // against the beacon SSID; first match wins -- fine for a single-AP
     // bench, but a multi-BSSID SSID deterministically picks the first scan
@@ -263,8 +291,11 @@ public:
     // watchConnect() reported.  After a non-OK return, connectedAp() still
     // holds the LAST SUCCESSFUL connect's AP (or an empty ScanResult if
     // there has never been one) -- never the failed attempt's AP.
+    // psOn (W10): enable IEEE PS on a successful connect (default true,
+    // matching NXP's own default).  Best-effort -- pass false to soak the
+    // erratum deliberately (see setIeeePs()).
     SdioHost::Status connectStation(const char *ssid, const char *psk,
-                                    uint8_t attempts = 3);
+                                    uint8_t attempts = 3, bool psOn = true);
     const ScanResult &connectedAp() const { return m_connectedAp; }
 
     // Firmware events that report the WPA2 handshake outcome.
@@ -487,6 +518,22 @@ private:
     // cipher/AKM, PMF caps forced to MFPC=1/MFPR=0), per wlan_update_rsn_ie.
     uint8_t buildAssocRsnIe(const uint8_t *beacon, uint8_t beaconLen,
                             uint8_t *out, uint8_t outCap);
+    // Wake a sleeping card before host-initiated traffic: CMD52-write
+    // HOST_POWER_UP to fn1 reg 0x00 (NXP wifi.c wifi_wake_up_card), then give
+    // the fw a moment.  The PS_AWAKE event arrives through the normal event
+    // path; we do NOT drain events here (re-entrancy: this is called from
+    // inside send paths).  Optimistic-with-retry: callers already surface
+    // CMD_TIMEOUT, and sendHostCmd retries the write once after a wake.
+    void wakeCardIfSleeping();
+    // Sent in direct answer to EVENT_PS_SLEEP.  Body: action=SLEEP_CONFIRM,
+    // resp_ctrl=1 (RESP_NEEDED).  The fw acks with a 0x80E4/action-5 response
+    // on the command port and THEN sleeps; the ack flows through the normal
+    // demux (it is not a tracked command, so waitCmdResp is not used here).
+    // Calls sendHostCmd(), which has its own wake gate -- that gate cannot
+    // self-trigger here because the firmware only ever raises EVENT_PS_SLEEP
+    // while the card is awake, so m_psState is still PS_AWAKE at the moment
+    // this runs (state flips to PS_SLEEPING only after the send below).
+    void sendSleepConfirm();
 
     SdioHost &m_host;
     SdioFunc &m_func;
@@ -504,6 +551,11 @@ private:
     ScanResult m_connectedAp  = {};
     uint32_t m_lastEvent      = 0;
     uint32_t m_lastEventInfo  = 0;
+    // W10: IEEE power-save state.
+    bool     m_psEnabled = false;
+    PsState  m_psState   = PS_AWAKE;
+    uint32_t m_psSleeps  = 0;
+    uint32_t m_psWakes   = 0;
     bool     m_diagEapol      = false;
     uint16_t m_diagDataFrames = 0;
     uint16_t m_diagFirstEthertype = 0;
