@@ -205,7 +205,12 @@ SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t 
     txBuf[2] = (uint8_t)MLAN_TYPE_CMD;       txBuf[3] = 0;
     txBuf[4] = (uint8_t)(cmd & 0xFF);        txBuf[5] = (uint8_t)(cmd >> 8);
     txBuf[6] = (uint8_t)(hostLen & 0xFF);    txBuf[7] = (uint8_t)(hostLen >> 8);
-    m_seq++;
+    // seq_num is only an 8-bit sequence: mlan's HostCmd_GET_SEQ_NO() masks
+    // the field with & 0x00FF, and the high byte carries bss_num/bss_type,
+    // which we always leave 0.  Wrap m_seq at 8 bits so the wire value
+    // (below) is unchanged by this -- txBuf[9] was already always 0 once
+    // m_seq stays <= 0xFF.
+    m_seq = (uint16_t)((m_seq + 1) & 0xFF);
     m_lastSentSeq = m_seq;   // waitCmdResp correlates the reply against this
     txBuf[8] = (uint8_t)(m_seq & 0xFF);      txBuf[9] = (uint8_t)(m_seq >> 8);
     txBuf[10] = 0; txBuf[11] = 0;                              // result
@@ -252,7 +257,12 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
 
 // Read command-port packets until the response to `cmd` (its id with
 // HOSTCMD_RET_BIT set) arrives, discarding events and stale replies.  The
-// header of every packet seen is recorded for the probe's report.
+// header of every packet seen is recorded for the probe's report.  Note: a
+// PS event (EVENT_PS_SLEEP/EVENT_PS_AWAKE) consumed HERE rather than in
+// serviceLink()'s demux goes un-confirmed deliberately -- this loop only
+// matches pkttype+cmd, it does not parse/act on events -- which is fine: per
+// the fw's own contract an unconfirmed sleep just means it stays awake, and
+// the next idle period re-raises EVENT_PS_SLEEP.
 SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                     uint32_t timeoutMs) {
     for (int tries = 0; tries < 4; tries++) {
@@ -271,12 +281,15 @@ SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen,
             // [result]), since a response echoes the request's header shape.
             // Without this, a stale untracked 0x80E4 -- e.g. the fw's ack to
             // a sendSleepConfirm() this call never issued -- can be mistaken
-            // for the answer to THIS request.  If a silicon soak ever shows
-            // mismatches on every call (fw not echoing seq faithfully),
-            // revert to the narrower action-based exclusion instead of this
-            // check.
+            // for the answer to THIS request.  Compare only the LOW byte:
+            // per mlan's HostCmd_GET_SEQ_NO() (& 0x00FF), seq_num's high byte
+            // carries bss_num/bss_type, which sendHostCmd always leaves 0 --
+            // masking here keeps the comparison honest even if that ever
+            // changes.  If a silicon soak ever shows mismatches on every
+            // call (fw not echoing seq faithfully), revert to the narrower
+            // action-based exclusion instead of this check.
             uint16_t respSeq = (uint16_t)(buf[8] | ((uint16_t)buf[9] << 8));
-            if (respSeq == m_lastSentSeq) {
+            if ((respSeq & 0xFF) == (m_lastSentSeq & 0xFF)) {
                 if (outLen) *outLen = len;
                 return SdioHost::OK;
             }
@@ -1184,6 +1197,15 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                         } else if (ev == EVENT_PS_AWAKE) {
                             m_psState = PS_AWAKE;
                             m_psWakes++;
+                            // Mirror mwifiex's pm_wakeup_card_complete: pair
+                            // the HOST_POWER_UP wake write with a clear back
+                            // to 0x00 once the fw itself confirms it's awake.
+                            // A latched HOST_POWER_UP could pin the card
+                            // awake and silently defeat the whole PS
+                            // workaround; clearing here is safe (the fw just
+                            // told us it IS awake) and cheap.  Best-effort --
+                            // the status of this write is not load-bearing.
+                            (void)m_host.cmd52Write(1, 0x00, 0x00);
                         }
                         if (ev == EVENT_DEAUTHENTICATED || ev == EVENT_DISASSOCIATED ||
                             ev == EVENT_LINK_LOST) {
@@ -1238,9 +1260,11 @@ void Iw416::pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
 void Iw416::wakeCardIfSleeping() {
     if (!m_psEnabled || m_psState == PS_AWAKE) return;
     (void)m_host.cmd52Write(1, 0x00, HOST_POWER_UP);
+    m_psHostWakes++;   // soak evidence: a host-initiated wake actually fired
     // The fw raises EVENT_PS_AWAKE via the normal event path; state flips
-    // there.  2 ms covers the measured wake latency; the caller's own
-    // timeout/retry handles a slow wake.
+    // there (and clears HOST_POWER_UP -- see serviceLink's demux).  2 ms
+    // covers the measured wake latency.  No retry happens here -- see this
+    // function's header-comment for why none is needed.
     delay(2);
     m_psState = PS_AWAKE;   // optimistic: the next event will re-assert truth
 }
@@ -1290,6 +1314,8 @@ void Iw416::sendSleepConfirm() {
     if (sendHostCmd(CMD_PS_MODE_ENH, body, sizeof(body)) == SdioHost::OK) {
         m_psState = PS_SLEEPING;
         m_psSleeps++;
+    } else {
+        m_psConfirmFails++;   // soak evidence: the confirm write itself failed
     }
 }
 

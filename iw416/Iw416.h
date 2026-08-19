@@ -265,13 +265,26 @@ public:
     // Enable/disable IEEE PS (EN_AUTO_PS/DIS_AUTO_PS with the STA bitmap and
     // NXP's default ps_param).  Call while associated; the sleep/confirm
     // handshake then runs inside serviceLink()'s event demux, so the app must
-    // keep servicing the link (both examples do).  wakeCard() is applied
-    // automatically before host-initiated traffic while sleeping.
+    // keep servicing the link (both examples do).  wakeCardIfSleeping() is
+    // applied automatically before host-initiated traffic while sleeping.
+    // On a transport failure (non-OK return), m_lastRespResult/lastRespResult()
+    // is stale (from whatever command last completed, not this one) --
+    // ieeePsEnabled() is the reliable signal for whether PS actually ended up
+    // enabled.
     SdioHost::Status setIeeePs(bool enable);
     bool     ieeePsEnabled() const { return m_psEnabled; }
     uint8_t  psState()       const { return (uint8_t)m_psState; }
     uint32_t psSleeps()      const { return m_psSleeps; }   // confirms sent
     uint32_t psWakes()       const { return m_psWakes; }    // awake events seen
+    // Soak-disambiguation counters (W10 review): psSleeps() > psWakes() over
+    // a run is expected and does NOT mean an awake event was lost -- it also
+    // counts confirms whose eventual PS_AWAKE was consumed silently inside
+    // waitCmdResp's discard loop (see the comment there) or a host-initiated
+    // wake that preempted the card before it raised its own PS_AWAKE.
+    // psHostWakes() isolates the latter; a large gap between psSleeps() and
+    // (psWakes()+psHostWakes()) would instead point at swallowed events.
+    uint32_t psConfirmFails() const { return m_psConfirmFails; } // sendSleepConfirm's send failed
+    uint32_t psHostWakes()    const { return m_psHostWakes; }    // wakeCardIfSleeping actually wrote HOST_POWER_UP
 
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
     // against the beacon SSID; first match wins -- fine for a single-AP
@@ -416,7 +429,13 @@ public:
     // safe (it has its own staging and only touches the TX ring).  Calling
     // ANY RX-path method (pollLink, serviceLink, readDataPacket,
     // captureMonitor) from the sink is forbidden -- it would reuse this
-    // same static buffer mid-drain and corrupt the ring bookkeeping.
+    // same static buffer mid-drain and corrupt the ring bookkeeping.  The
+    // same forbidden-list applies to command-path methods that read the
+    // command port (setIeeePs, waitCmdResp, and anything else that calls
+    // it, e.g. scan/associate/getHwSpec) -- serviceLink already took its own
+    // HOST_INT_STATUS sample for this pass, so a command-port read from
+    // inside the sink races against that stale sample and can steal or
+    // misparse the reply serviceLink itself is mid-handling.
     typedef void (*FrameSink)(void *ctx, const uint8_t *frame, uint16_t len);
     SdioHost::Status serviceLink(FrameSink sink, void *ctx, bool *dropped,
                                  uint32_t waitMs);
@@ -529,17 +548,23 @@ private:
     // HOST_POWER_UP to fn1 reg 0x00 (NXP wifi.c wifi_wake_up_card), then give
     // the fw a moment.  The PS_AWAKE event arrives through the normal event
     // path; we do NOT drain events here (re-entrancy: this is called from
-    // inside send paths).  Optimistic-with-retry: callers already surface
-    // CMD_TIMEOUT, and sendHostCmd retries the write once after a wake.
+    // inside send paths).  No retry is done HERE -- the actual mitigations
+    // live one level out: sendDataFrame's WR-bitmap wait already polls (and
+    // so absorbs wake latency) before its CMD53 write ever happens, and
+    // sendHostCmd's CMD53 write surfaces a bus error/CMD_TIMEOUT to callers,
+    // all of which already handle a failed/timed-out command.
     void wakeCardIfSleeping();
     // Sent in direct answer to EVENT_PS_SLEEP.  Body: action=SLEEP_CONFIRM,
     // resp_ctrl=1 (RESP_NEEDED).  The fw acks with a 0x80E4/action-5 response
     // on the command port and THEN sleeps; the ack flows through the normal
     // demux (it is not a tracked command, so waitCmdResp is not used here).
-    // Calls sendHostCmd(), which has its own wake gate -- that gate cannot
-    // self-trigger here because the firmware only ever raises EVENT_PS_SLEEP
-    // while the card is awake, so m_psState is still PS_AWAKE at the moment
-    // this runs (state flips to PS_SLEEPING only after the send below).
+    // Calls sendHostCmd(), which has its own wake gate -- that gate is not
+    // expected to fire here, since the firmware only ever raises
+    // EVENT_PS_SLEEP while the card is awake, so m_psState is still PS_AWAKE
+    // at the moment this runs (state flips to PS_SLEEPING only after the
+    // send below).  Even if that assumption were ever wrong, the cost is
+    // small: a duplicate queued sleep event just costs one harmless extra
+    // wake write plus one extra confirm, not a correctness bug.
     void sendSleepConfirm();
 
     SdioHost &m_host;
@@ -563,6 +588,8 @@ private:
     PsState  m_psState   = PS_AWAKE;
     uint32_t m_psSleeps  = 0;
     uint32_t m_psWakes   = 0;
+    uint32_t m_psConfirmFails = 0;   // sendSleepConfirm's sendHostCmd failed
+    uint32_t m_psHostWakes    = 0;   // wakeCardIfSleeping actually wrote HOST_POWER_UP
     bool     m_diagEapol      = false;
     uint16_t m_diagDataFrames = 0;
     uint16_t m_diagFirstEthertype = 0;
