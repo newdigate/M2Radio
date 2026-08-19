@@ -1177,20 +1177,16 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
     return SdioHost::CMD_TIMEOUT;      // a quiet poll, not an error
 }
 
-// pollLink keeps its historical contract for the probe: the FIRST frame is
-// copied out, later frames in the same pass are drained and counted in
-// rxDropped().
-namespace {
-struct PollLinkCtx {
-    uint8_t  *buf;
-    uint16_t  cap;
-    uint16_t *lenOut;
-    bool      got;
-    Iw416    *self;
-};
-}
-static void pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len);
-
+// pollLink keeps its historical COPY contract for the probe (first frame
+// that fits is copied out, later frames in the same pass are drained and
+// counted in rxDropped()) on top of serviceLink() -- but its early-return
+// contract is now slightly looser than before serviceLink() existed: the
+// old pollLink only set gotFrame (and returned OK early) once a frame was
+// actually COPIED to the caller, whereas serviceLink() returns OK as soon
+// as any frame is SEEN, whether or not the sink below chose to copy or drop
+// it.  That is harmless here -- pollLink's only caller re-polls in a loop,
+// so an extra "OK, nothing new copied" return just costs one more call, and
+// the drop is still recorded in rxDropped() either way.
 SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
                                  bool *dropped, uint32_t waitMs) {
     if (frameLen) *frameLen = 0;
@@ -1198,14 +1194,14 @@ SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *f
     return serviceLink(pollLinkSink, &ctx, dropped, waitMs);
 }
 
-static void pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
+void Iw416::pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
     PollLinkCtx *c = (PollLinkCtx *)vctx;
     if (!c->got && c->buf && len <= c->cap) {
         memcpy(c->buf, frame, len);
         if (c->lenOut) *c->lenOut = len;
         c->got = true;
     } else {
-        c->self->countRxDropped();
+        c->self->m_rxDropped++;
     }
 }
 

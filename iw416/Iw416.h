@@ -343,25 +343,33 @@ public:
     // 802.3 frame seen is copied to frameBuf/*frameLen (later frames in the
     // same pass are read and counted in rxDropped()).  Command-port events:
     // recorded in lastEvent()/lastEventInfo(); a DEAUTHENTICATED/DISASSOCIATED
-    // sets *dropped.  Returns OK as soon as a frame or a drop is captured,
-    // CMD_TIMEOUT when waitMs passed quietly (not an error), else a bus error.
+    // sets *dropped.  Returns OK as soon as any data frame was seen (the
+    // first is copied out if it fits), or a drop is captured; CMD_TIMEOUT
+    // when waitMs passed quietly (not an error), else a bus error.
     SdioHost::Status pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
                               bool *dropped, uint32_t waitMs);
 
     // Stack-facing service pass (W9).  One HOST_INT_STATUS read; EVERY
-    // pending data frame is unwrapped (RxPD) and handed to `sink`; command
-    // -port events are recorded and a DEAUTH/DISASSOC/LINK_LOST sets
+    // pending data frame is unwrapped (RxPD) and handed to `sink`;
+    // command-port events are recorded and a DEAUTH/DISASSOC/LINK_LOST sets
     // *dropped.  Returns OK if any frame or a drop was seen, CMD_TIMEOUT for
     // a quiet pass (not an error), else the bus error.  pollLink() is this
     // with a copy-first-frame sink.
+    //
+    // FrameSink contract: `frame` aliases serviceLink's internal static RX
+    // staging buffer and is valid ONLY for the duration of the callback --
+    // copy synchronously out of it, never retain the pointer.  Calling
+    // TX-side driver methods (e.g. sendDataFrame) from inside the sink is
+    // safe (it has its own staging and only touches the TX ring).  Calling
+    // ANY RX-path method (pollLink, serviceLink, readDataPacket,
+    // captureMonitor) from the sink is forbidden -- it would reuse this
+    // same static buffer mid-drain and corrupt the ring bookkeeping.
     typedef void (*FrameSink)(void *ctx, const uint8_t *frame, uint16_t len);
     SdioHost::Status serviceLink(FrameSink sink, void *ctx, bool *dropped,
                                  uint32_t waitMs);
 
     uint32_t rxDropped()   const { return m_rxDropped; }
     uint32_t rxDataCount() const { return m_rxDataCount; }
-    // For pollLink's compatibility sink only.
-    void countRxDropped() { m_rxDropped++; }
 
     struct MonitorFrame {
         uint16_t frameControl;   // little-endian; 0x80 = beacon
@@ -426,6 +434,20 @@ public:
     SdioHost::Status readRequestedLen(uint16_t *out);
 
 private:
+    // pollLink's compatibility sink: reproduces the historical contract
+    // (first frame that fits is copied out, every other delivered frame --
+    // including a first frame that didn't fit -- is counted in
+    // rxDropped()) on top of serviceLink().  `self` lets the static member
+    // reach the instance's private m_rxDropped.
+    struct PollLinkCtx {
+        uint8_t  *buf;
+        uint16_t  cap;
+        uint16_t *lenOut;
+        bool      got;
+        Iw416    *self;
+    };
+    static void pollLinkSink(void *ctx, const uint8_t *frame, uint16_t len);
+
     SdioHost::Status setCardBits(uint32_t reg, uint8_t bits,
                                  uint8_t *preOut, uint8_t *postOut);
     // Full 32-bit multiport bitmaps (all four bytes each).
