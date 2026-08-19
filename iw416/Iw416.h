@@ -302,7 +302,7 @@ public:
     uint32_t cmd52PollsTx()   const { return m_cmd52PollsTx; }   // sendDataFrame's wr_bitmap wait
     uint32_t cmd52PollsSvc()  const { return m_cmd52PollsSvc; }  // serviceLink + its RX helpers
     uint32_t cmd53Count()     const { return m_cmd53Count; }     // data CMD53s, both directions
-    uint32_t cmd53Bytes()     const { return m_cmd53Bytes; }     // bytes actually issued on the bus
+    uint32_t cmd53Bytes()     const { return m_cmd53Bytes; }     // bytes successfully issued on the bus
     uint32_t cmd53ByteMode()  const { return m_cmd53ByteMode; }  // of those, how many were BYTE mode
 
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
@@ -610,11 +610,19 @@ private:
     uint32_t m_psConfirmFails = 0;   // sendSleepConfirm's sendHostCmd failed
     uint32_t m_psHostWakes    = 0;   // wakeCardIfSleeping actually wrote HOST_POWER_UP
     // W11: bus-attribution counters (throughput work) -- per-frame SDIO bus
-    // cost, split by call path.  Attribution rules:
-    //  - wakeCardIfSleeping()'s CMD52 write is deliberately NOT counted in
-    //    either cmd52Polls* counter -- it is PS overhead already visible via
-    //    psHostWakes(), and counting it here would conflate PS wake cost
-    //    with steady-state polling cost.
+    // cost, split by call path.  Reset (zeroed) in downloadFirmware()'s
+    // prologue alongside m_txPort/m_rxPort/m_bytesSent: these five attribute
+    // the cost of a single firmware life, so a mid-soak recovery re-download
+    // must not carry the previous life's traffic into the new one.  The ps*
+    // counters deliberately do NOT reset there -- they stay cumulative across
+    // firmware downloads, as landed in W10.  Attribution rules:
+    //  - wakeCardIfSleeping()'s CMD52 write, and serviceLink()'s EVENT_PS_AWAKE
+    //    wake-latch clear write (the cmd52Write(1, 0x00, 0x00) at the end of
+    //    the PS_AWAKE handler), are deliberately NOT counted in either
+    //    cmd52Polls* counter -- both are writes, not polls, and both already
+    //    pair 1:1 with an existing PS counter (psHostWakes() and psWakes()
+    //    respectively), so counting them here would double up PS-wake
+    //    accounting rather than add new information.
     //  - m_cmd52PollsTx counts only readWrBitmap32()'s CMD52 reads, which is
     //    called solely from sendDataFrame's wr_bitmap wait loop.
     //  - m_cmd52PollsSvc counts serviceLink()'s own HOST_INT_STATUS and
@@ -630,14 +638,19 @@ private:
     //    TX write and readRingPacket's RX read (both directions of actual
     //    frame traffic).  Command/event-port CMD53s (sendHostCmd,
     //    serviceLink's own command-port read, readHostResp, ...) are out of
-    //    scope -- they carry no data-plane payload.  m_cmd53Bytes is the
-    //    block-padded transfer length actually issued on the bus
-    //    (blockSize * blocks), not the caller's unpadded frame/packet length.
-    //  - m_cmd53ByteMode counts data CMD53s issued in SDIO byte mode.
-    //    SdioHost::cmd53() hardcodes block mode (cmd53Arg's blockMode
-    //    argument is always `true` -- see sdio/SdioHost.cpp), so this driver
-    //    can never issue one; the counter exists to prove that rather than
-    //    assume it, and is expected to read 0 always.
+    //    scope -- they carry no data-plane payload.  Both sites count only on
+    //    a successful CMD53 (see the call sites' comments).  m_cmd53Bytes is
+    //    the block-padded transfer length successfully issued on the bus
+    //    (blockSize * blocks), not the caller's unpadded frame/packet length
+    //    -- and being a plain uint32 counting bytes, it wraps in roughly 2
+    //    hours at full rate, so a soak must consume it as deltas, not a
+    //    running total.
+    //  - m_cmd53ByteMode documents an invariant, not a live detector: it is 0
+    //    by construction because SdioHost::cmd53() hardcodes block mode
+    //    (cmd53Arg's blockMode argument is always `true` -- see
+    //    sdio/SdioHost.cpp).  It does not sense or flag a future byte-mode
+    //    code path; if SdioHost ever grows one, this counter also needs a
+    //    real increment site, not just a read of a value that already exists.
     uint32_t m_cmd52PollsTx   = 0;
     uint32_t m_cmd52PollsSvc  = 0;
     uint32_t m_cmd53Count     = 0;

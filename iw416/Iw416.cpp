@@ -87,6 +87,12 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     // A fresh firmware starts both data-port rings at slot 0.
     m_txPort = 0;
     m_rxPort = 0;
+    // W11: bus-attribution counters attribute a single firmware life -- a
+    // mid-soak recovery re-download must not carry the previous life's
+    // traffic into the new one.  (The ps* counters deliberately do NOT reset
+    // here -- see their group comment in Iw416.h.)
+    m_cmd52PollsTx = 0; m_cmd52PollsSvc = 0;
+    m_cmd53Count = 0; m_cmd53Bytes = 0; m_cmd53ByteMode = 0;
     // One 256-byte staging block, zero-padded for the final short chunk.
     // NXP always writes whole blocks (calculate_sdio_write_params sets
     // buflen = SDIO_BLOCK_SIZE regardless of txlen), so we do the same.
@@ -1105,8 +1111,11 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                            SDIO_BLOCK_SIZE, blocks);
     if (s != SdioHost::OK) return s;
     // W11: the TX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
-    // counters' comment in Iw416.h.  m_cmd53Bytes takes the block-padded
-    // length actually issued (blocks * SDIO_BLOCK_SIZE), not frameLen.
+    // counters' comment in Iw416.h.  Counted only on success (the early
+    // `return s` above already filtered the failure case out, matching the
+    // RX site's success-only bookkeeping).  m_cmd53Bytes takes the
+    // block-padded length successfully issued (blocks * SDIO_BLOCK_SIZE),
+    // not frameLen.
     m_cmd53Count++;
     m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE;
     m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
