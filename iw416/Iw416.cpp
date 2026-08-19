@@ -206,6 +206,7 @@ SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t 
     txBuf[4] = (uint8_t)(cmd & 0xFF);        txBuf[5] = (uint8_t)(cmd >> 8);
     txBuf[6] = (uint8_t)(hostLen & 0xFF);    txBuf[7] = (uint8_t)(hostLen >> 8);
     m_seq++;
+    m_lastSentSeq = m_seq;   // waitCmdResp correlates the reply against this
     txBuf[8] = (uint8_t)(m_seq & 0xFF);      txBuf[9] = (uint8_t)(m_seq >> 8);
     txBuf[10] = 0; txBuf[11] = 0;                              // result
     if (body && bodyLen) memcpy(&txBuf[12], body, bodyLen);
@@ -264,8 +265,22 @@ SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen,
         m_lastRespResult = (uint16_t)(buf[10] | ((uint16_t)buf[11] << 8));
         if (m_lastRespType == MLAN_TYPE_CMD &&
             m_lastRespCmd == (uint16_t)(cmd | HOSTCMD_RET_BIT)) {
-            if (outLen) *outLen = len;
-            return SdioHost::OK;
+            // Correlate by seq_num, not just cmd id: seq_num sits at the same
+            // offset (8:9) as in the request header (SDIOPkt's
+            // [size][pkttype] followed by HostCmd's [command][size][seq_num]
+            // [result]), since a response echoes the request's header shape.
+            // Without this, a stale untracked 0x80E4 -- e.g. the fw's ack to
+            // a sendSleepConfirm() this call never issued -- can be mistaken
+            // for the answer to THIS request.  If a silicon soak ever shows
+            // mismatches on every call (fw not echoing seq faithfully),
+            // revert to the narrower action-based exclusion instead of this
+            // check.
+            uint16_t respSeq = (uint16_t)(buf[8] | ((uint16_t)buf[9] << 8));
+            if (respSeq == m_lastSentSeq) {
+                if (outLen) *outLen = len;
+                return SdioHost::OK;
+            }
+            m_seqMismatches++;
         }
     }
     return SdioHost::BAD_CIS;   // packets kept coming, none was the answer
@@ -1174,6 +1189,13 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                             ev == EVENT_LINK_LOST) {
                             gotDrop = true;
                             if (dropped) *dropped = true;
+                            // PS engagement is per-association, so a dropped
+                            // link can't still be "asleep" -- reset the state
+                            // machine.  Leave m_psEnabled alone: a wake-gate
+                            // write to a card that isn't actually sleeping is
+                            // harmless, and connectStation() re-enables PS on
+                            // reconnect anyway.
+                            m_psState = PS_AWAKE;
                         }
                     }
                 }

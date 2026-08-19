@@ -456,6 +456,13 @@ public:
     uint16_t lastRespType()   const { return m_lastRespType; }
     uint16_t lastRespCmd()    const { return m_lastRespCmd; }
     uint16_t lastRespResult() const { return m_lastRespResult; }
+    // Times waitCmdResp saw a cmd-id match (pkttype+cmd|RET_BIT) whose
+    // seq_num did NOT match the request just sent, and so kept waiting
+    // instead of accepting it -- e.g. a stale sleep-confirm ack.  Zero across
+    // a soak means the firmware echoes seq_num faithfully; a nonzero count on
+    // every call would mean it doesn't, and the seq check should be reverted
+    // to the narrower action-based exclusion (see waitCmdResp).
+    uint32_t seqMismatches() const { return m_seqMismatches; }
 
     // Evidence from the response path, for the probe's report: every
     // HOST_INT_STATUS bit ever observed (ORed -- reads clear the register), and
@@ -589,4 +596,6 @@ private:
     uint32_t m_chunksSent   = 0;
     uint16_t m_lastRequest  = 0;
     uint16_t m_seq          = 0;
+    uint16_t m_lastSentSeq  = 0;   // seq_num of the last sendHostCmd() request
+    uint32_t m_seqMismatches = 0;  // waitCmdResp: cmd-id matches with wrong seq
 };
