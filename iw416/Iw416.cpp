@@ -1205,6 +1205,36 @@ void Iw416::pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
     }
 }
 
+SdioHost::Status Iw416::connectStation(const char *ssid, const char *psk,
+                                       uint8_t attempts) {
+    static ScanResult aps[12];
+    uint8_t n = 0;
+    SdioHost::Status s = scan(aps, 12, &n);
+    if (s != SdioHost::OK) return s;
+    int idx = -1;
+    for (uint8_t i = 0; i < n; i++) {
+        if (strcmp(aps[i].ssid, ssid) == 0) { idx = i; break; }
+    }
+    if (idx < 0) return SdioHost::BAD_CIS;         // SSID not in the scan
+    m_connectedAp = aps[idx];
+
+    if (psk && psk[0]) {
+        // Use the SCANNED SSID bytes as the PBKDF2 salt (authoritative --
+        // they are what the AP beacons), not the caller's spelling.
+        s = setPassphrase(m_connectedAp.ssid, psk);
+        if (s != SdioHost::OK) return s;
+        delay(50);
+    }
+    for (uint8_t a = 0; a < attempts; a++) {
+        s = associate(m_connectedAp);
+        if (s != SdioHost::OK) continue;
+        SdioHost::Status w = watchConnect(2500);
+        // Probe rule: OK or a quiet TIMEOUT = up; CMD_CRC = rejected.
+        if (w != SdioHost::CMD_CRC) return SdioHost::OK;
+    }
+    return SdioHost::CMD_CRC;
+}
+
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     uint16_t rxLen = 0;

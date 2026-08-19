@@ -245,6 +245,17 @@ public:
     // associate() to clear stale state; exposed for explicit disconnects.
     SdioHost::Status deauthenticate(const uint8_t bssid[6]);
 
+    // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
+    // against the beacon SSID) -> setPassphrase (skipped when psk is NULL or
+    // empty -> open network) -> associate -> watchConnect, retrying the
+    // associate up to `attempts` times on a rejection (CMD_CRC).  OK means
+    // associated and settled (probe rule: no deauth in the watch window; a
+    // port-release is not required here).  BAD_CIS = SSID not found in the
+    // scan.  connectedAp() is valid after OK.
+    SdioHost::Status connectStation(const char *ssid, const char *psk,
+                                    uint8_t attempts = 3);
+    const ScanResult &connectedAp() const { return m_connectedAp; }
+
     // Firmware events that report the WPA2 handshake outcome.
     static const uint32_t EVENT_PORT_RELEASE     = 0x0000002B;  // handshake OK
     static const uint32_t EVENT_MIC_ERR_UNICAST  = 0x0000000E;
@@ -479,6 +490,7 @@ private:
     uint16_t m_assocCapInfo   = 0;
     uint8_t  m_assocRsn[24]   = {0};
     uint8_t  m_assocRsnLen    = 0;
+    ScanResult m_connectedAp  = {};
     uint32_t m_lastEvent      = 0;
     uint32_t m_lastEventInfo  = 0;
     bool     m_diagEapol      = false;
