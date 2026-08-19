@@ -87,6 +87,12 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     // A fresh firmware starts both data-port rings at slot 0.
     m_txPort = 0;
     m_rxPort = 0;
+    // W11: the cached bitmap views describe the PREVIOUS firmware life's
+    // ports -- reset them with the rings.  0 (nothing free/pending) is the
+    // only safe reset value: set bits may arrive ONLY via a real
+    // readWrBitmap32()/readRdBitmap32().
+    m_wrBitmapView = 0;
+    m_rdBitmapView = 0;
     // W11: bus-attribution counters attribute a single firmware life -- a
     // mid-soak recovery re-download must not carry the previous life's
     // traffic into the new one.  (The ps* counters deliberately do NOT reset
@@ -499,42 +505,62 @@ SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *
     // worth checking is m_rxPort.  (Verified against NXP's own stack with
     // CONFIG_WIFI_IO_DEBUG: rd_bitmap walks 0x100, 0x200, 0x400... as the
     // ESP's 1 Hz broadcasts arrive -- see transcript_hw_evkb.txt W8.)
-    uint32_t bitmap = 0;
-    SdioHost::Status s = readRdBitmap32(&bitmap);
-    if (s != SdioHost::OK) return s;
-    m_dbgBitmapOr |= bitmap;
-    if (!(bitmap & (1u << m_rxPort))) {
-        if (bitmap != 0) {
-            // Bitmap has a packet somewhere else: the ring model was wrong or
-            // the firmware restarted.  Resync (counted) rather than starve.
-            uint8_t p = 0;
-            while (p < MAX_DATA_PORTS && !((bitmap >> p) & 1u)) p++;
-            m_rxPort = p;
-            m_rxRingResyncs++;
-        } else {
-            return SdioHost::CMD_TIMEOUT;      // nothing pending
+    // W11: consult the cached rd-bitmap view first -- amortizes the 4-CMD52
+    // bitmap read across the ring.  A set bit in m_rdBitmapView is an upload
+    // seen by a real read and not yet consumed; bits are only ever CLEARED
+    // locally (consumed) -- new uploads arrive only via a real
+    // readRdBitmap32().  So a burst of successive-port uploads pays one
+    // bitmap read for the first packet, then drains the rest straight off the
+    // view, plus one re-read when the view runs out (catching frames uploaded
+    // during the drain).
+    SdioHost::Status s;
+    if (!(m_rdBitmapView & (1u << m_rxPort))) {
+        uint32_t bitmap = 0;
+        s = readRdBitmap32(&bitmap);
+        if (s != SdioHost::OK) return s;
+        m_dbgBitmapOr |= bitmap;
+        m_rdBitmapView = bitmap;
+        if (!(bitmap & (1u << m_rxPort))) {
+            if (bitmap != 0) {
+                // Bitmap has a packet somewhere else: the ring model was wrong or
+                // the firmware restarted.  Resync (counted) rather than starve.
+                // (Reached only on a FRESH read: the view is a filter over ring
+                // order, never a scheduler.)
+                uint8_t p = 0;
+                while (p < MAX_DATA_PORTS && !((bitmap >> p) & 1u)) p++;
+                m_rxPort = p;
+                m_rxRingResyncs++;
+            } else {
+                return SdioHost::CMD_TIMEOUT;      // nothing pending
+            }
         }
     }
     const uint8_t p = m_rxPort;
     if (portOut) *portOut = p;
 
+    // Every exit below that does NOT consume the slot invalidates the view
+    // (m_rdBitmapView = 0), so the next attempt re-reads the real bitmap --
+    // exactly what the pre-view code did on every call.  In particular a
+    // stale cached bit with RD_LEN reading 0 must not survive, or every later
+    // drain would short-circuit on it and starve RX.
     uint8_t lo = 0, hi = 0;
-    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); m_cmd52PollsSvc++; if (s != SdioHost::OK) { m_rdBitmapView = 0; return s; }
+    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); m_cmd52PollsSvc++; if (s != SdioHost::OK) { m_rdBitmapView = 0; return s; }
     uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-    if (len == 0) return SdioHost::CMD_TIMEOUT;
+    if (len == 0) { m_rdBitmapView = 0; return SdioHost::CMD_TIMEOUT; }
 
     // Always read into scratch and consume the ring slot -- an unread port
     // stalls every later upload, so "too big" must still drain the packet.
     static uint8_t scratch[SDIO_BLOCK_SIZE * 16];
-    if (len > sizeof(scratch)) return SdioHost::BAD_CIS;   // cannot drain; bug
+    if (len > sizeof(scratch)) { m_rdBitmapView = 0; return SdioHost::BAD_CIS; }   // cannot drain; bug
     uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
     // W11: the RX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
     // counters' comment in Iw416.h.  Counted only on a successful read, to
     // match m_dbgReads/m_rxPort's own success-only bookkeeping just below.
     s = m_host.cmd53Read(1, m_ioPort | p, false, scratch, SDIO_BLOCK_SIZE, blocks);
     if (s == SdioHost::OK) { m_cmd53Count++; m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE; }
-    if (s != SdioHost::OK) return s;
+    if (s != SdioHost::OK) { m_rdBitmapView = 0; return s; }   // slot NOT consumed
+    m_rdBitmapView &= ~(1u << p);      // consume the slot in the cached view
     m_rxPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
     m_dbgReads++;
 
@@ -1084,14 +1110,22 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     // own comment: DN_LD "is usually when we write to port most significant
     // port").  So the port to watch is m_txPort, and picking "lowest set bit"
     // instead permanently stalls at 16 sends on a 16-bit bitmap view.
-    uint32_t bitmap = 0;
-    for (uint32_t waited = 0;; waited++) {
-        SdioHost::Status s = readWrBitmap32(&bitmap);
-        if (s != SdioHost::OK) return s;
-        m_lastWrBitmap = bitmap;
-        if (bitmap & (1u << m_txPort)) break;
-        if (waited >= timeoutMs) return SdioHost::CMD_TIMEOUT;
-        delay(1);
+    // W11: consult the cached wr-bitmap view first.  The batch free means one
+    // real read typically publishes many free ports at once; successive sends
+    // consume them from the view with zero CMD52s.  Bits are only ever
+    // CLEARED locally (consumed) -- new free ports arrive only via a real
+    // readWrBitmap32().
+    if (!(m_wrBitmapView & (1u << m_txPort))) {
+        for (uint32_t waited = 0;; waited++) {
+            uint32_t bitmap = 0;
+            SdioHost::Status s = readWrBitmap32(&bitmap);
+            if (s != SdioHost::OK) return s;
+            m_lastWrBitmap = bitmap;
+            m_wrBitmapView = bitmap;
+            if (bitmap & (1u << m_txPort)) break;
+            if (waited >= timeoutMs) return SdioHost::CMD_TIMEOUT;
+            delay(1);
+        }
     }
     const uint8_t p = m_txPort;
 
@@ -1109,7 +1143,14 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
 
     SdioHost::Status s = m_host.cmd53Write(1, m_ioPort | p, false, tx,
                                            SDIO_BLOCK_SIZE, blocks);
-    if (s != SdioHost::OK) return s;
+    if (s != SdioHost::OK) {
+        // Unchanged failure contract: the ring does not advance and the port
+        // is not consumed.  View bookkeeping to match: invalidate rather than
+        // consume, so a retry re-reads the real bitmap -- exactly what the
+        // pre-view code did on every call.
+        m_wrBitmapView = 0;
+        return s;
+    }
     // W11: the TX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
     // counters' comment in Iw416.h.  Counted only on success (the early
     // `return s` above already filtered the failure case out, matching the
@@ -1118,6 +1159,7 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     // not frameLen.
     m_cmd53Count++;
     m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE;
+    m_wrBitmapView &= ~(1u << p);      // consume the port in the cached view
     m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
     m_dataTxCount++;
     return SdioHost::OK;
