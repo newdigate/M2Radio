@@ -645,10 +645,6 @@ private:
     //    -- and being a plain uint32 counting bytes, it wraps in roughly 2
     //    hours at full rate, so a soak must consume it as deltas, not a
     //    running total.
-    //  - Since W11's ring-view fix, m_wrBitmapView/m_rdBitmapView amortize
-    //    the bitmap reads across the ring, so readWrBitmap32()/
-    //    readRdBitmap32() still count every CMD52 they issue -- they just run
-    //    roughly once per batch of ports instead of once per frame.
     //  - m_cmd53ByteMode documents an invariant, not a live detector: it is 0
     //    by construction because SdioHost::cmd53() hardcodes block mode
     //    (cmd53Arg's blockMode argument is always `true` -- see
@@ -676,14 +672,6 @@ private:
     uint32_t m_rxDataCount    = 0;
     uint8_t  m_txPort         = 0;   // TX download-port ring position
     uint8_t  m_rxPort         = 0;   // RX upload-port ring position
-    // W11: cached wr/rd bitmap views (sendDataFrame / readRingPacket).  Bits
-    // are consumed (cleared) locally as ring ports are used; set bits arrive
-    // ONLY from a real readWrBitmap32()/readRdBitmap32().  Reset to 0 with
-    // the rings in downloadFirmware(), and invalidated (0) on any
-    // non-consuming exit after a port was selected, so the next attempt
-    // re-reads the card.
-    uint32_t m_wrBitmapView   = 0;
-    uint32_t m_rdBitmapView   = 0;
     uint16_t m_rxRingResyncs  = 0;
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
