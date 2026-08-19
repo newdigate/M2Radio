@@ -1114,10 +1114,9 @@ SdioHost::Status Iw416::amsduAggrCtrl() {
     return (m_lastRespResult == 0) ? SdioHost::OK : SdioHost::BAD_CIS;
 }
 
-SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
-                                 bool *dropped, uint32_t waitMs) {
+SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
+                                    uint32_t waitMs) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 8];
-    if (frameLen) *frameLen = 0;
     if (dropped) *dropped = false;
     bool gotFrame = false, gotDrop = false;
     for (uint32_t waited = 0; waited <= waitMs; waited++) {
@@ -1143,13 +1142,8 @@ SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *f
                 uint16_t plen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
                 uint16_t poff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
                 if ((uint32_t)INTF_HEADER_LEN + poff + plen > pktSize) continue;
-                if (!gotFrame && frameBuf && plen <= bufCap) {
-                    memcpy(frameBuf, &rx[INTF_HEADER_LEN + poff], plen);
-                    if (frameLen) *frameLen = plen;
-                    gotFrame = true;
-                } else {
-                    m_rxDropped++;     // a second frame in the same pass
-                }
+                gotFrame = true;
+                if (sink) sink(ctx, &rx[INTF_HEADER_LEN + poff], plen);
             }
         }
         if (st & CMD_PORT_UPLD) {
@@ -1181,6 +1175,38 @@ SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *f
         if (!(st & (HOST_INT_UP_LD | CMD_PORT_UPLD))) delay(1);
     }
     return SdioHost::CMD_TIMEOUT;      // a quiet poll, not an error
+}
+
+// pollLink keeps its historical contract for the probe: the FIRST frame is
+// copied out, later frames in the same pass are drained and counted in
+// rxDropped().
+namespace {
+struct PollLinkCtx {
+    uint8_t  *buf;
+    uint16_t  cap;
+    uint16_t *lenOut;
+    bool      got;
+    Iw416    *self;
+};
+}
+static void pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len);
+
+SdioHost::Status Iw416::pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
+                                 bool *dropped, uint32_t waitMs) {
+    if (frameLen) *frameLen = 0;
+    PollLinkCtx ctx = { frameBuf, bufCap, frameLen, false, this };
+    return serviceLink(pollLinkSink, &ctx, dropped, waitMs);
+}
+
+static void pollLinkSink(void *vctx, const uint8_t *frame, uint16_t len) {
+    PollLinkCtx *c = (PollLinkCtx *)vctx;
+    if (!c->got && c->buf && len <= c->cap) {
+        memcpy(c->buf, frame, len);
+        if (c->lenOut) *c->lenOut = len;
+        c->got = true;
+    } else {
+        c->self->countRxDropped();
+    }
 }
 
 SdioHost::Status Iw416::getHwSpec(uint8_t mac[6], uint32_t *fwRelease, uint16_t *hwVersion) {

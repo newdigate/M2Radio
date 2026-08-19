@@ -347,8 +347,21 @@ public:
     // CMD_TIMEOUT when waitMs passed quietly (not an error), else a bus error.
     SdioHost::Status pollLink(uint8_t *frameBuf, uint16_t bufCap, uint16_t *frameLen,
                               bool *dropped, uint32_t waitMs);
+
+    // Stack-facing service pass (W9).  One HOST_INT_STATUS read; EVERY
+    // pending data frame is unwrapped (RxPD) and handed to `sink`; command
+    // -port events are recorded and a DEAUTH/DISASSOC/LINK_LOST sets
+    // *dropped.  Returns OK if any frame or a drop was seen, CMD_TIMEOUT for
+    // a quiet pass (not an error), else the bus error.  pollLink() is this
+    // with a copy-first-frame sink.
+    typedef void (*FrameSink)(void *ctx, const uint8_t *frame, uint16_t len);
+    SdioHost::Status serviceLink(FrameSink sink, void *ctx, bool *dropped,
+                                 uint32_t waitMs);
+
     uint32_t rxDropped()   const { return m_rxDropped; }
     uint32_t rxDataCount() const { return m_rxDataCount; }
+    // For pollLink's compatibility sink only.
+    void countRxDropped() { m_rxDropped++; }
 
     struct MonitorFrame {
         uint16_t frameControl;   // little-endian; 0x80 = beacon
