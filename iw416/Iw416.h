@@ -423,26 +423,51 @@ public:
     uint16_t rxRingResyncs() const { return m_rxRingResyncs; }
 
     // W12 fault #5 signature.  Times serviceLink()'s RD-bitmap safety net
-    // found an upload waiting at m_rxPort that NO interrupt had told it about,
-    // and drained it.  **Non-zero means an upload interrupt was lost** -- some
+    // found an upload waiting that NO interrupt had told it about, and drained
+    // it -- at m_rxPort, or anywhere in the bitmap if the ring had ALSO
+    // desynced.  **Non-zero means an upload interrupt was lost** -- some
     // path consumed the clear-on-read HOST_INT_STATUS bit without servicing
     // the upload -- **and the net caught it.**  A healthy system reads 0.
+    // Read it alongside rxDrainErrors() below, which says how many of these
+    // the drain's own by-design error exit created.
     // Reset when the firmware is (re)downloaded, like the other per-firmware-
     // life counters.
     uint32_t rxStrandedRecovered() const { return m_rxStrandedRecovered; }
 
+    // Times serviceLink()'s ring drain exited early because readRingPacket()
+    // returned something other than OK/CMD_TIMEOUT (a CMD52/CMD53 bus error, or
+    // an oversized packet that was consumed but not deliverable).  That exit is
+    // DELIBERATE -- re-entering a failing read on every pass would spin the
+    // poll at full speed -- and it falls straight into the by-design
+    // HOST_INT_UP_LD clear, so each occurrence can strand whatever is left in
+    // the ring until Layer 2's next check.
+    //
+    // READ IT AGAINST rxStrandedRecovered():
+    //   drainErrors tracks stranded ~one-for-one  => the residual strands ARE
+    //       these by-design error exits; Layer 1 has no remaining hole and the
+    //       thing to chase is the bus error, not the interrupt bookkeeping.
+    //   stranded MUCH GREATER than drainErrors    => a genuine lost-interrupt
+    //       path still exists; hunt for a HOST_INT_STATUS reader that consumes
+    //       a bit without servicing it (the fault class has now bitten twice).
+    // Reset per firmware life, like rxStrandedRecovered().
+    uint32_t rxDrainErrors() const { return m_rxDrainErrors; }
+
     // DIAGNOSTIC ONLY (W12): read the card's 32-bit RX (upload) bitmap right
-    // now and return it; 0 on a bus error.  Answers the one question a frozen
-    // RX path cannot otherwise answer -- is the FIRMWARE still offering
-    // uploads (bits set that we are not draining => our ring position has
-    // desynced) or has it stopped uploading altogether (bitmap empty => the
-    // fault is card-side)?
+    // now and return it.  Answers the one question a frozen RX path cannot
+    // otherwise answer -- is the FIRMWARE still offering uploads (bits set that
+    // we are not draining => our ring position has desynced) or has it stopped
+    // uploading altogether (bitmap empty => the fault is card-side)?
+    // On a bus error it returns 0 and, if `ok` is non-null, sets *ok=false.
+    // PASS `ok` WHENEVER THE ANSWER MATTERS: a bare 0 is ambiguous between
+    // "genuinely empty" (card-side fault) and "the probe could not read the
+    // card at all" -- and telling those apart is the entire point of the
+    // freeze dump.  *ok is set on every path, so it needs no pre-initialising.
     // Safe to call at any time: the RD bitmap registers are plain reads.
     // It deliberately does NOT touch HOST_INT_STATUS, which is CLEAR-ON-READ
     // -- a diagnostic read of that register would steal upload/event bits
     // from serviceLink() and cause the very stall it was called to explain.
     // Costs 4 CMD52s, counted into cmd52PollsSvc() like every other read.
-    uint32_t probeRdBitmap();
+    uint32_t probeRdBitmap(bool *ok = nullptr);
 
     // One connected-link service poll, servicing BOTH ports from a single
     // HOST_INT_STATUS read (the register is clear-on-read, so split polling
@@ -468,8 +493,10 @@ public:
     // condition this pass did not finish servicing stays set in m_intPending
     // and is picked up by the next pass.  Backstopping that, every
     // RX_BITMAP_CHECK_PASSES quiet passes it verifies the RD bitmap directly
-    // and drains m_rxPort if the card is holding an upload no interrupt ever
-    // announced (counted in rxStrandedRecovered()).
+    // and drains if the card is holding an upload no interrupt ever announced
+    // (counted in rxStrandedRecovered()) -- on ANY set bit, not just
+    // m_rxPort's, so a lost interrupt combined with a ring desync recovers too
+    // (the drain's own resync fixes m_rxPort).
     //
     // FrameSink contract: `frame` aliases serviceLink's internal static RX
     // staging buffer and is valid ONLY for the duration of the callback --
@@ -635,6 +662,13 @@ private:
     // of the register into here, and only the code that actually FINISHES
     // servicing a condition clears that condition's bit.  Distinct from
     // m_intSeen, which is a write-only diagnostic union (never consumed).
+    //
+    // MASKED to (HOST_INT_UP_LD | CMD_PORT_UPLD) at every read site: those are
+    // the only conditions any code path services, so they are the only ones
+    // that can ever be cleared.  Latching HOST_INT_DN_LD/CMD_PORT_DNLD instead
+    // pins this field non-zero from the first download onwards and makes its
+    // documented meaning ("work nobody has finished") false.  Use m_intSeen for
+    // the raw union -- that is what it is for.
     uint8_t  m_intPending   = 0;
     uint16_t m_lastRdLen    = 0;
     uint16_t m_fwStatusPre  = 0;
@@ -734,6 +768,7 @@ private:
     static const uint16_t RX_BITMAP_CHECK_PASSES = 64;
     uint16_t m_svcQuietPasses     = 0;   // consecutive drainless serviceLink passes
     uint32_t m_rxStrandedRecovered = 0;  // uploads the net found with no interrupt
+    uint32_t m_rxDrainErrors      = 0;   // drain loop exits on a bus error (see accessor)
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
     uint32_t m_dbgBitmapOr    = 0;
