@@ -422,6 +422,28 @@ public:
     // model missed something and the resync kept data flowing anyway.
     uint16_t rxRingResyncs() const { return m_rxRingResyncs; }
 
+    // W12 fault #5 signature.  Times serviceLink()'s RD-bitmap safety net
+    // found an upload waiting at m_rxPort that NO interrupt had told it about,
+    // and drained it.  **Non-zero means an upload interrupt was lost** -- some
+    // path consumed the clear-on-read HOST_INT_STATUS bit without servicing
+    // the upload -- **and the net caught it.**  A healthy system reads 0.
+    // Reset when the firmware is (re)downloaded, like the other per-firmware-
+    // life counters.
+    uint32_t rxStrandedRecovered() const { return m_rxStrandedRecovered; }
+
+    // DIAGNOSTIC ONLY (W12): read the card's 32-bit RX (upload) bitmap right
+    // now and return it; 0 on a bus error.  Answers the one question a frozen
+    // RX path cannot otherwise answer -- is the FIRMWARE still offering
+    // uploads (bits set that we are not draining => our ring position has
+    // desynced) or has it stopped uploading altogether (bitmap empty => the
+    // fault is card-side)?
+    // Safe to call at any time: the RD bitmap registers are plain reads.
+    // It deliberately does NOT touch HOST_INT_STATUS, which is CLEAR-ON-READ
+    // -- a diagnostic read of that register would steal upload/event bits
+    // from serviceLink() and cause the very stall it was called to explain.
+    // Costs 4 CMD52s, counted into cmd52PollsSvc() like every other read.
+    uint32_t probeRdBitmap();
+
     // One connected-link service poll, servicing BOTH ports from a single
     // HOST_INT_STATUS read (the register is clear-on-read, so split polling
     // loses bits -- same rationale as diagConnect).  Data packets: the first
@@ -440,6 +462,14 @@ public:
     // *dropped.  Returns OK if any frame or a drop was seen, CMD_TIMEOUT for
     // a quiet pass (not an error), else the bus error.  pollLink() is this
     // with a copy-first-frame sink.
+    //
+    // W12: the bits it works from are `fresh read | m_intPending`, and the
+    // early return on a frame/drop is safe precisely because of that -- any
+    // condition this pass did not finish servicing stays set in m_intPending
+    // and is picked up by the next pass.  Backstopping that, every
+    // RX_BITMAP_CHECK_PASSES quiet passes it verifies the RD bitmap directly
+    // and drains m_rxPort if the card is holding an upload no interrupt ever
+    // announced (counted in rxStrandedRecovered()).
     //
     // FrameSink contract: `frame` aliases serviceLink's internal static RX
     // staging buffer and is valid ONLY for the duration of the callback --
@@ -589,6 +619,23 @@ private:
     SdioHost &m_host;
     SdioFunc &m_func;
     uint8_t  m_intSeen      = 0;
+    // W12 fault #5, LAYER 1.  HOST_INT_STATUS is CLEAR-ON-READ, and five call
+    // sites read it (readHostResp, readDataPacket, diagConnect, watchConnect,
+    // serviceLink).  Four of them used to look only at the bit they cared
+    // about and DISCARD the rest -- so a data upload whose HOST_INT_UP_LD
+    // landed inside, say, readHostResp's 1 ms command poll had its interrupt
+    // silently eaten.  The firmware does not re-raise an interrupt for an
+    // upload it has already offered, so the frame sat in the ring forever and
+    // host-visible RX was dead until reflash.  Captured on silicon:
+    //   FREEZE rd_bitmap=0x20000 wr_bitmap=0xFFFFF800 ring=12/17/339
+    //          c53=26493 rx_data=17616 rx_drop=0
+    // -- port 17 pending, m_rxPort ALSO 17 (the ring model was right), yet the
+    // data CMD53 count frozen: nobody ever told serviceLink to look.
+    // m_intPending is the fix: EVERY read site ORs the bits it just took out
+    // of the register into here, and only the code that actually FINISHES
+    // servicing a condition clears that condition's bit.  Distinct from
+    // m_intSeen, which is a write-only diagnostic union (never consumed).
+    uint8_t  m_intPending   = 0;
     uint16_t m_lastRdLen    = 0;
     uint16_t m_fwStatusPre  = 0;
     uint16_t m_lastRespType   = 0;
@@ -673,6 +720,20 @@ private:
     uint8_t  m_txPort         = 0;   // TX download-port ring position
     uint8_t  m_rxPort         = 0;   // RX upload-port ring position
     uint16_t m_rxRingResyncs  = 0;
+    // W12 fault #5, LAYER 2 -- the self-healing net behind the sticky bits
+    // above.  Layer 1 fixes the loss this tree knows about; this catches the
+    // next one (the class has now bitten twice), so RX cannot be dead
+    // FOREVER on a lost interrupt, only until the next check.
+    // Interval: serviceLink paces a quiet pass at 1 ms (its delay(1)), so 64
+    // quiet passes is ~64 ms of idle -- a recovery latency no application
+    // notices, at 4 CMD52s per check, i.e. ~16 CMD52/s while idle and NONE
+    // while traffic is flowing (the counter resets on every drain).  Against
+    // the ~26k CMD53s of a live soak that is noise.  Deliberately NOT smaller:
+    // this is a backstop, not a polling strategy -- if it ever runs often
+    // enough to matter, rxStrandedRecovered() will say so.
+    static const uint16_t RX_BITMAP_CHECK_PASSES = 64;
+    uint16_t m_svcQuietPasses     = 0;   // consecutive drainless serviceLink passes
+    uint32_t m_rxStrandedRecovered = 0;  // uploads the net found with no interrupt
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
     uint32_t m_dbgBitmapOr    = 0;
