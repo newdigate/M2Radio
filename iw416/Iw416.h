@@ -423,16 +423,34 @@ public:
     uint16_t rxRingResyncs() const { return m_rxRingResyncs; }
 
     // W12 fault #5 signature.  Times serviceLink()'s RD-bitmap safety net
-    // found an upload waiting that NO interrupt had told it about, and drained
-    // it -- at m_rxPort, or anywhere in the bitmap if the ring had ALSO
-    // desynced.  **Non-zero means an upload interrupt was lost** -- some
-    // path consumed the clear-on-read HOST_INT_STATUS bit without servicing
-    // the upload -- **and the net caught it.**  A healthy system reads 0.
-    // Read it alongside rxDrainErrors() below, which says how many of these
-    // the drain's own by-design error exit created.
+    // found an upload waiting AT OUR OWN RING SLOT that no interrupt had told
+    // it about, and drained it.  **Non-zero means an upload interrupt was
+    // lost** -- some path consumed the clear-on-read HOST_INT_STATUS bit
+    // without servicing the upload -- **and the net caught it.**  A healthy
+    // system reads 0.  Read it alongside rxDrainErrors() and rxSlotNotReady()
+    // below, which between them say WHICH loss path produced it.
+    // W13: the DESYNC variant (bits set, but not at m_rxPort) is counted
+    // separately in rxDesyncRecovered() -- the two mechanisms are different
+    // faults and collapsing them into one number hides which one is live.
     // Reset when the firmware is (re)downloaded, like the other per-firmware-
     // life counters.
     uint32_t rxStrandedRecovered() const { return m_rxStrandedRecovered; }
+
+    // W13, residual #2.  Times the safety net drained an upload the card was
+    // offering at a slot OTHER than m_rxPort -- i.e. an interrupt was lost AND
+    // the host's ring position had desynced from the firmware's.  Nothing else
+    // in the driver recovers that combination, so before W13 it read as RX
+    // permanently dead with rxStrandedRecovered() stuck at 0.
+    //
+    // ★ The net enters this path only on a POSITIVE check: the candidate slot
+    // (lowest set rd-bitmap bit) must publish a NON-ZERO RD_LEN.  A set bitmap
+    // bit does NOT imply a packet is waiting on this firmware -- measured on
+    // silicon, a net widened to plain `bm != 0` produced ~6100 ring resyncs
+    // over 110 blasts that found no data at all, walking m_rxPort backwards
+    // over stale bits each time.  Never re-widen it; if this counter needs to
+    // fire more often, make the positive check better, not looser.
+    // Reset per firmware life, like rxStrandedRecovered().
+    uint32_t rxDesyncRecovered() const { return m_rxDesyncRecovered; }
 
     // Times serviceLink()'s ring drain exited early because readRingPacket()
     // returned something other than OK/CMD_TIMEOUT (a CMD52/CMD53 bus error, or
@@ -449,8 +467,43 @@ public:
     //   stranded MUCH GREATER than drainErrors    => a genuine lost-interrupt
     //       path still exists; hunt for a HOST_INT_STATUS reader that consumes
     //       a bit without servicing it (the fault class has now bitten twice).
+    // MEASURED (W12 soaks): stranded 3-7 per ~100 blasts with drainErrors == 0
+    // -- so the by-design explanation above is REFUTED and the second branch
+    // is the live one.  rxSlotNotReady() below is W13's candidate for it.
     // Reset per firmware life, like rxStrandedRecovered().
     uint32_t rxDrainErrors() const { return m_rxDrainErrors; }
+
+    // W13 DIAGNOSTIC -- the hypothesis for the residual rxStrandedRecovered()
+    // that rxDrainErrors() == 0 refuted the old explanation for.
+    //
+    // Times readRingPacket() found a set rd-bitmap bit for the slot it was
+    // about to read (m_rxPort's own, or the slot it resynced to) and then read
+    // RD_LEN_P<slot> == 0 -- "the card is offering this slot but has not
+    // published a length for it".  readRingPacket reports that as CMD_TIMEOUT,
+    // which is the SAME status it uses for "the ring is genuinely empty", and
+    // serviceLink()'s drain loop therefore treats it as a completed drain and
+    // falls into the deliberate HOST_INT_UP_LD clear.  If the card really did
+    // still hold an upload (a stale bit alongside a real one, or a length
+    // published a few microseconds late), that upload is now stranded with no
+    // interrupt and no bus error -- exactly the observed signature.
+    //
+    // HOW TO READ IT, on the next silicon soak:
+    //   slotNotReady == 0 while stranded > 0  => hypothesis REFUTED; the loss
+    //       is somewhere else entirely and this counter has done its job.
+    //   slotNotReady >= stranded              => hypothesis SUPPORTED (it is an
+    //       upper bound: only the false-empties reached from a genuine
+    //       HOST_INT_UP_LD drain can strand, the ones reached from the net
+    //       cannot -- the net's clear is scoped to a bit that was never set).
+    //       The fix is then to stop conflating the two CMD_TIMEOUTs: hold
+    //       HOST_INT_UP_LD across a BOUNDED number of extra passes when the
+    //       drain ended on a false empty rather than on an empty bitmap.  It
+    //       must be bounded -- serviceLink's delay(1) is gated on those same
+    //       bits, so an unbounded hold spins the poll at full speed.
+    // Deliberately NOT acted on yet: this counter exists so the next soak can
+    // confirm or kill the hypothesis before anything on the hot RX path
+    // changes.  That is how the previous explanation got refuted.
+    // Reset per firmware life, like rxStrandedRecovered().
+    uint32_t rxSlotNotReady() const { return m_rxSlotNotReady; }
 
     // DIAGNOSTIC ONLY (W12): read the card's 32-bit RX (upload) bitmap right
     // now and return it.  Answers the one question a frozen RX path cannot
@@ -493,10 +546,12 @@ public:
     // condition this pass did not finish servicing stays set in m_intPending
     // and is picked up by the next pass.  Backstopping that, every
     // RX_BITMAP_CHECK_PASSES quiet passes it verifies the RD bitmap directly
-    // and drains if the card is holding an upload no interrupt ever announced
-    // (counted in rxStrandedRecovered()) -- on ANY set bit, not just
-    // m_rxPort's, so a lost interrupt combined with a ring desync recovers too
-    // (the drain's own resync fixes m_rxPort).
+    // and drains if the card is holding an upload no interrupt ever announced.
+    // Two cases, counted apart because they are different faults:
+    //   - the bit is at m_rxPort            -> rxStrandedRecovered()
+    //   - the bit is elsewhere (ring desync) -> rxDesyncRecovered(), and only
+    //     after RD_LEN for that slot reads NON-ZERO.  A set bitmap bit alone
+    //     is not evidence on this firmware; see rxDesyncRecovered().
     //
     // FrameSink contract: `frame` aliases serviceLink's internal static RX
     // staging buffer and is valid ONLY for the duration of the callback --
@@ -616,6 +671,21 @@ private:
     // BAD_CIS = packet read and dropped (did not fit bufCap).
     SdioHost::Status readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
                                     uint8_t *portOut);
+    // Length the card has published for data port `port`, in bytes.
+    //
+    // ★ REGISTER LAYOUT (W13): RD_LEN is PER SLOT, not one shared register --
+    // 32 little-endian pairs at RD_LEN_P0_L_REG + (port << 1), i.e. 0x18/0x19
+    // for port 0 through 0x56/0x57 for port 31 (NXP's mlan_sdio_defs.h reads
+    // it the same way: SDIO_RD_LEN_P0_L + (port << 1)).  Nothing has to be
+    // "selected" first and the read has no side effects -- it is a plain
+    // CMD52 pair -- so ANY slot's length can be probed at any time, which is
+    // what makes the safety net's positive desync check possible.  (Contrast
+    // CMD_RD_LEN_0/1, which is the single COMMAND-port length register and
+    // has no per-slot form.)  Zero means "the card has not published a
+    // length for that slot" -- notably NOT the same thing as "that slot's
+    // rd-bitmap bit is clear"; see rxSlotNotReady().
+    // Counts its 2 CMD52s into m_cmd52PollsSvc, like every other RX-side read.
+    SdioHost::Status readRdLenPort(uint8_t port, uint16_t *out);
     // Normalise a beacon RSN IE into the association-request form (single
     // cipher/AKM, PMF caps forced to MFPC=1/MFPR=0), per wlan_update_rsn_ie.
     uint8_t buildAssocRsnIe(const uint8_t *beacon, uint8_t beaconLen,
@@ -669,6 +739,20 @@ private:
     // pins this field non-zero from the first download onwards and makes its
     // documented meaning ("work nobody has finished") false.  Use m_intSeen for
     // the raw union -- that is what it is for.
+    //
+    // W13, THE OTHER HALF OF LAYER 1.  Accumulating is only half a fix: a site
+    // that ORs its read in here and then branches on its OWN fresh sample can
+    // still sit out a condition that is already flagged, because the bit was
+    // taken out of the clear-on-read register by somebody else and the
+    // firmware never re-raises it.  readHostResp() had exactly that shape and
+    // would time out with the answer already pending.  So:
+    //   ** A SITE MUST BRANCH ON m_intPending, NOT ON ITS OWN READ -- for
+    //      every bit it also CLEARS when it services that bit. **
+    // The clear is what makes consulting the accumulator terminate.  That is
+    // why readDataPacket() is the one site still branching on its fresh read:
+    // it deliberately clears nothing (it reads ONE ring packet, it does not
+    // drain the ring), so consulting a bit it can never clear would make its
+    // poll loop fire on every iteration for the rest of the firmware's life.
     uint8_t  m_intPending   = 0;
     uint16_t m_lastRdLen    = 0;
     uint16_t m_fwStatusPre  = 0;
@@ -767,8 +851,10 @@ private:
     // enough to matter, rxStrandedRecovered() will say so.
     static const uint16_t RX_BITMAP_CHECK_PASSES = 64;
     uint16_t m_svcQuietPasses     = 0;   // consecutive drainless serviceLink passes
-    uint32_t m_rxStrandedRecovered = 0;  // uploads the net found with no interrupt
+    uint32_t m_rxStrandedRecovered = 0;  // net found an upload at m_rxPort, no interrupt
+    uint32_t m_rxDesyncRecovered  = 0;   // ... at another slot, positively length-checked
     uint32_t m_rxDrainErrors      = 0;   // drain loop exits on a bus error (see accessor)
+    uint32_t m_rxSlotNotReady     = 0;   // set bitmap bit with RD_LEN 0 (see accessor)
     uint16_t m_dbgUploads     = 0;
     uint16_t m_dbgReads       = 0;
     uint32_t m_dbgBitmapOr    = 0;

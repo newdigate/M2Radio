@@ -102,6 +102,10 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     // lost-interrupt fault is still happening.
     m_intPending = 0; m_svcQuietPasses = 0; m_rxStrandedRecovered = 0;
     m_rxDrainErrors = 0;
+    // W13: same rule for the two new per-firmware-life signatures -- the
+    // desync-variant recovery count and the "bit set, no length published"
+    // diagnostic.  Both describe THIS firmware's ring behaviour.
+    m_rxDesyncRecovered = 0; m_rxSlotNotReady = 0;
     // One 256-byte staging block, zero-padded for the final short chunk.
     // NXP always writes whole blocks (calculate_sdio_write_params sets
     // buflen = SDIO_BLOCK_SIZE regardless of txlen), so we do the same.
@@ -250,6 +254,21 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
     // in the ring for good (silicon: rd_bitmap=0x20000 with m_rxPort=17 and
     // the data CMD53 count frozen).  Accumulating into m_intPending hands the
     // bit to serviceLink() instead of dropping it.
+    // W13 (residual #1, code-review item M5): this loop used to branch on its
+    // OWN fresh sample, which is only half of Layer 1.  A CMD_PORT_UPLD that
+    // another site took out of the clear-on-read register and accumulated
+    // WITHOUT servicing (readDataPacket does exactly that) is recorded in
+    // m_intPending and is never re-raised by the firmware -- so this loop would
+    // poll out its whole timeout with the reply already flagged and sitting in
+    // the command port, and the command port has no bitmap to re-derive that
+    // state from.  Branch on the accumulator instead; the clear below is what
+    // keeps that termination-safe (see m_intPending's rule in Iw416.h).
+    //
+    // Timeout semantics are unchanged: still at most `timeoutMs` iterations of
+    // one CMD52 + delay(1), still CMD_TIMEOUT if the bit never appears, and
+    // m_intSeen / m_lastRdLen are recorded exactly as before.  The one
+    // behavioural difference is the intended one -- a bit already pending on
+    // entry is honoured on the first iteration instead of being waited out.
     uint8_t st = 0;
     bool up = false;
     for (uint32_t i = 0; i < timeoutMs; i++) {
@@ -260,12 +279,13 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
         // download-side bits would make m_intPending's "unfinished work"
         // meaning false forever (see its comment in Iw416.h).
         m_intPending |= (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));
-        if (st & CMD_PORT_UPLD) {
+        if (m_intPending & CMD_PORT_UPLD) {
             // This call now owns the command-port packet and reads it below,
             // so consume that bit here (whatever a later path may observe, it
             // must not go looking for this reply a second time).  The DATA bit
             // is deliberately left pending -- draining the ring is not this
-            // function's job.
+            // function's job, and this function never branches on it, so
+            // consulting the accumulator above is safe for CMD_PORT_UPLD only.
             m_intPending &= (uint8_t)~CMD_PORT_UPLD;
             up = true;
             break;
@@ -539,6 +559,20 @@ SdioHost::Status Iw416::readWrBitmap32(uint32_t *out) {
     return SdioHost::OK;
 }
 
+// W13: the per-slot RD_LEN read, factored out of readRingPacket so the safety
+// net can probe a CANDIDATE slot's length without going through the ring.  See
+// the declaration in Iw416.h for the register layout that makes that legal.
+SdioHost::Status Iw416::readRdLenPort(uint8_t port, uint16_t *out) {
+    uint8_t lo = 0, hi = 0;
+    SdioHost::Status s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)port << 1), &lo);
+    m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)port << 1), &hi);
+    m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
+    *out = (uint16_t)(lo | ((uint16_t)hi << 8));
+    return SdioHost::OK;
+}
+
 SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
                                        uint8_t *portOut) {
     // The firmware uploads to ports strictly in ring order, so the only port
@@ -564,11 +598,19 @@ SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *
     const uint8_t p = m_rxPort;
     if (portOut) *portOut = p;
 
-    uint8_t lo = 0, hi = 0;
-    s = m_host.cmd52Read(1, RD_LEN_P0_L_REG + ((uint32_t)p << 1), &lo); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, RD_LEN_P0_U_REG + ((uint32_t)p << 1), &hi); m_cmd52PollsSvc++; if (s != SdioHost::OK) return s;
-    uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
-    if (len == 0) return SdioHost::CMD_TIMEOUT;
+    uint16_t len = 0;
+    s = readRdLenPort(p, &len);
+    if (s != SdioHost::OK) return s;
+    if (len == 0) {
+        // W13: the card offered this slot in the bitmap but has published no
+        // length for it.  Reported as CMD_TIMEOUT -- the SAME status as a
+        // genuinely empty ring -- which is why this is counted: serviceLink's
+        // drain reads that as "finished" and clears HOST_INT_UP_LD.  See
+        // rxSlotNotReady() in Iw416.h for the whole argument and for what to
+        // do once a soak has confirmed or killed it.
+        m_rxSlotNotReady++;
+        return SdioHost::CMD_TIMEOUT;
+    }
 
     // Always read into scratch and consume the ring slot -- an unread port
     // stalls every later upload, so "too big" must still drain the packet.
@@ -603,6 +645,16 @@ SdioHost::Status Iw416::readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *
     // does not drain the ring, so HOST_INT_UP_LD stays pending and the next
     // serviceLink() pass finishes the job (and clears it once the ring reports
     // empty).
+    //
+    // ★ W13: and THAT is exactly why this is the one HOST_INT_STATUS reader
+    // still branching on its own fresh sample rather than on m_intPending.
+    // The accumulator may only be consulted for a bit the site also clears
+    // (see m_intPending's rule in Iw416.h); a site that clears nothing would
+    // see the bit set on every iteration for the rest of the firmware's life,
+    // and captureMonitor's window -- which relies on this loop's delay(1)
+    // pacing and its CMD_TIMEOUT -- would degenerate into a hot spin.
+    // This site is also the reason readHostResp had to be fixed: it is the
+    // one path that accumulates CMD_PORT_UPLD and never services it.
     uint8_t st = 0;
     bool up = false;
     for (uint32_t i = 0; i < timeoutMs; i++) {
@@ -996,12 +1048,19 @@ SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
     static uint8_t rx[SDIO_BLOCK_SIZE * 4];
     m_lastEvent = 0; m_diagDataFrames = 0; m_diagEapol = false; m_diagFirstEthertype = 0;
     for (uint32_t waited = 0; waited < timeoutMs; waited++) {
-        uint8_t st = 0;
-        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        uint8_t fresh = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
         if (s != SdioHost::OK) return s;
-        m_intSeen    |= st;
+        m_intSeen    |= fresh;
         // W12: never discard a bit anyone services (see m_intPending).
-        m_intPending |= (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        // W13: branch on the accumulator, not on this read alone (the M5
+        // shape -- see readHostResp).  Legal here for BOTH bits because both
+        // branches below clear the bit they service; associate() runs
+        // readHostResp immediately before this watcher, so a data upload it
+        // accumulated and could not service is exactly what would otherwise be
+        // sat out for the whole window.
+        uint8_t st = m_intPending;
 
         if (st & HOST_INT_UP_LD) {                     // data port -- maybe EAPOL
             for (;;) {
@@ -1072,12 +1131,17 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
     m_eventLogLen = 0; m_sawPortRelease = false; m_lastEvent = 0;
     bool sawDrop = false;
     for (uint32_t waited = 0; waited < timeoutMs; waited++) {
-        uint8_t st = 0;
-        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
+        uint8_t fresh = 0;
+        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
         if (s != SdioHost::OK) return s;
-        m_intSeen    |= st;
+        m_intSeen    |= fresh;
         // W12: never discard a bit anyone services (see m_intPending).
-        m_intPending |= (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        // W13: branch on the accumulator -- same reasoning as diagConnect, and
+        // this is the watcher connectStation() actually uses, so an upload
+        // accumulated by associate()'s readHostResp reaches its drain here
+        // rather than waiting for the first serviceLink() pass afterwards.
+        uint8_t st = m_intPending;
         if (st & HOST_INT_UP_LD) {                 // drain data port, ignore body
             for (;;) {
                 uint16_t len = 0;
@@ -1273,25 +1337,41 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
         // m_rxPort was 17 and nothing was being read).  A hit here means RX
         // would otherwise have been dead forever, so it is counted, not silent.
         //
-        // The test is `bm != 0`, NOT `bm & (1u << m_rxPort)`.  There are two
-        // variants of this fault and the narrow test only catches one:
+        // There are two variants of this fault and they need different tests:
         //   (a) interrupt lost, ring model still right -- the captured silicon
-        //       freeze (rd_bitmap=0x20000 with m_rxPort==17);
+        //       freeze (rd_bitmap=0x20000 with m_rxPort==17).  `bm` carries our
+        //       own slot's bit, and that bit IS evidence: the firmware set it
+        //       for the upload it placed there;
         //   (b) interrupt lost AND the host's ring position no longer matches
         //       what the firmware is offering.  Then bits are set but NOT at
-        //       m_rxPort, the narrow test never fires, and RX is dead forever
-        //       while rxStrandedRecovered() still reads 0 -- the net silently
-        //       not working.  (b) is plausible on this card: W12's own
-        //       characterization is "the trigger is repeated connections", and
-        //       connectStation() does NOT re-download the firmware, so the
-        //       firmware is free to restart its upload ring under a host whose
-        //       m_rxPort keeps counting from wherever it was.
-        // Entering the ordinary drain path handles BOTH: readRingPacket already
-        // resyncs to the lowest set bit when its own bitmap read disagrees with
-        // m_rxPort (counted in rxRingResyncs()).  That is the resync to use --
-        // duplicating it here would give two ring models that can disagree.
-        bool drainNow = (st & HOST_INT_UP_LD) != 0;
-        bool viaNet   = false;
+        //       m_rxPort, a test that looks only at our own slot never fires,
+        //       and RX is dead forever while rxStrandedRecovered() still reads
+        //       0 -- the net silently not working.  (b) is plausible on this
+        //       card: W12's own characterization is "the trigger is repeated
+        //       connections", and connectStation() does NOT re-download the
+        //       firmware, so the firmware is free to restart its upload ring
+        //       under a host whose m_rxPort keeps counting from wherever it was.
+        //
+        // ★ W13: (b) is NOT closed by widening the test to `bm != 0`.  That was
+        // tried and measured WRONG on this firmware -- ~6100 ring resyncs over
+        // 110 blasts that found no data at all.  A SET RD-BITMAP BIT DOES NOT
+        // IMPLY A PACKET IS WAITING: stale bits linger, and entering the drain
+        // on one makes readRingPacket resync m_rxPort BACKWARDS onto it, so the
+        // ring walks the wrong way, repeatedly.  Never re-widen this test.
+        // (b) is closed with a POSITIVE check instead: probe the candidate
+        // slot's own RD_LEN -- the length registers are PER SLOT, so any slot
+        // can be read without selecting it first (see readRdLenPort) -- and
+        // enter the drain only if the card has actually published a length
+        // there.  A stale bit with zero length is ignored, not chased.  The
+        // candidate is the LOWEST set bit, which is exactly the slot
+        // readRingPacket would resync to, so probe and resync cannot disagree.
+        //
+        // Entering the ordinary drain path then handles both: readRingPacket
+        // owns the resync (counted in rxRingResyncs()) -- duplicating it here
+        // would give two ring models that can disagree.
+        bool drainNow  = (st & HOST_INT_UP_LD) != 0;
+        bool viaNet    = false;
+        bool viaDesync = false;
         if (!drainNow) {
             if (++m_svcQuietPasses >= RX_BITMAP_CHECK_PASSES) {
                 uint32_t bm = 0;
@@ -1299,9 +1379,24 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                     // Re-arm only on a check that actually happened: a failing
                     // bus must not buy itself another 64 passes of silence.
                     m_svcQuietPasses = 0;
-                    if (bm != 0) {
-                        drainNow = true;
+                    if (bm & (1u << m_rxPort)) {
+                        drainNow = true;                   // (a) aligned
                         viaNet   = true;
+                    } else if (bm != 0) {
+                        // (b) candidate elsewhere -- demand positive evidence
+                        // before letting the drain move the ring position.
+                        uint8_t p = 0;
+                        while (p < MAX_DATA_PORTS && !((bm >> p) & 1u)) p++;
+                        uint16_t clen = 0;
+                        if (p < MAX_DATA_PORTS &&
+                            readRdLenPort(p, &clen) == SdioHost::OK && clen != 0) {
+                            drainNow  = true;
+                            viaNet    = true;
+                            viaDesync = true;
+                        }
+                        // clen == 0 => stale bit: no drain, no resync, no
+                        // counter, and m_rxPort does NOT move.  This is the
+                        // whole point of the positive check.
                     }
                 }
             }
@@ -1344,7 +1439,15 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
             // Honest counter: only a drain the NET initiated, that actually
             // pulled a packet off the ring, is a recovered strand.  A bitmap
             // bit that evaporated before readRingPacket looked is not one.
-            if (viaNet && drainedAny) m_rxStrandedRecovered++;
+            // W13: split by variant -- (a) the upload was at our own ring slot,
+            // (b) it was elsewhere and the ring had desynced too.  They are
+            // different faults with different causes, so one counter each; a
+            // bench that sees only (b) is looking at a ring-model problem, not
+            // at the lost-interrupt problem.
+            if (viaNet && drainedAny) {
+                if (viaDesync) m_rxDesyncRecovered++;
+                else           m_rxStrandedRecovered++;
+            }
             // The DATA condition is finished: either the ring reported nothing
             // more (the normal exit) or a read failed, and re-entering this
             // loop on the very next pass could not help with that -- it would
