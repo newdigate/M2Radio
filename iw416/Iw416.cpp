@@ -262,7 +262,12 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
 // serviceLink()'s demux goes un-confirmed deliberately -- this loop only
 // matches pkttype+cmd, it does not parse/act on events -- which is fine: per
 // the fw's own contract an unconfirmed sleep just means it stays awake, and
-// the next idle period re-raises EVENT_PS_SLEEP.
+// the next idle period re-raises EVENT_PS_SLEEP.  A PS_AWAKE consumed here
+// also skips the HOST_POWER_UP clear that serviceLink's demux performs on
+// that event -- if the wake-latch hypothesis (see that clear's comment)
+// ever proves true on silicon, mirroring the flip/clear here is the fix
+// (queued as a W10 follow-up; soak signature to watch for: psSleeps() flat
+// while psHostWakes() stalls).
 SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                     uint32_t timeoutMs) {
     for (int tries = 0; tries < 4; tries++) {
@@ -1358,9 +1363,11 @@ SdioHost::Status Iw416::connectStation(const char *ssid, const char *psk,
         if (w != SdioHost::CMD_CRC) {
             m_connectedAp = *found;   // success-gated: only path that sets it
             // W10: IEEE PS on by default -- the idle RX-death workaround
-            // (see the PS constants block in the header).  Best-effort: a
-            // failure is recorded in lastRespResult but does not fail the
-            // connect.
+            // (see the PS constants block in the header).  Best-effort: does
+            // not fail the connect.  On a transport failure lastRespResult()
+            // is stale (from whatever command last completed, not this
+            // one) -- ieeePsEnabled() is the reliable signal for whether PS
+            // actually ended up enabled.
             if (psOn) (void)setIeeePs(true);
             return SdioHost::OK;
         }

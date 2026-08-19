@@ -276,13 +276,20 @@ public:
     uint8_t  psState()       const { return (uint8_t)m_psState; }
     uint32_t psSleeps()      const { return m_psSleeps; }   // confirms sent
     uint32_t psWakes()       const { return m_psWakes; }    // awake events seen
-    // Soak-disambiguation counters (W10 review): psSleeps() > psWakes() over
-    // a run is expected and does NOT mean an awake event was lost -- it also
-    // counts confirms whose eventual PS_AWAKE was consumed silently inside
-    // waitCmdResp's discard loop (see the comment there) or a host-initiated
-    // wake that preempted the card before it raised its own PS_AWAKE.
-    // psHostWakes() isolates the latter; a large gap between psSleeps() and
-    // (psWakes()+psHostWakes()) would instead point at swallowed events.
+    // Soak-disambiguation counters (W10 review).  A DATA-path host wake
+    // (sendDataFrame -> wakeCardIfSleeping) increments BOTH psHostWakes() (at
+    // the gate write itself) AND, once the fw's own PS_AWAKE arrives via
+    // serviceLink(), psWakes() -- so in the common case
+    // psWakes()+psHostWakes() normally EXCEEDS psSleeps(), by roughly the
+    // number of data-path host wakes (each one is double-counted across the
+    // two counters).  The honest invariant to watch is the other direction:
+    // psSleeps() - psWakes() approximates PS_AWAKE events that were
+    // swallowed -- mostly command-path wakes, whose PS_AWAKE arrives while
+    // waitCmdResp's discard loop (not serviceLink's demux) is reading the
+    // command port and so is never counted (see the comment there) -- plus
+    // any wake the fw genuinely raised no event for.  psHostWakes() counts
+    // gate writes on BOTH the data and command paths and is orthogonal to
+    // that invariant, not a term in it.
     uint32_t psConfirmFails() const { return m_psConfirmFails; } // sendSleepConfirm's send failed
     uint32_t psHostWakes()    const { return m_psHostWakes; }    // wakeCardIfSleeping actually wrote HOST_POWER_UP
 
