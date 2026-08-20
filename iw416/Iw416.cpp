@@ -98,6 +98,7 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     m_cmd53RegsTx = 0; m_cmd53RegsSvc = 0;
     m_mpRegsOk = true; m_mpRegsChecked = false;
     m_mpRegsBadStatus = 0; m_mpRegsErrors = 0;
+    m_mpRegsSnap = 0; m_mpRegsLive = 0;
     m_cmd53Rx = 0; m_cmd53Tx = 0;
     m_rxAggrBatches = 0; m_rxAggrSlots = 0;
     m_txAggrBatches = 0; m_txAggrSlots = 0;
@@ -630,9 +631,28 @@ SdioHost::Status Iw416::readMpRegs(MpRegs *out, bool txPath) {
     // other rather than against a constant.  See mpRegsUsable().
     if (!m_mpRegsChecked) {
         m_mpRegsChecked = true;
-        const uint8_t st = regs[CARD_STATUS_REG];
-        if (m_cardStatus != 0 && st != m_cardStatus) {
-            m_mpRegsBadStatus = st;
+        // Does the snapshot have any variety in it?  A port that took OP Code
+        // 0 literally returns N copies of ONE register and CANNOT produce
+        // anything else; a running card's register file cannot be uniform (the
+        // 32 per-slot RD_LENs are zeros on an idle link while 0x5C carries the
+        // command-port ready bits).  Testing the failure MODE rather than any
+        // register's value is what makes this immune to the mistake the first
+        // version of this check made -- see mpRegsUsable() in Iw416.h.
+        bool uniform = true;
+        for (uint16_t i = 1; i < MP_REGS_LEN; i++) {
+            if (regs[i] != regs[0]) { uniform = false; break; }
+        }
+        // Evidence, taken NOW rather than inherited from begin(): what the
+        // CMD52 path says register 0x5C holds at the same moment.  Reported,
+        // never used as a verdict -- 0x5C is live, and two reads of a live
+        // register are allowed to differ.
+        uint8_t live = 0;
+        (void)m_host.cmd52Read(1, CARD_STATUS_REG, &live);
+        m_cmd52PollsSvc++;
+        m_mpRegsSnap = regs[CARD_STATUS_REG];
+        m_mpRegsLive = live;
+        if (uniform) {
+            m_mpRegsBadStatus = regs[0];
             m_mpRegsOk = false;
             // The bits this read consumed still have to be accounted for
             // before falling back, or the very first register-port read would
@@ -668,16 +688,17 @@ SdioHost::Status Iw416::readMpRegs(MpRegs *out, bool txPath) {
     return SdioHost::OK;
 }
 
-SdioHost::Status Iw416::readWrBitmap32(uint32_t *out) {
+SdioHost::Status Iw416::readWrBitmap32(uint32_t *out, bool txPath) {
     uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     SdioHost::Status s;
     // W11: this is the CMD52 traffic sendDataFrame's wait loop used to pay per
     // poll.  W16 moved it into the register-port snapshot; this remains as the
     // fallback's TX half -- see readMpRegsCmd52().
-    s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
-    s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
+    uint32_t *ctr = txPath ? &m_cmd52PollsTx : &m_cmd52PollsSvc;
+    s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); (*ctr)++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); (*ctr)++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); (*ctr)++; if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); (*ctr)++; if (s != SdioHost::OK) return s;
     *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
     return SdioHost::OK;
 }
@@ -709,8 +730,12 @@ SdioHost::Status Iw416::readMpRegsCmd52(MpRegs *out, bool txPath) {
     s = readRdBitmap32(&out->rdBitmap);
     if (s != SdioHost::OK) return s;
     m_dbgBitmapOr |= out->rdBitmap;
-    s = readWrBitmap32(&out->wrBitmap);
-    if (s != SdioHost::OK) return s;
+    // TX path only: nothing on the service path reads wrBitmap, and four
+    // CMD52s per poll is real money on the path that is already the slow one.
+    if (txPath) {
+        s = readWrBitmap32(&out->wrBitmap, true);
+        if (s != SdioHost::OK) return s;
+    }
     uint8_t lo = 0, hi = 0;
     s = m_host.cmd52Read(1, CMD_RD_LEN_0, &lo); m_cmd52PollsSvc++;
     if (s != SdioHost::OK) return s;

@@ -383,6 +383,11 @@ public:
     struct MpRegs {
         uint8_t  intStatus;
         uint32_t rdBitmap;
+        // ★ VALID ON THE TX PATH ONLY when the CMD52 fallback filled this
+        // struct (mpRegsUsable() false).  Nothing on the service path reads
+        // it, and fetching it there would cost four CMD52s per poll on the one
+        // path that is already paying the pre-W16 price.  The register port
+        // always fills it -- it comes free in the same 196 bytes.
         uint32_t wrBitmap;
         uint16_t cmdRdLen;
         uint16_t rdLen[MAX_DATA_PORTS];
@@ -412,17 +417,46 @@ public:
     // on an empty wr-bitmap, and the read would still be eating the card's
     // clear-on-read interrupt status the whole time.
     //
-    // So the FIRST snapshot of each firmware life is checked against something
-    // that cannot be zero: CARD_STATUS (0x5C) sits inside NXP's 196-byte window
-    // and reads 0x0D on this silicon -- a value begin() has already fetched by
-    // CMD52 and stored in cardStatus(), so the check compares the register port
-    // against the CMD52 path rather than against a constant this driver
-    // invented.  On a mismatch the register port is abandoned for the rest of
-    // the firmware life and every caller falls back to the CMD52 reads this
-    // driver used before W16.  Slow, and correct, and LOUD: mpRegsUsable()
-    // reads false and mpRegsRejected() says what came back.
+    // So the FIRST snapshot of each firmware life is tested for the shape that
+    // failure has: IS EVERY BYTE THE SAME?  A port that obeyed OP Code 0
+    // literally returns N copies of one register and cannot produce anything
+    // else; a port that streams cannot produce a uniform 196 bytes on a
+    // running card (the per-slot RD_LEN block is zeros on an idle link while
+    // 0x5C carries the command-port ready bits).  The test is of the failure
+    // MODE, not of any register's value, which is what makes it immune to the
+    // thing that broke the first attempt.
+    //
+    // ★ THE FIRST ATTEMPT WAS A STALE-CONSTANT COMPARISON, AND SILICON KILLED
+    // IT IN ONE RUN.  It compared the snapshot's byte at 0x5C against the
+    // cardStatus() value begin() had read by CMD52 -- "a register that cannot
+    // be zero".  On the bench that read 0x40 against an expected 0x0D and the
+    // driver dutifully fell back to CMD52 on a card whose register port was
+    // working perfectly.  0x5C is CARD_TO_HOST_EVENT_REG: it means
+    // DN_LD_CARD_RDY|CARD_IO_READY (0x0D) to the BOOT ROM and UP_LD_CP_RDY
+    // (0x40) once firmware is running (NXP mlan_sdio_defs.h).  The reference
+    // was not a constant at all -- it was a live register captured minutes
+    // earlier, in a different phase of the card's life.
+    // The live CMD52 reading is still taken, once, and reported through
+    // mpRegsWitness() -- but as EVIDENCE, never as a verdict: two reads of a
+    // live register microseconds apart are allowed to differ.
     bool     mpRegsUsable()   const { return m_mpRegsOk; }
+    // Force the transport, for a CONTROLLED A/B on hardware.  useRegisterPort
+    // (false) selects the pre-W16 CMD52 path on a card whose register port
+    // works perfectly, which is the only way to measure the two against each
+    // other in ONE firmware life -- the discipline W12 learned the hard way
+    // when an A/B whose arms differed in a second respect (fresh boot vs
+    // repeat run) measured the difference nobody intended.  It also marks the
+    // port as already checked, so a forced arm is not silently re-tested and
+    // flipped back mid-run.
+    void useRegisterPort(bool on) { m_mpRegsOk = on; m_mpRegsChecked = true; }
+    // The repeated byte, when a uniform snapshot got the port rejected.
     uint8_t  mpRegsRejected() const { return m_mpRegsBadStatus; }
+    // What the two transports said about register 0x5C at the same moment, as
+    // (snapshot << 8) | CMD52.  Diagnostic: on a healthy card both are the
+    // card's live CARD_TO_HOST_EVENT value and normally agree.
+    uint16_t mpRegsWitness()  const {
+        return (uint16_t)(((uint16_t)m_mpRegsSnap << 8) | m_mpRegsLive);
+    }
     // Register-port reads that failed on the bus (not the sanity check).
     // Non-zero means interrupt bits were consumed by a transfer that then
     // errored -- see readMpRegs() for what is done about that.
@@ -909,8 +943,14 @@ private:
     // to decide whether that fault class is back.  Comparing this counter
     // across the drain is what tells the two apart.
     void latchIntBits(uint8_t st);
-    // The 32-bit WR bitmap as four CMD52s (the fallback's TX half).
-    SdioHost::Status readWrBitmap32(uint32_t *out);
+    // The 32-bit WR bitmap as four CMD52s (the fallback's TX half).  `txPath`
+    // decides which poll counter the four reads land in -- without it the
+    // service path's own fallback reads were being attributed to
+    // cmd52PollsTx(), which on the first silicon run made an idle link look
+    // like it was doing 191,607 CMD52s of TX polling for three transmitted
+    // frames.  Attribution that lies is worse than no attribution: W11 pinned
+    // a 2.5x regression on the TX path using exactly this split.
+    SdioHost::Status readWrBitmap32(uint32_t *out, bool txPath);
     // The 32-bit RD bitmap as four CMD52s.  Kept -- rather than replaced by
     // readMpRegs() -- because probeRdBitmap()'s whole contract is that it does
     // NOT touch the clear-on-read HOST_INT_STATUS (a diagnostic that steals
@@ -1160,6 +1200,8 @@ private:
     bool     m_mpRegsOk       = true;
     bool     m_mpRegsChecked  = false;
     uint8_t  m_mpRegsBadStatus = 0;
+    uint8_t  m_mpRegsSnap     = 0;   // register 0x5C as the register port saw it
+    uint8_t  m_mpRegsLive     = 0;   // ... and as CMD52 saw it, same moment
     uint32_t m_mpRegsErrors   = 0;
     // Bumped by latchIntBits() whenever HOST_INT_UP_LD is newly latched; read
     // across serviceLink's drain.  Wraps harmlessly -- only equality matters.
