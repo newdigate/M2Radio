@@ -1,7 +1,13 @@
 /* Copied verbatim from github.com/newdigate/Ethernet src/ (clean-room MIT,
  * see that repo). Per-library duplication is this tree's pattern (NativeEthernet
  * carries its own copy too); consequence: Ethernet and M2Radio's arduino/
- * cannot be imported into one sketch (duplicate class Client). */
+ * cannot be imported into one sketch (duplicate class Client).
+ *
+ * NOTE: unlike Client.h/Server.h (which use #pragma once and so collide with
+ * a LOUD "redefinition of 'class Client'" error), this header uses a NAMED
+ * guard (IPAddress_h) identical to Ethernet's copy -- so a TU that reaches
+ * both copies compiles SILENTLY, first-include-wins. Harmless while the two
+ * are byte-identical; if they ever drift, nothing at build time will say so. */
 /*
  *
  * MIT License:
