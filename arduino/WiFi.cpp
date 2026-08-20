@@ -74,13 +74,16 @@ struct ScopeFlag {
 bool WiFiClass::bringUpCard(bool doBoardPreamble) {
     if (m_cardUp) return true;    // short-circuit OUTSIDE the guard below: a
                                   // no-op call must not deafen the pump
-    // Defence in depth today, load-bearing tomorrow.  Nothing can currently
-    // observe an unguarded bring-up: m_cardUp is a one-way latch that is never
-    // cleared, so this body only ever runs while it is false, and both pump
-    // attach sites imply it is already true.  That stops holding the moment
-    // Task 6 adds m_pool.service() outside servicePass()'s `if (m_lwipUp)` --
-    // and the resulting stolen command reply is a SILICON-ONLY failure that no
-    // QEMU gate in this tree would ever go red on.
+    // Defence in depth.  Nothing can currently observe an unguarded bring-up:
+    // m_cardUp is a one-way latch that is never cleared, so this body only ever
+    // runs while it is false, and both pump attach sites imply it is already
+    // true.  The guard exists for the day that stops being true -- an end() or
+    // a card-reset path that clears m_cardUp lets the pump re-enter bring-up
+    // mid-command, and the resulting stolen command reply (Iw416.h) is a
+    // SILICON-ONLY failure that no QEMU gate in this tree would ever go red on.
+    // (An earlier version of this comment named Task 6's m_pool.service() as
+    // the trigger; that step was dropped as dead code -- see the plan's
+    // Deviations.  Nothing in the current plan is about to trip this.)
     DriverCmd guard(m_inDriverCmd);
     if (doBoardPreamble) m2ReleaseWifiReset();
     // HAZARD (m2_sdio_probe.cpp): J15 (microSD) is the SAME bus, so this 1.8 V
