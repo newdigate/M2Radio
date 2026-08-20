@@ -74,9 +74,15 @@ public:
     // Advanced / used by WiFiClient and WiFiServer.
     bool lwipUp() const { return m_lwipUp; }   // lwip_init + netif_add done
     bool linkUp() const { return m_linkUp; }   // associated, netif link up
-    void servicePass();                        // ONE bounded service pass, no
-                                               // guards -- callers that are
-                                               // not loop() must not re-enter
+    void servicePass();                        // ONE bounded service pass.
+                                               // BOTH guards live HERE, not in
+                                               // loop(): the driver delay()s
+                                               // inside a pass, so yield() can
+                                               // re-enter this directly and a
+                                               // guard on loop() alone would
+                                               // not see it.  Safe to call
+                                               // anywhere; loop() adds only
+                                               // maybeReconnect() on top
     bool pumpUntil(bool (*cond)(void *), void *ctx, uint32_t timeoutMs);
                                                // service until cond() or
                                                // timeout; how blocking calls

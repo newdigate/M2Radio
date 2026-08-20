@@ -75,7 +75,6 @@ bool WiFiClass::bringUpCard(bool doBoardPreamble) {
 
 int WiFiClass::begin(const char *ssid, const char *psk,
                      uint32_t timeoutMs, bool doBoardPreamble) {
-    (void)timeoutMs;
     // Reject rather than truncate.  A silently-shortened SSID comes back as
     // "SSID not found" and a silently-shortened passphrase as a wrong key --
     // both maximally confusing on a bench.  32 is the 802.11 SSID limit; 63 is
@@ -84,26 +83,155 @@ int WiFiClass::begin(const char *ssid, const char *psk,
     if (psk  && strlen(psk)  > 63)      { m_status = WL_CONNECT_FAILED; return m_status; }
     strncpy(m_ssid, ssid ? ssid : "", sizeof(m_ssid) - 1);
     strncpy(m_psk,  psk  ? psk  : "", sizeof(m_psk)  - 1);
+    if (m_linkUp) disconnect();         // re-begin() on a live link: tear the
+                                        // old association down first
     if (!bringUpCard(doBoardPreamble)) { m_status = WL_NO_SHIELD; return m_status; }
-    m_status = WL_IDLE_STATUS;          // Task 4 replaces this with the
-    return m_status;                    // lwip + connectStation + DHCP path
+    if (!m_lwipUp) {
+        lwip_init();
+        netif_add(&m_netif, IP4_ADDR_ANY4, IP4_ADDR_ANY4, IP4_ADDR_ANY4,
+                  &m_iw416, iw416NetifInit, ethernet_input);
+        netif_set_default(&m_netif);
+        netif_set_up(&m_netif);
+        m_lwipUp = true;
+    }
+    int st = connectAndDhcp(timeoutMs);
+    m_status = (uint8_t)st;
+    // Attach the yield pump even on a FAILED connect: the sketch may call
+    // status()/loop() and, with auto-reconnect on, the link comes back without
+    // the sketch doing anything.  A pass with no link only ticks lwip timers.
+    if (m_autoService && !m_autoServiceAttached) {
+        m_responder.attach(serviceEvent);
+        m_responder.triggerEvent();
+        m_autoServiceAttached = true;
+    }
+    return m_status;
 }
 
-void WiFiClass::disconnect() {}
-uint8_t WiFiClass::status() { return m_status; }
-IPAddress WiFiClass::ipFromNetif(int) { return IPAddress(); }
-IPAddress WiFiClass::dnsServerIP() { return IPAddress(); }
+static bool dhcpCond(void *nif) {
+    return dhcp_supplied_address((struct netif *)nif) != 0;
+}
+
+int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
+    uint32_t t0 = millis();
+    // m_inDriverCmd deafens the pump for the whole command-port exchange:
+    // Iw416.h documents that a serviceLink() pass concurrent with one steals
+    // or misparses the reply.  connectStation() internally delay()s, so the
+    // yield pump WOULD run inside it without this.  Cleared on every path
+    // below before any return -- leaving it set permanently deafens the pump.
+    m_inDriverCmd = true;
+    SdioHost::Status c = m_iw416.connectStation(
+        m_ssid, m_psk[0] ? m_psk : nullptr);   // psOn defaults true: IEEE PS
+                                               // stays ON (W10 erratum)
+    m_inDriverCmd = false;
+    if (c == SdioHost::BAD_CIS) return WL_NO_SSID_AVAIL;   // scan ran, SSID absent
+    if (c != SdioHost::OK)      return WL_CONNECT_FAILED;  // assoc/handshake/bus
+    m_linkUp = true;
+    netif_set_link_up(&m_netif);
+    dhcp_start(&m_netif);
+    uint32_t spent = millis() - t0;
+    uint32_t left  = (spent < timeoutMs) ? timeoutMs - spent : 1;
+    if (!pumpUntil(dhcpCond, &m_netif, left)) {
+        // Associated but no lease: report the failure rather than a half-truth.
+        dhcp_stop(&m_netif);
+        return WL_CONNECT_FAILED;
+    }
+    return WL_CONNECTED;
+}
+
+void WiFiClass::disconnect() {
+    if (m_linkUp) {
+        m_inDriverCmd = true;
+        (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
+        m_inDriverCmd = false;
+        dhcp_stop(&m_netif);
+        netif_set_link_down(&m_netif);
+        m_linkUp = false;
+    }
+    m_status = WL_DISCONNECTED;
+}
+
+uint8_t WiFiClass::status() {
+    maybeReconnect();
+    return m_status;
+}
+
+IPAddress WiFiClass::ipFromNetif(int which) {
+    if (!m_lwipUp) return IPAddress();
+    const ip4_addr_t *a = (which == 1) ? netif_ip4_netmask(&m_netif)
+                        : (which == 2) ? netif_ip4_gw(&m_netif)
+                        : netif_ip4_addr(&m_netif);
+    return IPAddress(ip4_addr_get_u32(a));
+}
+
+IPAddress WiFiClass::dnsServerIP() {
+    const ip_addr_t *d = dns_getserver(0);
+    return IPAddress(ip4_addr_get_u32(ip_2_ip4(d)));
+}
+
 uint8_t *WiFiClass::macAddress(uint8_t *mac) { memcpy(mac, g_mac, 6); return mac; }
-int32_t WiFiClass::RSSI() { return 0; }
-int WiFiClass::hostByName(const char *, IPAddress &, uint32_t) { return 0; }
-void WiFiClass::loop() {}
-void WiFiClass::setAutoService(bool on) { m_autoService = on; }
-// servicePass() is the RAW bounded pass (poll the link, sys_check_timeouts,
-// pool retries).  loop() is the guarded wrapper around it: re-entrancy latch +
-// m_inDriverCmd + maybeReconnect().  Task 4 fills both in.
-void WiFiClass::servicePass() {}
-bool WiFiClass::pumpUntil(bool (*)(void *), void *, uint32_t) { return false; }
-void WiFiClass::serviceEvent(EventResponderRef) {}
-int WiFiClass::connectAndDhcp(uint32_t) { return WL_IDLE_STATUS; }
-void WiFiClass::maybeReconnect() {}
-void WiFiClass::linkLost() {}
+
+int32_t WiFiClass::RSSI() {
+    if (!m_linkUp) return 0;
+    return -(int32_t)m_iw416.connectedAp().rssi;   // dBm = -raw (Iw416.h)
+}
+
+// --- the service pump --------------------------------------------------------
+void WiFiClass::servicePass() {
+    if (m_inService || m_inDriverCmd) return;   // both guards load-bearing:
+    m_inService = true;                         // see WiFi.h + Iw416.h
+    if (m_lwipUp) {
+        if (m_linkUp && !iw416NetifPoll(&m_netif)) linkLost();
+        sys_check_timeouts();
+    }
+    m_inService = false;
+}
+
+void WiFiClass::linkLost() {
+    m_linkUp = false;
+    dhcp_stop(&m_netif);
+    netif_set_link_down(&m_netif);
+    m_status = WL_CONNECTION_LOST;
+    // Pool teardown arrives with the pool (Task 6).
+}
+
+bool WiFiClass::pumpUntil(bool (*cond)(void *), void *ctx, uint32_t timeoutMs) {
+    uint32_t t0 = millis();
+    while (!cond(ctx)) {
+        servicePass();
+        if (millis() - t0 >= timeoutMs) return false;
+        delay(1);        // delay() yields -> auto-service also runs; harmless
+    }
+    return true;
+}
+
+void WiFiClass::serviceEvent(EventResponderRef ref) {
+    WiFi.servicePass();      // NOT loop(): the pump must never reach
+                             // maybeReconnect(), whose 15 s scan would fire
+                             // inside an unrelated delay()
+    ref.triggerEvent();      // re-queue: one bounded pass per yield(), forever
+}
+
+void WiFiClass::loop() {
+    servicePass();
+    maybeReconnect();        // sketch-called path only: the yield pump calls
+}                            // servicePass() directly and can never scan
+
+void WiFiClass::setAutoService(bool on) {
+    m_autoService = on;
+    if (!on && m_autoServiceAttached) { m_responder.detach(); m_autoServiceAttached = false; }
+    if (on && !m_autoServiceAttached && m_lwipUp) {
+        m_responder.attach(serviceEvent);
+        m_responder.triggerEvent();
+        m_autoServiceAttached = true;
+    }
+}
+
+void WiFiClass::maybeReconnect() {
+    if (!m_autoReconnect || m_linkUp || !m_cardUp || !m_lwipUp) return;
+    if (m_status != WL_CONNECTION_LOST) return;
+    if (millis() - m_lastReconnectMs < 5000) return;   // scan storms are 15 s
+    m_lastReconnectMs = millis();
+    m_status = (uint8_t)connectAndDhcp(30000);
+}
+
+int WiFiClass::hostByName(const char *, IPAddress &, uint32_t) { return 0; }  // Task 8
