@@ -43,8 +43,34 @@ static void m2ReleaseWifiReset() {
     delay(1000);                                    // PDn exit needs ROM boot time
 }
 
+// --- m_inDriverCmd, held by scope ------------------------------------------
+// Iw416.h:884-892: a serviceLink() pass concurrent with a command-port
+// exchange STEALS or MISPARSES the reply.  Every facade call into the driver's
+// command path therefore deafens the yield pump for its duration.
+//
+// RAII rather than a hand-placed set/clear pair, for two reasons.  bringUpCard()
+// alone has five early `return false` exits, and a clear missed on one of them
+// leaves the pump permanently deafened -- a worse failure than the bug the
+// guard prevents, and a silent one.  And restoring the CALLER's value (not
+// hardcoding false) makes it nest-safe without a counter: an inner scope
+// finishing cannot un-deafen the pump for an outer command still in flight.
+struct DriverCmd {
+    volatile bool &f; bool prev;
+    explicit DriverCmd(volatile bool &b) : f(b), prev(b) { f = true; }
+    ~DriverCmd() { f = prev; }
+};
+
 bool WiFiClass::bringUpCard(bool doBoardPreamble) {
-    if (m_cardUp) return true;
+    if (m_cardUp) return true;    // short-circuit OUTSIDE the guard below: a
+                                  // no-op call must not deafen the pump
+    // Defence in depth today, load-bearing tomorrow.  Nothing can currently
+    // observe an unguarded bring-up: m_cardUp is a one-way latch that is never
+    // cleared, so this body only ever runs while it is false, and both pump
+    // attach sites imply it is already true.  That stops holding the moment
+    // Task 6 adds m_pool.service() outside servicePass()'s `if (m_lwipUp)` --
+    // and the resulting stolen command reply is a SILICON-ONLY failure that no
+    // QEMU gate in this tree would ever go red on.
+    DriverCmd guard(m_inDriverCmd);
     if (doBoardPreamble) m2ReleaseWifiReset();
     // HAZARD (m2_sdio_probe.cpp): J15 (microSD) is the SAME bus, so this 1.8 V
     // request reaches any card sitting in it -- a 3.3 V-only microSD must not
@@ -113,16 +139,13 @@ static bool dhcpCond(void *nif) {
 
 int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
     uint32_t t0 = millis();
-    // m_inDriverCmd deafens the pump for the whole command-port exchange:
-    // Iw416.h documents that a serviceLink() pass concurrent with one steals
-    // or misparses the reply.  connectStation() internally delay()s, so the
-    // yield pump WOULD run inside it without this.  Cleared on every path
-    // below before any return -- leaving it set permanently deafens the pump.
-    m_inDriverCmd = true;
-    SdioHost::Status c = m_iw416.connectStation(
-        m_ssid, m_psk[0] ? m_psk : nullptr);   // psOn defaults true: IEEE PS
+    SdioHost::Status c;
+    {   // connectStation() delay()s internally, so the yield pump WOULD run
+        // inside it -- and inside its command-port exchange -- without this.
+        DriverCmd guard(m_inDriverCmd);
+        c = m_iw416.connectStation(m_ssid, m_psk[0] ? m_psk : nullptr);
+    }                                          // psOn defaults true: IEEE PS
                                                // stays ON (W10 erratum)
-    m_inDriverCmd = false;
     if (c == SdioHost::BAD_CIS) return WL_NO_SSID_AVAIL;   // scan ran, SSID absent
     if (c != SdioHost::OK)      return WL_CONNECT_FAILED;  // assoc/handshake/bus
     m_linkUp = true;
@@ -131,22 +154,35 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
     uint32_t spent = millis() - t0;
     uint32_t left  = (spent < timeoutMs) ? timeoutMs - spent : 1;
     if (!pumpUntil(dhcpCond, &m_netif, left)) {
-        // Associated but no lease: report the failure rather than a half-truth.
+        // Associated but no lease: report the failure rather than a half-truth
+        // -- AND make the state agree with the verdict.  Leaving m_linkUp set
+        // here left the facade associated-with-no-address forever: status()
+        // said failed while RSSI() returned a live value, and
+        // maybeReconnect()'s `|| m_linkUp ||` guard blocked every retry.
         dhcp_stop(&m_netif);
+        {
+            DriverCmd guard(m_inDriverCmd);
+            (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
+        }
+        netif_set_link_down(&m_netif);
+        m_linkUp = false;
         return WL_CONNECT_FAILED;
     }
     return WL_CONNECTED;
 }
 
 void WiFiClass::disconnect() {
-    if (m_linkUp) {
-        m_inDriverCmd = true;
+    if (!m_linkUp) return;   // NOT a place to clobber m_status: an unconnected
+                             // disconnect() used to overwrite the diagnosis
+                             // from a failed begin() -- WL_NO_SSID_AVAIL became
+                             // WL_DISCONNECTED and the bench lost the reason
+    {
+        DriverCmd guard(m_inDriverCmd);
         (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
-        m_inDriverCmd = false;
-        dhcp_stop(&m_netif);
-        netif_set_link_down(&m_netif);
-        m_linkUp = false;
     }
+    dhcp_stop(&m_netif);
+    netif_set_link_down(&m_netif);
+    m_linkUp = false;
     m_status = WL_DISCONNECTED;
 }
 
@@ -164,6 +200,10 @@ IPAddress WiFiClass::ipFromNetif(int which) {
 }
 
 IPAddress WiFiClass::dnsServerIP() {
+    if (!m_lwipUp) return IPAddress();   // same guard ipFromNetif() carries.
+                                         // Harmless without it (dns_getserver
+                                         // indexes a zero-init static), but the
+                                         // asymmetry invites the wrong fix
     const ip_addr_t *d = dns_getserver(0);
     return IPAddress(ip4_addr_get_u32(ip_2_ip4(d)));
 }
@@ -218,7 +258,20 @@ void WiFiClass::loop() {
 
 void WiFiClass::setAutoService(bool on) {
     m_autoService = on;
-    if (!on && m_autoServiceAttached) { m_responder.detach(); m_autoServiceAttached = false; }
+    if (!on && m_autoServiceAttached) {
+        // clearEvent() BEFORE detach(), and it is not tidiness.
+        // EventResponder::detachNoInterrupts() unlinks the responder but leaves
+        // _triggered SET; attach() does not clear it; and
+        // triggerEventNotImmediate() is wrapped in `if (_triggered == false)`.
+        // So without this the re-arm below is a silent no-op and the pump never
+        // runs again -- while status() still says WL_CONNECTED and linkUp() is
+        // still true.  In steady state _triggered is essentially always set, so
+        // this was near-deterministic rather than a race, and it defeated the
+        // documented setAutoService() escape hatch entirely.
+        (void)m_responder.clearEvent();
+        m_responder.detach();
+        m_autoServiceAttached = false;
+    }
     if (on && !m_autoServiceAttached && m_lwipUp) {
         m_responder.attach(serviceEvent);
         m_responder.triggerEvent();
@@ -231,7 +284,11 @@ void WiFiClass::maybeReconnect() {
     if (m_status != WL_CONNECTION_LOST) return;
     if (millis() - m_lastReconnectMs < 5000) return;   // scan storms are 15 s
     m_lastReconnectMs = millis();
-    m_status = (uint8_t)connectAndDhcp(30000);
+    int st = connectAndDhcp(30000);
+    // Keep the lost-link state on a FAILED retry.  Overwriting m_status with
+    // the attempt's outcome closes the WL_CONNECTION_LOST guard above forever,
+    // making auto-reconnect a single shot and the 5 s throttle dead code.
+    m_status = (st == WL_CONNECTED) ? (uint8_t)st : (uint8_t)WL_CONNECTION_LOST;
 }
 
 int WiFiClass::hostByName(const char *, IPAddress &, uint32_t) { return 0; }  // Task 8

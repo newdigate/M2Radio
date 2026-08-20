@@ -11,6 +11,11 @@
  *   - The link must be serviced continuously.  By default a yield()-driven
  *     EventResponder pump does it (every loop() pass and every delay() ms);
  *     WiFi.setAutoService(false) hands the cadence to your own WiFi.loop().
+ *     EXPECT ~1 kHz once the link is UP: a quiet link-up service pass blocks
+ *     ~1 ms in the driver's trailing delay(1) (Iw416.cpp, serviceLink), so
+ *     your loop() iteration rate falls to about that.  Inherent to a polled
+ *     SDIO driver, not a defect -- but it is a surprise if you measured your
+ *     loop rate before calling begin().
  */
 #pragma once
 #include <stdint.h>
@@ -46,6 +51,12 @@ public:
               uint32_t timeoutMs = 30000, bool doBoardPreamble = true);
     void disconnect();
 
+    // CAN BLOCK ~45 s, but only with setAutoReconnect(true): status() drives
+    // maybeReconnect(), which is a ~15 s scan under the command-port guard plus
+    // up to 30 s of DHCP.  Default (auto-reconnect OFF) it is a plain getter.
+    // The call is deliberately here and not only in loop(): a sketch relying on
+    // the auto-service pump may never call WiFi.loop() at all, and moving it
+    // would leave such a sketch with auto-reconnect silently doing nothing.
     uint8_t   status();
     IPAddress localIP()     { return ipFromNetif(0); }
     IPAddress subnetMask()  { return ipFromNetif(1); }
@@ -61,6 +72,9 @@ public:
     // One bounded service pass; safe to call anywhere, any rate.
     void loop();
     void setAutoService(bool on);
+    // Default FALSE.  Turning it ON makes status() and loop() capable of
+    // blocking ~45 s (see status()); reconnect NEVER runs from the yield pump,
+    // so a 15 s scan can not fire inside an unrelated delay().
     void setAutoReconnect(bool on) { m_autoReconnect = on; }
 
     // Escape hatches -- the facade is a floor, not a ceiling.
