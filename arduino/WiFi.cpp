@@ -178,10 +178,16 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
             (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
         }
         // Same teardown as every other link-down site.  dhcp_stop() now runs
-        // after the deauth rather than before it, which is inert HERE and only
-        // here: it transmits a DHCP RELEASE only when a lease exists
+        // after the deauth rather than before it.  That is inert here ALMOST
+        // always: it transmits a DHCP RELEASE only when a lease exists
         // (dhcp_release_and_stop, guarded by dhcp_supplied_address), and we are
-        // on this path precisely because no lease ever arrived.
+        // normally on this path precisely because no lease arrived.  The
+        // exception is one servicePass wide -- pumpUntil() tests its timeout
+        // AFTER pumping, so a lease that binds inside the final pass still
+        // returns false, and then the RELEASE is emitted post-deauth and the
+        // frame is dropped.  Harmless: RELEASE is best-effort in lwip (its own
+        // source notes correct DHCP behaviour does not depend on it) and
+        // netif_set_addr(ANY,ANY,ANY) clears the address either way.
         linkDownAndAbort();
         return WL_CONNECT_FAILED;
     }

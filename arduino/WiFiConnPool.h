@@ -75,6 +75,13 @@ struct WiFiConn {
 //    tcp_connect(), and `arg` there will be the SLOT (installCallbacks set
 //    tcp_arg).  connectDone/connectOk are only ever set here to (true,false),
 //    by connErr and abortAll -- the success half belongs to that callback.
+//    That callback also owns the STATE transition: alloc() reserves the slot
+//    as CONNECTING and nothing in the pool advances it, so a connected
+//    callback must set state = ESTABLISHED itself.  (The accept path differs
+//    -- a server sets ESTABLISHED at accept time, which is why the example
+//    below does not show this.)  A slot left in CONNECTING after a successful
+//    connect still works for RX/TX, but reads as "connecting" to anything
+//    that inspects state, so set it.
 // 4. stop() will usually put an RST on the wire, not a FIN.  tcp_recved() is
 //    deferred to consume(), so any unread byte leaves rcv_wnd != TCP_WND_MAX,
 //    and tcp_close_shutdown() resets rather than closes gracefully (tcp.c).
