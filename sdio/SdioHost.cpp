@@ -28,6 +28,14 @@ static const uint32_t INT_CCE  = 1u << 17;  // command CRC error
 static const uint32_t INT_CEBE = 1u << 18;  // command end-bit error
 static const uint32_t INT_CIE  = 1u << 19;  // command index error
 static const uint32_t INT_CMD_ERR = INT_CTOE | INT_CCE | INT_CEBE | INT_CIE;
+// CINT, the SDIO card interrupt (DAT1).  It is NOT a latched event: the
+// controller derives it from the card's line level and INT_STATUS_EN[CINT], so
+// writing 1 to it does not clear it while that enable is set -- the card has to
+// let go of DAT1 first.  Both sendCommand() and cmd53() write INT_STATUS back
+// wholesale (`INT_STATUS = st`, `INT_STATUS = 0xFFFFFFFF`), and this is why
+// that is harmless with card interrupts live: the bit declines the write, and
+// nothing in either function tests it.
+static const uint32_t INT_CINT = 1u << 8;
 
 // CMD_XFR_TYP response types
 static const uint32_t RSP_NONE   = 0u << 16;
@@ -158,7 +166,14 @@ SdioHost::Status SdioHost::begin() {
     }
     PROT_CTRL = (PROT_CTRL & ~0x6u);   // 1-bit bus width for identification
     INT_STATUS_EN = 0xFFFFFFFFu;
-    INT_SIGNAL_EN = 0;                 // polled, no interrupts in W1
+    // No interrupt is SIGNALLED to the CPU by default -- the polled path is
+    // what W1..W14 ran and it stays the default.  enableCardInt() is the only
+    // thing that ever sets a bit here, and it must be called after this reset:
+    // RSTA above wipes both enables, so the mirror is dropped too or an
+    // already-"armed" flag would describe a controller that is signalling
+    // nothing.
+    INT_SIGNAL_EN  = 0;
+    m_cardIntArmed = false;
 
     if (m_use1V8) {
         // GPIO_AD_34 (ball J16) ALT4 = USDHC1_VSELECT -> R168 -> U311.5, which
@@ -267,6 +282,78 @@ SdioHost::Status SdioHost::cmd52Read(uint8_t fn, uint32_t addr, uint8_t *out) {
 SdioHost::Status SdioHost::cmd52Write(uint8_t fn, uint32_t addr, uint8_t value) {
     return sendCommand(52, cmd52Arg(true, fn, addr, value),
                        RSP_48 | CHK_CRC | CHK_IDX, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// The SDIO card interrupt (DAT1).  See SdioHost.h for the protocol; this is
+// only the plumbing.
+//
+// The vector table takes a plain function, so the instance that owns uSDHC1's
+// interrupt is recorded here while card interrupts are enabled.  There is
+// exactly one uSDHC1 on this part and the file-header WARNING already says only
+// one card may be present on it, so a single owner is the honest model rather
+// than a limitation worth generalising away.
+static SdioHost *s_cardIntOwner = nullptr;
+
+static void usdhc1_card_isr(void) {
+    if (s_cardIntOwner) s_cardIntOwner->cardIsr();
+}
+
+void SdioHost::cardIsr() {
+    // MASK FIRST, AND UNCONDITIONALLY.  DAT1 is a level: while the card still
+    // has an unmasked cause the controller keeps the IRQ line asserted, so any
+    // path out of here that leaves signalling enabled re-enters immediately and
+    // the CPU never returns to thread level.  Clearing the whole register is
+    // both correct and atomic -- CINT is the only bit this driver ever signals
+    // (begin() sets INT_SIGNAL_EN = 0 and armCardInt() writes CINT alone).
+    INT_SIGNAL_EN  = 0;
+    m_cardIntArmed = false;
+    // No SDIO command is issued here: servicing means CMD52/CMD53 traffic, and
+    // this ISR may have interrupted a thread half way through a transfer.  All
+    // it does is record that the card wants attention.
+    if (INT_STATUS & INT_CINT) {
+        m_cardIntFlag = true;
+        m_cardIntCount++;
+    }
+}
+
+void SdioHost::enableCardInt(bool enable) {
+    if (enable) {
+        m_cardIntFlag  = false;
+        m_cardIntArmed = false;
+        // The status bit only exists while its status-enable is set; begin()
+        // sets the whole register, but this makes the call order-independent.
+        INT_STATUS_EN |= INT_CINT;
+        s_cardIntOwner = this;
+        attachInterruptVector(IRQ_USDHC1, &usdhc1_card_isr);
+        NVIC_ENABLE_IRQ(IRQ_USDHC1);
+        m_cardIntOn = true;
+        // Arm LAST.  INT_SIGNAL_EN is still 0 at the NVIC_ENABLE_IRQ above, so
+        // no interrupt can arrive between attaching the vector and being ready
+        // for it; and if the card is ALREADY holding DAT1 down (it may well be
+        // -- the card side is unmasked long before this), this write is what
+        // delivers that standing assertion, which is exactly right.
+        armCardInt();
+    } else {
+        m_cardIntOn    = false;
+        INT_SIGNAL_EN  = 0;
+        NVIC_DISABLE_IRQ(IRQ_USDHC1);
+        s_cardIntOwner = nullptr;
+        m_cardIntFlag  = false;
+        m_cardIntArmed = false;
+    }
+}
+
+void SdioHost::armCardInt() {
+    if (!m_cardIntOn || m_cardIntArmed) return;
+    m_cardIntArmed = true;      // before the write -- see the member comment
+    INT_SIGNAL_EN  = INT_CINT;
+}
+
+bool SdioHost::takeCardInt() {
+    if (!m_cardIntFlag) return false;
+    m_cardIntFlag = false;
+    return true;
 }
 
 SdioHost::Status SdioHost::readManfId(uint16_t *manufacturer, uint16_t *card) {

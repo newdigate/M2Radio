@@ -301,6 +301,45 @@ public:
     // counted at the CMD52/CMD53 call site rather than by caller).
     uint32_t cmd52PollsTx()   const { return m_cmd52PollsTx; }   // sendDataFrame's wr_bitmap wait
     uint32_t cmd52PollsSvc()  const { return m_cmd52PollsSvc; }  // serviceLink + its RX helpers
+
+    // --- W15: interrupt-driven service (the SDIO card interrupt, DAT1) ------
+    //
+    // Polled, serviceLink() reads HOST_INT_STATUS once per pass and paces
+    // itself with delay(1): ~1000 CMD52 per second on a link doing absolutely
+    // nothing.  In interrupt mode the CARD says when it has work -- it pulls
+    // DAT1 whenever HOST_INT_STATUS has a bit its HOST_INT_MASK lets through --
+    // and a quiet pass issues no bus traffic at all.
+    //
+    // ★ DEFAULT: OFF, and it stays off until silicon says otherwise.  The
+    // RT1176 uSDHC's card-interrupt behaviour has never been exercised on the
+    // MIMXRT1170-EVKB, and the QEMU model it was developed against is the one
+    // behaviour in that file derived from the SPECIFICATION rather than from a
+    // capture (its MODELLING NOTE 10 says so).  A green gate proves this driver
+    // matches the spec as read there, not that it matches the card -- so the
+    // polled path remains the default and remains correct, and turning this on
+    // is a deliberate act.
+    //
+    // PRECONDITIONS: call after SdioHost::begin() and after enableHostInt()
+    // (the card side has to be unmasked for the card to drive DAT1 at all).
+    //
+    // WHAT DOES *NOT* CHANGE, and this is the load-bearing part: the W12/W13
+    // RD-bitmap safety net still runs on exactly the same schedule.  It fires
+    // every RX_BITMAP_CHECK_PASSES *quiet passes* and quiet passes are
+    // untouched -- serviceLink still loops once per delay(1), it just stops
+    // issuing a CMD52 on each one.  See the comment at the top of
+    // serviceLink()'s loop for why that had to be checked rather than assumed:
+    // a net whose trigger is "quiet passes" would be silently DEAD if
+    // interrupt mode had removed the passes instead of the reads, and the
+    // W13 evidence (rxStrandedRecovered() still climbing ~3 per 80 blasts on
+    // silicon) says this firmware genuinely needs it.
+    void setInterruptMode(bool on);
+    bool interruptMode() const { return m_intMode; }
+    // DAT1 assertions serviced.  This is the un-fakeable "interrupt mode
+    // actually engaged" signal: a driver that stayed polled -- or one whose
+    // controller-side enable silently did not take -- reads 0 here no matter
+    // how many frames it delivers.  Reset per firmware life, like the other
+    // service counters.
+    uint32_t cardInts() const { return m_cardInts; }
     uint32_t cmd53Count()     const { return m_cmd53Count; }     // data CMD53s, both directions
     uint32_t cmd53Bytes()     const { return m_cmd53Bytes; }     // bytes successfully issued on the bus
     uint32_t cmd53ByteMode()  const { return m_cmd53ByteMode; }  // of those, how many were BYTE mode
@@ -818,6 +857,11 @@ private:
     //    real increment site, not just a read of a value that already exists.
     uint32_t m_cmd52PollsTx   = 0;
     uint32_t m_cmd52PollsSvc  = 0;
+    // W15: interrupt-driven service.  m_intMode is the mode switch (see
+    // setInterruptMode); m_cardInts counts DAT1 assertions serviceLink took
+    // delivery of, and is per-firmware-life like the counters above.
+    bool     m_intMode        = false;
+    uint32_t m_cardInts       = 0;
     uint32_t m_cmd53Count     = 0;
     uint32_t m_cmd53Bytes     = 0;
     uint32_t m_cmd53ByteMode  = 0;
@@ -849,6 +893,14 @@ private:
     // the ~26k CMD53s of a live soak that is noise.  Deliberately NOT smaller:
     // this is a backstop, not a polling strategy -- if it ever runs often
     // enough to matter, rxStrandedRecovered() will say so.
+    //
+    // W15: in interrupt mode this same tick ALSO carries the HOST_INT_STATUS
+    // read (see serviceLink), which makes it a slow poll of both ports rather
+    // than of the ring alone.  That is deliberate: the data ring has a bitmap
+    // to check, the COMMAND port has nothing of the kind, so without it a board
+    // whose DAT1 never asserts would go deaf to deauth/PS events while RX kept
+    // working -- a failure mode far nastier than the one it replaces.  Cost is
+    // one extra CMD52 per 64 ms.
     static const uint16_t RX_BITMAP_CHECK_PASSES = 64;
     uint16_t m_svcQuietPasses     = 0;   // consecutive drainless serviceLink passes
     uint32_t m_rxStrandedRecovered = 0;  // net found an upload at m_rxPort, no interrupt

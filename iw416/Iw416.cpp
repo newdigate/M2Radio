@@ -102,6 +102,13 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     // lost-interrupt fault is still happening.
     m_intPending = 0; m_svcQuietPasses = 0; m_rxStrandedRecovered = 0;
     m_rxDrainErrors = 0;
+    // W15: DAT1 assertions are per-firmware-life for the same reason -- the
+    // number a soak reads to decide whether interrupt mode is actually
+    // carrying the traffic must describe THIS firmware, not the one before the
+    // recovery re-download.  m_intMode is deliberately NOT reset: it is the
+    // caller's mode selection, not a measurement, and a re-download must not
+    // silently drop the host back to polling.
+    m_cardInts = 0;
     // W13: same rule for the two new per-firmware-life signatures -- the
     // desync-variant recovery count and the "bit set, no length published"
     // diagnostic.  Both describe THIS firmware's ring behaviour.
@@ -1312,15 +1319,60 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
     if (dropped) *dropped = false;
     bool gotFrame = false, gotDrop = false;
     for (uint32_t waited = 0; waited <= waitMs; waited++) {
+        // ---- W15: is HOST_INT_STATUS worth reading on this pass? ----------
+        //
+        // Polled (the default), the answer is always yes and this is exactly
+        // the code W14 shipped.  In INTERRUPT mode the card raises DAT1 when it
+        // has work, so a quiet pass need not touch the bus at all, and three
+        // things can make a pass non-quiet:
+        //   * the ISR flagged a DAT1 assertion -- the whole point of the mode;
+        //   * a bit is already pending from another reader (`m_intPending`
+        //     non-zero) -- handled below without a read, since `st` is taken
+        //     from the accumulator, not from `fresh`;
+        //   * this is the pass on which the safety net runs.
+        //
+        // ★ THE NET DOES NOT DIE WHEN THE POLL STOPS, AND THAT WAS CHECKED,
+        // NOT ASSUMED.  Layer 2 fires every RX_BITMAP_CHECK_PASSES *quiet
+        // passes*; what interrupt mode removes is the CMD52 on each pass, not
+        // the pass.  The loop below still runs once per delay(1), still counts
+        // m_svcQuietPasses the same way, so the net keeps its ~64 ms cadence
+        // and its 4 CMD52 per check unchanged.  Had the mode been implemented
+        // by blocking on the interrupt instead of by skipping the read, the net
+        // would have stopped firing and W13's protection would have been
+        // removed in silence -- rxStrandedRecovered() still climbs ~3 per 80
+        // blasts on silicon, so it is protection this firmware still needs.
+        //
+        // The status read is FOLDED INTO the same tick (`netTick` below): in
+        // interrupt mode the net becomes a slow poll of BOTH ports rather than
+        // of the ring alone.  The ring has a bitmap to interrogate; the command
+        // port has nothing of the kind, so if DAT1 turned out not to work on
+        // some board this is what keeps deauth/PS events arriving (at up to
+        // 64 ms latency) instead of the link going quietly deaf.  Interrupt
+        // mode therefore degrades to slow polling, never to nothing.
+        bool intFired = false;
+        if (m_intMode) {
+            intFired = m_host.takeCardInt();
+            if (intFired) m_cardInts++;
+            // Self-heal: a pass that returned early (or bailed on a bus error)
+            // left signalling masked by the ISR.  Re-arming here bounds that to
+            // a single pass.  It is free when already armed -- armCardInt()
+            // mirrors the enable rather than re-writing it -- and it cannot
+            // lose an assertion, because DAT1 is a LEVEL: if the card is still
+            // holding it, the write itself delivers the interrupt.
+            else m_host.armCardInt();
+        }
+        bool netTick = (uint16_t)(m_svcQuietPasses + 1) >= RX_BITMAP_CHECK_PASSES;
         uint8_t fresh = 0;
-        SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
-        m_cmd52PollsSvc++;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
-        if (s != SdioHost::OK) return s;
-        m_intSeen    |= fresh;
-        // Serviced bits only -- HOST_INT_DN_LD/CMD_PORT_DNLD are never consumed
-        // by anyone, so latching them would pin m_intPending non-zero for the
-        // rest of the firmware's life (see its comment in Iw416.h).
-        m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        if (!m_intMode || intFired || netTick) {
+            SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
+            m_cmd52PollsSvc++;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
+            if (s != SdioHost::OK) return s;
+            m_intSeen    |= fresh;
+            // Serviced bits only -- HOST_INT_DN_LD/CMD_PORT_DNLD are never consumed
+            // by anyone, so latching them would pin m_intPending non-zero for the
+            // rest of the firmware's life (see its comment in Iw416.h).
+            m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        }
         // W12 LAYER 1: work from the union of this read and everything the
         // other four HOST_INT_STATUS readers took out of the clear-on-read
         // register without servicing.  This is what makes the `gotFrame ||
@@ -1519,10 +1571,32 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                 }
             }
         }
+        // W15: this pass has now done the servicing the ISR masked signalling
+        // for, so put it back BEFORE any return below.  Level, not edge: if the
+        // card still holds DAT1 (a frame that arrived during the service
+        // window, or a ring the drain did not empty) the interrupt fires the
+        // instant this write lands and the next pass picks it up -- which is
+        // why masking during the window loses nothing.  The `else armCardInt()`
+        // at the top of the loop covers the paths that leave via `return s`.
+        if (m_intMode && intFired) m_host.armCardInt();
         if (gotFrame || gotDrop) return SdioHost::OK;
         if (!(st & (HOST_INT_UP_LD | CMD_PORT_UPLD))) delay(1);
     }
     return SdioHost::CMD_TIMEOUT;      // a quiet poll, not an error
+}
+
+// W15.  Enabling is two independent switches and both must be on: the CARD
+// drives DAT1 only for bits its HOST_INT_MASK lets through (enableHostInt()
+// does that, and must already have run), and the HOST delivers it to the CPU
+// only once INT_SIGNAL_EN[CINT] is set (SdioHost::enableCardInt does that).
+// Disabling restores the polled path exactly -- serviceLink() reads
+// HOST_INT_STATUS on every pass again, and nothing else in the driver behaves
+// differently -- so the fallback cannot rot: it is the same code either way,
+// selected by one branch.
+void Iw416::setInterruptMode(bool on) {
+    if (on == m_intMode) return;
+    m_intMode = on;
+    m_host.enableCardInt(on);
 }
 
 // pollLink keeps its historical COPY contract for the probe (first frame
