@@ -131,6 +131,17 @@ private:
     // clears it even when there was no link to drop -- that is how a sketch
     // cancels auto-reconnect.
     bool m_wantReconnect = false;
+    // Re-entrancy latch for maybeReconnect().  The 5 s throttle is NOT
+    // sufficient insurance: once lwip callbacks can call back into sketch code
+    // (Task 7's WiFiClient), a sketch calling WiFi.status() from a callback
+    // dispatched by sys_check_timeouts() inside pumpUntil() re-enters
+    // maybeReconnect() -- and if the OUTER attempt has already run past 5 s
+    // (on silicon it always has: a scan alone is ~15 s) the throttle passes
+    // and a NESTED connectStation() runs on the command port.  That is the
+    // reply-stealing hazard Iw416.h documents, and m_inDriverCmd does NOT
+    // cover it, because this path is a direct call rather than the pump.
+    // Not reachable today; one bool closes it permanently.
+    bool m_inReconnect = false;
     volatile bool m_inService = false;
     volatile bool m_inDriverCmd = false;   // serviceLink during a command-port
                                            // exchange steals the reply (Iw416.h)

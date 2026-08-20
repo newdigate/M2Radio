@@ -61,6 +61,13 @@ struct DriverCmd {
     explicit DriverCmd(volatile bool &b) : f(b), prev(b) { f = true; }
     ~DriverCmd() { f = prev; }
 };
+// Non-volatile sibling, for flags only ever touched from sketch context
+// (m_inReconnect).  Same save-and-restore contract, so it nests.
+struct ScopeFlag {
+    bool &f; bool prev;
+    explicit ScopeFlag(bool &b) : f(b), prev(b) { f = true; }
+    ~ScopeFlag() { f = prev; }
+};
 }  // namespace
 
 bool WiFiClass::bringUpCard(bool doBoardPreamble) {
@@ -186,7 +193,16 @@ void WiFiClass::disconnect() {
                              // m_status either: an unconnected disconnect()
                              // used to overwrite the diagnosis from a failed
                              // begin() -- WL_NO_SSID_AVAIL became
-                             // WL_DISCONNECTED and the bench lost the reason
+                             // WL_DISCONNECTED and the bench lost the reason.
+                             // WL_CONNECTION_LOST survives here too, and that
+                             // is DELIBERATE: it is the one status the facade
+                             // set rather than the sketch, and after the
+                             // m_wantReconnect split it is pure diagnosis --
+                             // preserving it tells the bench why the link went
+                             // away, while the cleared flag is what actually
+                             // stops the retrying.  (Measured: status=5 after
+                             // a disconnect() on a lost link, 0 attempts in
+                             // the following 15 s.)
     {
         DriverCmd guard(m_inDriverCmd);
         (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
@@ -302,7 +318,15 @@ void WiFiClass::maybeReconnect() {
     // "please try again".
     if (!m_autoReconnect || !m_wantReconnect) return;
     if (m_linkUp || !m_cardUp || !m_lwipUp) return;
+    // See m_inReconnect in WiFi.h: the throttle below is only 5 s wide and a
+    // real attempt outlives it, so the throttle alone cannot prevent a nested
+    // connectStation() on the command port.  This latch can.
+    if (m_inReconnect) return;
     if (millis() - m_lastReconnectMs < 5000) return;
+    // RAII for the same reason DriverCmd is: this function has ONE exit today,
+    // and a hand-placed clear is one future early return away from latching
+    // auto-reconnect off forever.
+    ScopeFlag latch(m_inReconnect);
     m_lastReconnectMs = millis();      // cheap re-entrancy insurance; the
                                        // re-stamp below is the real throttle
     int st = connectAndDhcp(30000);
