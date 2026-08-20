@@ -123,6 +123,14 @@ private:
     bool m_cardUp = false, m_lwipUp = false, m_linkUp = false;
     bool m_autoService = true, m_autoServiceAttached = false;
     bool m_autoReconnect = false;
+    // Reconnect INTENT, kept separate from m_status on purpose.  m_status
+    // doubling as diagnosis and control state caused two bugs in two review
+    // rounds; this flag carries the control half so m_status carries only the
+    // diagnosis.  Raised ONLY by linkLost() (a link that dropped out from
+    // under us); cleared by a successful connect and by disconnect(), which
+    // clears it even when there was no link to drop -- that is how a sketch
+    // cancels auto-reconnect.
+    bool m_wantReconnect = false;
     volatile bool m_inService = false;
     volatile bool m_inDriverCmd = false;   // serviceLink during a command-port
                                            // exchange steals the reply (Iw416.h)

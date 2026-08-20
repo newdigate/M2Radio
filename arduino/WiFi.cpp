@@ -54,11 +54,14 @@ static void m2ReleaseWifiReset() {
 // guard prevents, and a silent one.  And restoring the CALLER's value (not
 // hardcoding false) makes it nest-safe without a counter: an inner scope
 // finishing cannot un-deafen the pump for an outer command still in flight.
+namespace {   // internal linkage: at file scope this had external linkage and
+              // would ODR-clash with any other TU defining a DriverCmd
 struct DriverCmd {
     volatile bool &f; bool prev;
     explicit DriverCmd(volatile bool &b) : f(b), prev(b) { f = true; }
     ~DriverCmd() { f = prev; }
 };
+}  // namespace
 
 bool WiFiClass::bringUpCard(bool doBoardPreamble) {
     if (m_cardUp) return true;    // short-circuit OUTSIDE the guard below: a
@@ -168,13 +171,21 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
         m_linkUp = false;
         return WL_CONNECT_FAILED;
     }
+    m_wantReconnect = false;   // we are up: nothing left to want back
     return WL_CONNECTED;
 }
 
 void WiFiClass::disconnect() {
-    if (!m_linkUp) return;   // NOT a place to clobber m_status: an unconnected
-                             // disconnect() used to overwrite the diagnosis
-                             // from a failed begin() -- WL_NO_SSID_AVAIL became
+    // UNCONDITIONALLY, and ABOVE the early-out: this is the whole point of the
+    // flag.  After linkLost() m_linkUp is already false, so an early return
+    // here made disconnect() a COMPLETE NO-OP while every guard in
+    // maybeReconnect() still passed -- the facade would reconnect behind a
+    // sketch that had explicitly told it to stop, with no way to prevent it.
+    m_wantReconnect = false;
+    if (!m_linkUp) return;   // nothing to tear down.  NOT a place to clobber
+                             // m_status either: an unconnected disconnect()
+                             // used to overwrite the diagnosis from a failed
+                             // begin() -- WL_NO_SSID_AVAIL became
                              // WL_DISCONNECTED and the bench lost the reason
     {
         DriverCmd guard(m_inDriverCmd);
@@ -230,7 +241,10 @@ void WiFiClass::linkLost() {
     m_linkUp = false;
     dhcp_stop(&m_netif);
     netif_set_link_down(&m_netif);
-    m_status = WL_CONNECTION_LOST;
+    m_status = WL_CONNECTION_LOST;   // DIAGNOSIS only -- see m_wantReconnect
+    m_wantReconnect = true;          // the only place intent is raised: a link
+                                     // that dropped out from under us is the
+                                     // one case the facade may chase on its own
     // Pool teardown arrives with the pool (Task 6).
 }
 
@@ -280,15 +294,28 @@ void WiFiClass::setAutoService(bool on) {
 }
 
 void WiFiClass::maybeReconnect() {
-    if (!m_autoReconnect || m_linkUp || !m_cardUp || !m_lwipUp) return;
-    if (m_status != WL_CONNECTION_LOST) return;
-    if (millis() - m_lastReconnectMs < 5000) return;   // scan storms are 15 s
-    m_lastReconnectMs = millis();
+    // Gated on INTENT, never on m_status.  m_status doubling as diagnosis and
+    // as control state produced two separate bugs in two review rounds (a
+    // single-shot retry, then a disconnect() that could not cancel); splitting
+    // the jobs is what stops the third.  m_status is now diagnosis only, so a
+    // failed retry can keep WL_CONNECTION_LOST without that value meaning
+    // "please try again".
+    if (!m_autoReconnect || !m_wantReconnect) return;
+    if (m_linkUp || !m_cardUp || !m_lwipUp) return;
+    if (millis() - m_lastReconnectMs < 5000) return;
+    m_lastReconnectMs = millis();      // cheap re-entrancy insurance; the
+                                       // re-stamp below is the real throttle
     int st = connectAndDhcp(30000);
-    // Keep the lost-link state on a FAILED retry.  Overwriting m_status with
-    // the attempt's outcome closes the WL_CONNECTION_LOST guard above forever,
-    // making auto-reconnect a single shot and the 5 s throttle dead code.
+    // Keep the lost-link diagnosis on a FAILED retry (see above -- it no longer
+    // gates anything, so this is purely what the bench reads).
     m_status = (st == WL_CONNECTED) ? (uint8_t)st : (uint8_t)WL_CONNECTION_LOST;
+    // Stamp AGAIN, after the attempt, and THIS is the throttle that matters:
+    // the gap it measures is BETWEEN ATTEMPTS, not between attempt starts.  A
+    // failing attempt takes 15 s (scan) to 45 s (scan + DHCP), so a
+    // before-only stamp is already long expired by the time the attempt
+    // returns and retries run back-to-back -- the continuous scan storm this
+    // is supposed to prevent.
+    m_lastReconnectMs = millis();
 }
 
 int WiFiClass::hostByName(const char *, IPAddress &, uint32_t) { return 0; }  // Task 8
