@@ -65,13 +65,22 @@ public:
 
     // Escape hatches -- the facade is a floor, not a ceiling.
     Iw416        &radio() { return m_iw416; }
+    SdioHost     &sdio()  { return m_sdio; }   // begin() collapses every
+                                               // bring-up failure to
+                                               // WL_NO_SHIELD; this is how a
+                                               // bench tells which one
     struct netif *netif() { return &m_netif; }
 
-    // Internal (WiFiClient/WiFiServer/pool); public for want of friends.
-    bool lwipUp() const { return m_lwipUp; }
-    bool linkUp() const { return m_linkUp; }
-    void servicePass();
+    // Advanced / used by WiFiClient and WiFiServer.
+    bool lwipUp() const { return m_lwipUp; }   // lwip_init + netif_add done
+    bool linkUp() const { return m_linkUp; }   // associated, netif link up
+    void servicePass();                        // ONE bounded service pass, no
+                                               // guards -- callers that are
+                                               // not loop() must not re-enter
     bool pumpUntil(bool (*cond)(void *), void *ctx, uint32_t timeoutMs);
+                                               // service until cond() or
+                                               // timeout; how blocking calls
+                                               // wait without stalling the link
 
 private:
     static void serviceEvent(EventResponderRef ref);
