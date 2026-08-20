@@ -607,11 +607,42 @@ public:
     // small ones, whichever comes first.
     static const uint16_t AGGR_BUF_BLOCKS = 32;
 
-    // RX aggregation: ON by default.  It is transparent -- a batch read
-    // delivers exactly the frames a run of single reads would have delivered,
-    // in the same order, with no deferred semantics for a caller to trip over.
-    // The switch exists so a gate can run the SAME image with and without it
-    // and divide the two, which is a controlled A/B rather than an anecdote.
+    // RX aggregation: ★ DEFAULT OFF, because on silicon it COSTS 4.6x
+    // THROUGHPUT.  Measured on the house AP, one association, controls either
+    // side, isolated by bisecting the three W16 switches one at a time:
+    //
+    //   all off (pre-W16)        tcp-rx 10.96 Mbps
+    //   register port only              11.03      <- harmless
+    //   + RX aggregation                 2.39      <- collapse
+    //   + TX aggregation                 2.45
+    //   + interrupt mode                 2.44
+    //   back to pre-W16                 10.49      <- the air was fine
+    //
+    // AND IT IS NOT THE AGGREGATION FAILING -- it works exactly as designed:
+    // 0.43 data CMD53s per frame, 86% of frames arriving batched.  The cost is
+    // somewhere else, and the counters name it: rxStrandedRecovered() goes
+    // from 26 to 139 over a 10 s blast (23x per frame).  Each of those is an
+    // upload the safety net had to rescue at up to 64 ms of latency, and 139
+    // of them do not fit in ten seconds without destroying the link.
+    //
+    // MECHANISM, stated as the leading hypothesis and not as a finding: a
+    // multi-slot read holds the bus and the CPU for milliseconds (eight
+    // 1.5 KB slots is ~12 KB in one PIO transfer), and the drain works from a
+    // SNAPSHOT taken before it.  Uploads the card queues during that window
+    // are not in the snapshot, so the drain exits believing the ring is empty
+    // and the pass then clears HOST_INT_UP_LD -- stranding them until the net
+    // fires.  The bigger the batch, the longer the window.  The likely fix is
+    // to stop clearing that bit on the strength of a stale snapshot: take a
+    // FRESH register read at the end of the drain and clear only if the ring
+    // is really empty.  Not attempted yet; measured first, as W11 should have
+    // been.
+    //
+    // ★ THIS IS W11 HAPPENING AGAIN, and the shape is worth recognising: a
+    // change that provably cuts bus commands, whose own counters look
+    // excellent, and which costs throughput anyway because of how it perturbs
+    // the firmware's timing.  W11's bitmap cache cut reads and cost 2.5x by
+    // breaking pacing; this cuts reads and costs 4.6x by widening a race.
+    // Bus-command counters are necessary and they are not sufficient.
     void setRxAggregation(bool on) { m_rxAggr = on; }
     bool rxAggregation() const     { return m_rxAggr; }
 
@@ -1171,7 +1202,7 @@ private:
     uint32_t m_cardInts       = 0;
     // W16: aggregation state.  m_txAggrBuf is uint32_t-backed because the
     // uSDHC PIO port is 32 bits wide and SdioHost casts the caller's pointer.
-    bool     m_rxAggr         = true;
+    bool     m_rxAggr         = false;
     bool     m_txAggr         = false;
     uint32_t m_txAggrBuf[(uint32_t)AGGR_BUF_BLOCKS * SDIO_BLOCK_SIZE / 4] = {0};
     uint32_t m_txAggrLen      = 0;   // padded bytes staged
