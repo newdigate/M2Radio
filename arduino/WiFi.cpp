@@ -2,6 +2,7 @@
 #include "WiFi.h"
 #include "Arduino.h"
 #include "Iw416Netif.h"
+#include "WiFiConnPool.h"
 #include "lwip/init.h"
 #include "lwip/timeouts.h"
 #include "lwip/dhcp.h"
@@ -261,7 +262,10 @@ void WiFiClass::linkLost() {
     m_wantReconnect = true;          // the only place intent is raised: a link
                                      // that dropped out from under us is the
                                      // one case the facade may chase on its own
-    // Pool teardown arrives with the pool (Task 6).
+    // Link is gone: no FIN can be sent, so every live conn is aborted with
+    // its callbacks cleared first.  Slots with handles still attached keep
+    // their RX chain readable (PEER_CLOSED); unheld ones return to FREE.
+    WiFiPool::abortAll();
 }
 
 bool WiFiClass::pumpUntil(bool (*cond)(void *), void *ctx, uint32_t timeoutMs) {
