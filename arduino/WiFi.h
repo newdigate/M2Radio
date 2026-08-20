@@ -108,6 +108,16 @@ private:
     int  connectAndDhcp(uint32_t timeoutMs);
     void maybeReconnect();
     void linkLost();
+    // The three places the link goes down (linkLost, disconnect, and a DHCP
+    // timeout after a successful association) must do the SAME four things.
+    // Pool teardown was the one that got missed: only linkLost() had it, and
+    // with LWIP_TCP_KEEPALIVE=0 an idle ESTABLISHED pcb never retransmits and
+    // never times out, so a CLAIMED idle connection survived disconnect()
+    // indefinitely -- holding a slot and a pcb, with connected() still
+    // reporting true.  (Unclaimed ones were caught by the pool's stall valve;
+    // claimed ones are exempt from it by design.)  One helper, three callers,
+    // no room for a fourth site to miss it.
+    void linkDownAndAbort();
     IPAddress ipFromNetif(int which);
 
     SdioHost m_sdio;

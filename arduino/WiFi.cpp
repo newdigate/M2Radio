@@ -173,13 +173,16 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
         // here left the facade associated-with-no-address forever: status()
         // said failed while RSSI() returned a live value, and
         // maybeReconnect()'s `|| m_linkUp ||` guard blocked every retry.
-        dhcp_stop(&m_netif);
         {
             DriverCmd guard(m_inDriverCmd);
             (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
         }
-        netif_set_link_down(&m_netif);
-        m_linkUp = false;
+        // Same teardown as every other link-down site.  dhcp_stop() now runs
+        // after the deauth rather than before it, which is inert HERE and only
+        // here: it transmits a DHCP RELEASE only when a lease exists
+        // (dhcp_release_and_stop, guarded by dhcp_supplied_address), and we are
+        // on this path precisely because no lease ever arrived.
+        linkDownAndAbort();
         return WL_CONNECT_FAILED;
     }
     m_wantReconnect = false;   // we are up: nothing left to want back
@@ -211,9 +214,8 @@ void WiFiClass::disconnect() {
         DriverCmd guard(m_inDriverCmd);
         (void)m_iw416.deauthenticate(m_iw416.connectedAp().bssid);
     }
-    dhcp_stop(&m_netif);
-    netif_set_link_down(&m_netif);
-    m_linkUp = false;
+    linkDownAndAbort();          // pool included: a claimed idle conn has
+                                 // nothing else that would ever end it
     m_status = WL_DISCONNECTED;
 }
 
@@ -257,18 +259,21 @@ void WiFiClass::servicePass() {
     m_inService = false;
 }
 
-void WiFiClass::linkLost() {
-    m_linkUp = false;
+void WiFiClass::linkDownAndAbort() {
     dhcp_stop(&m_netif);
     netif_set_link_down(&m_netif);
+    m_linkUp = false;
+    // Pool LAST, and deliberately after the link is down -- see abortAll()'s
+    // comment in WiFiConnPool.cpp for why the RSTs are allowed to go nowhere.
+    WiFiPool::abortAll();
+}
+
+void WiFiClass::linkLost() {
+    linkDownAndAbort();
     m_status = WL_CONNECTION_LOST;   // DIAGNOSIS only -- see m_wantReconnect
     m_wantReconnect = true;          // the only place intent is raised: a link
                                      // that dropped out from under us is the
                                      // one case the facade may chase on its own
-    // Link is gone: no FIN can be sent, so every live conn is aborted with
-    // its callbacks cleared first.  Slots with handles still attached keep
-    // their RX chain readable (PEER_CLOSED); unheld ones return to FREE.
-    WiFiPool::abortAll();
 }
 
 bool WiFiClass::pumpUntil(bool (*cond)(void *), void *ctx, uint32_t timeoutMs) {

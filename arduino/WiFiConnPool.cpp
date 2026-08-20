@@ -5,11 +5,30 @@
 
 static WiFiConn s_conns[WIFI_MAX_CONNS];
 static uint32_t s_evictions = 0;
+static uint32_t s_stallAborts = 0;
 
 namespace WiFiPool {
 
 WiFiConn *slot(uint8_t i) { return (i < WIFI_MAX_CONNS) ? &s_conns[i] : nullptr; }
 uint32_t evictions() { return s_evictions; }
+uint32_t stallAborts() { return s_stallAborts; }
+
+// Every callback lwip can reach this slot through, cleared in one place --
+// tcp_connected INCLUDED.  There is no tcp_connected() setter (the callback is
+// an argument to tcp_connect), so that one is assigned directly, exactly as
+// lwip's own tcp_connect does.  The pool never installs it, but Task 7 will,
+// and "clear EVERY callback before you close" has to be true rather than
+// nearly true.
+static void detachCallbacks(struct tcp_pcb *pcb) {
+    tcp_arg(pcb, nullptr);
+    tcp_recv(pcb, nullptr);
+    tcp_sent(pcb, nullptr);
+    tcp_err(pcb, nullptr);
+    tcp_poll(pcb, nullptr, 0);
+#if LWIP_CALLBACK_API
+    pcb->connected = nullptr;
+#endif
+}
 
 static void freeRx(WiFiConn *c) {
     if (c->rxHead) { pbuf_free(c->rxHead); c->rxHead = nullptr; }
@@ -52,7 +71,17 @@ WiFiConn *allocEvicting() {
     }
     if (!victim) return nullptr;
     s_evictions++;
-    (void)closeConn(victim);     // clears callbacks first; not in a callback here
+    // ABORT, not a graceful close.  We are here BECAUSE the pool is full, and
+    // tcp_close on an ESTABLISHED conn leaves the pcb in FIN_WAIT holding one
+    // of MEMP_NUM_TCP_PCB=5 -- spending a pcb precisely when pcbs are what ran
+    // out.  The victim is unclaimed by definition (the sketch has never seen
+    // it), so there is nobody to owe a graceful close to.
+    if (victim->pcb) {
+        struct tcp_pcb *pcb = victim->pcb;
+        victim->pcb = nullptr;
+        detachCallbacks(pcb);
+        tcp_abort(pcb);
+    }
     toFree(victim);              // ... which leaves it FREE, so re-reserve it
     victim->state = WiFiConn::CONNECTING;
     return victim;
@@ -61,7 +90,20 @@ WiFiConn *allocEvicting() {
 void addRef(WiFiConn *c) { if (c) c->refs++; }
 
 void release(WiFiConn *c) {
-    if (!c || c->refs == 0) return;
+    if (!c) return;
+    if (c->refs == 0) {
+        // A RESERVATION nobody ever took a handle on: alloc() succeeded and
+        // then something before addRef() failed.  Nothing else in this file can
+        // collect that slot -- abortAll() skips a null pcb, both valves need
+        // callbacks installed, the evictor only considers serverPort != 0 --
+        // so without this it is stranded until reboot, and four such failures
+        // kill the pool.  Safe because a null pcb means lwip holds no pointer
+        // to this slot; a slot that still HAS a pcb is a live connection and
+        // must be closed properly rather than silently dropped, so it is left
+        // alone here.
+        if (c->pcb == nullptr && c->state != WiFiConn::FREE) toFree(c);
+        return;
+    }
     if (--c->refs == 0) {
         // Last handle gone.  A live conn the sketch abandoned gets closed --
         // Arduino clients don't linger after their last handle dies.
@@ -74,11 +116,7 @@ err_t closeConn(WiFiConn *c) {
     struct tcp_pcb *pcb = c->pcb;
     c->pcb = nullptr;
     if (!pcb) return ERR_OK;
-    tcp_arg(pcb, nullptr);
-    tcp_recv(pcb, nullptr);
-    tcp_sent(pcb, nullptr);
-    tcp_err(pcb, nullptr);
-    tcp_poll(pcb, nullptr, 0);
+    detachCallbacks(pcb);
     if (tcp_close(pcb) != ERR_OK) {
         tcp_abort(pcb);
         return ERR_ABRT;
@@ -92,13 +130,15 @@ void abortAll() {
         if (c->state == WiFiConn::FREE || !c->pcb) continue;
         struct tcp_pcb *pcb = c->pcb;
         c->pcb = nullptr;
-        tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_sent(pcb, nullptr);
-        tcp_err(pcb, nullptr); tcp_poll(pcb, nullptr, 0);
+        detachCallbacks(pcb);
         // No FIN is possible with the link down, so this is an abort, not a
-        // close.  tcp_abort DOES attempt an RST -- but linkLost() marked the
-        // netif link down two lines earlier, and ip4_route skips a link-down
-        // netif, so tcp_route returns NULL and the segment never reaches the
-        // driver.  Nothing is transmitted; nothing fails loudly either.
+        // close.  tcp_abort DOES attempt an RST -- but every caller
+        // (WiFiClass::linkDownAndAbort) marks the netif link down first, and
+        // ip4_route skips a link-down netif, so tcp_route returns NULL and the
+        // segment never reaches the driver.  Nothing is transmitted, and
+        // nothing fails loudly either.  Deliberate: the alternative is handing
+        // a frame to a driver whose link state we are mid-way through tearing
+        // down, to tell a peer something its own timeout will tell it anyway.
         tcp_abort(pcb);
         c->state = WiFiConn::PEER_CLOSED;   // rx chain stays readable
         c->connectDone = true; c->connectOk = false;
@@ -139,7 +179,7 @@ int consume(WiFiConn *c, uint8_t *buf, int len) {
 }
 
 // --- lwip callbacks (arg is ALWAYS the slot) --------------------------------
-static err_t connRecv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t) {
+static err_t connRecv(void *arg, struct tcp_pcb *, struct pbuf *p, err_t) {
     WiFiConn *c = (WiFiConn *)arg;
     if (p == nullptr) {                    // peer FIN; keep pcb for our close
         c->state = WiFiConn::PEER_CLOSED;
@@ -153,12 +193,22 @@ static err_t connRecv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t) {
     // with ERR_OK instead would leak WINDOW, not just data: tcp_receive has
     // already debited rcv_wnd for those bytes and only tcp_recved re-credits
     // it, so the window would shrink by that segment permanently.
-    uint8_t depth = 0;
-    for (struct pbuf *q = c->rxHead; q != nullptr; q = q->next) depth++;
-    if (depth >= WIFI_RX_MAX_PBUFS) return ERR_MEM;
+    //
+    // The empty-chain exemption is what makes permanent refusal impossible: if
+    // a delivery bigger than the whole cap could be refused into an empty
+    // chain, nothing would ever drain and nothing would ever be accepted.
+    // pbuf_cat'ing it instead costs nothing real -- p is only ever a long chain
+    // because tcp_in.c joined queued out-of-order segments, which are already
+    // allocated whether we take them or not.
+    uint16_t staged = 0;
+    for (struct pbuf *q = c->rxHead; q != nullptr; q = q->next) staged++;
+    if (staged != 0) {          // an EMPTY chain ALWAYS accepts -- see below
+        uint16_t incoming = 0;  // p is not necessarily one pbuf: tcp_in.c
+        for (struct pbuf *q = p; q != nullptr; q = q->next) incoming++;
+        if (staged + incoming > WIFI_RX_MAX_PBUFS) return ERR_MEM;
+    }
     if (c->rxHead) pbuf_cat(c->rxHead, p); else { c->rxHead = p; c->rxOff = 0; }
     c->lastActivityMs = millis();
-    (void)pcb;
     return ERR_OK;                         // tcp_recved deferred to consume()
 }
 
@@ -196,10 +246,12 @@ static err_t connPoll(void *arg, struct tcp_pcb *pcb) {
     WiFiConn *c = (WiFiConn *)arg;
     if (!c->claimed && c->refs == 0 && millis() - c->lastActivityMs > 30000) {
         c->pcb = nullptr;
-        tcp_arg(pcb, nullptr); tcp_recv(pcb, nullptr); tcp_sent(pcb, nullptr);
-        tcp_err(pcb, nullptr); tcp_poll(pcb, nullptr, 0);
+        detachCallbacks(pcb);
         tcp_abort(pcb);
         toFree(c);
+        s_stallAborts++;                   // a conn vanishing on its own must
+                                           // leave evidence; this is the only
+                                           // trace it leaves
         return ERR_ABRT;                   // in-callback abort contract
     }
     return ERR_OK;

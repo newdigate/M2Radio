@@ -15,17 +15,31 @@
 
 static const uint8_t WIFI_MAX_CONNS = 4;
 
-// Cap on the pbuf COUNT of one slot's unconsumed RX chain.  The byte bound is
-// real (rcv_wnd closes at TCP_WND = 8*MSS = 11680) but it bounds the wrong
-// quantity: the netif allocates ONE PBUF_POOL pbuf per FRAME regardless of
-// frame size (Iw416Netif.cpp, frameSink), and PBUF_POOL_SIZE is 32.  A peer
-// sending 100-byte segments therefore parks ~117 pbufs on one chain before
-// TCP_WND is approached -- roughly 4x the entire pool -- and even at full MSS,
-// 4 stalled slots x 8 segments = 32 = the whole pool exactly.  A dry pool makes
-// frameSink drop EVERY inbound frame: ARP, DHCP renew, the other connections'
-// ACKs.  It recovers, so this is degradation rather than deadlock, but one
-// unread WiFiClient must not be able to stall the whole stack.  Hence a cap
-// that is asserted, not hoped for.
+// Cap on the pbuf COUNT this pool STAGES for one slot.  Read the bound
+// carefully -- it is not "total pbufs in use for this connection".
+//
+// Why a count at all: the byte bound is real (rcv_wnd closes at TCP_WND =
+// 8*MSS = 11680) but it bounds the wrong quantity.  The netif allocates one
+// PBUF_POOL pbuf per FRAME regardless of frame size (Iw416Netif.cpp,
+// frameSink) and PBUF_POOL_SIZE is 32, so a peer sending 100-byte segments
+// would park ~117 pbufs on a single chain -- ~4x the whole pool -- long before
+// TCP_WND is approached.  A dry pool makes frameSink drop EVERY inbound frame:
+// ARP, DHCP renew, other connections' ACKs.  That is the unbounded case this
+// number exists to remove.
+//
+// What it actually bounds: a non-empty chain never grows past this many pbufs.
+// Two things sit OUTSIDE it, both deliberate:
+//   - An empty chain accepts whatever lwip hands over in one go, however long.
+//     That exemption is what makes permanent refusal impossible (see connRecv),
+//     and it costs nothing real: a delivery can be a multi-pbuf chain only
+//     because tcp_in.c pbuf_cat'ed queued out-of-order segments (TCP_OOSEQ_MAX_
+//     PBUFS is 0 = unlimited here), and those pbufs are ALREADY allocated --
+//     refusing them moves ownership to lwip, it does not free anything.
+//   - Whatever lwip holds as pcb->refused_data for this pcb, which is what a
+//     refusal creates.  So per stalled slot the pool can hold up to this many
+//     staged plus one refused delivery, not this many total.
+// The honest headline: 4 slots cannot silently consume the pbuf pool through
+// staged data, and no single connection can run it dry.
 static const uint8_t WIFI_RX_MAX_PBUFS = 6;
 
 struct WiFiConn {
@@ -47,6 +61,29 @@ struct WiFiConn {
     volatile bool connectOk   = false;
 };
 
+// ---------------------------------------------------------------------------
+// CONTRACT for WiFiClient / WiFiServer -- five things this file's caller must
+// know, written here because that author may read only this file.
+//
+// 1. addRef() immediately after alloc(), before anything that can fail.  See
+//    the ordering rule on addRef() below; it is the difference between a
+//    failed connect that frees its slot and one that leaks it forever.
+// 2. installCallbacks() BEFORE tcp_connect().  It is what stores c->pcb, and
+//    until it runs the pool cannot see the pcb at all -- abortAll() skips a
+//    slot whose pcb is null, so a link lost mid-connect would strand it.
+// 3. The pool does NOT install tcp_connected; the caller passes its own to
+//    tcp_connect(), and `arg` there will be the SLOT (installCallbacks set
+//    tcp_arg).  connectDone/connectOk are only ever set here to (true,false),
+//    by connErr and abortAll -- the success half belongs to that callback.
+// 4. stop() will usually put an RST on the wire, not a FIN.  tcp_recved() is
+//    deferred to consume(), so any unread byte leaves rcv_wnd != TCP_WND_MAX,
+//    and tcp_close_shutdown() resets rather than closes gracefully (tcp.c).
+//    Intended -- it is the flow control working -- but it shows up in captures
+//    and in a peer's logs, so do not read it as a bug.
+// 5. availableBytes() means "staged right now", NOT "everything the peer
+//    sent".  With the cap above, `if (available() >= N)` can stall forever at
+//    ~6 segments; consume incrementally (`while (available())`) instead.
+// ---------------------------------------------------------------------------
 namespace WiFiPool {
     WiFiConn *slot(uint8_t i);           // 0..WIFI_MAX_CONNS-1
     // Reserves the slot it returns (state := CONNECTING) rather than handing
@@ -59,14 +96,25 @@ namespace WiFiPool {
     // claimed slot (refs==0 by definition -- the sketch never saw it).
     // Claimed connections are NEVER evicted.
     WiFiConn *allocEvicting();
-    // ORDERING RULE for anything that takes a handle on a slot: addRef() FIRST,
-    // or set claimed, BEFORE the slot can be polled.  The stall valve frees an
-    // unclaimed idle slot, and it tests refs as well as claimed, so either one
-    // is enough -- but a slot that is neither is reapable under a live handle,
-    // which is the dangling-handle class this pool exists to remove.
+    // ORDERING RULE, and it is MANDATORY, not one of two options: addRef()
+    // immediately after alloc(), before tcp_new(), before tcp_connect(),
+    // before anything that can fail.  Setting `claimed` is an ADDITION to that,
+    // never a substitute.  Two independent reasons:
+    //   - the stall valve tests both, so either would spare the slot; but
+    //   - only a refcount gives the slot a way BACK.  release() is the only
+    //     exit, and a slot that was reserved and then abandoned with refs==0
+    //     and claimed=true is invisible to every other reaper (abortAll skips
+    //     a null pcb, the valves need callbacks installed, the evictor needs
+    //     serverPort != 0) -- four failed connects and the pool is dead until
+    //     reboot.  release() now also collects such a slot defensively, but
+    //     do not rely on that: addRef first.
     void addRef(WiFiConn *c);
-    void release(WiFiConn *c);           // drop a handle; frees the slot when
-                                         // refs==0 and the conn is dead
+    // Drop a handle; frees the slot when refs==0 and the conn is dead.  Also
+    // the exit for a RESERVED-but-abandoned slot: called on a slot with no
+    // handles and no pcb, it returns it to FREE, so every alloc() failure path
+    // in a caller can end with one symmetrical release().  A slot that still
+    // has a pcb is a live connection and is never dropped this way.
+    void release(WiFiConn *c);
     // Clear EVERY callback BEFORE tcp_close; tcp_abort on close failure.
     // Returns what an in-callback caller must return to lwip (ERR_ABRT after
     // the abort path -- returning ERR_OK there leaves tcp_input on a freed
@@ -77,5 +125,11 @@ namespace WiFiPool {
     int  availableBytes(const WiFiConn *c);
     int  peekByte(const WiFiConn *c);
     int  consume(WiFiConn *c, uint8_t *buf, int len);  // + tcp_recved
-    uint32_t evictions();                // silicon-visible safety-valve counter
+    // Silicon-visible counters, one per safety valve.  Both exist because a
+    // connection that vanishes on its own must leave evidence: evictions() is
+    // the accept-path valve (an unclaimed accept dropped to make room),
+    // stallAborts() is the idle-path valve (connPoll reaping a stalled,
+    // unheld, unclaimed conn at 30-40 s).
+    uint32_t evictions();
+    uint32_t stallAborts();
 }
