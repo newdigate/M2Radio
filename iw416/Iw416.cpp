@@ -92,7 +92,20 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     // traffic into the new one.  (The ps* counters deliberately do NOT reset
     // here -- see their group comment in Iw416.h.)
     m_cmd52PollsTx = 0; m_cmd52PollsSvc = 0;
-    m_cmd53Count = 0; m_cmd53Bytes = 0; m_cmd53ByteMode = 0;
+    m_cmd53Bytes = 0; m_cmd53ByteMode = 0;
+    // W16: the register-port reads are the same kind of measurement and reset
+    // with them, so busCommands() describes one firmware life throughout.
+    m_cmd53RegsTx = 0; m_cmd53RegsSvc = 0;
+    m_mpRegsOk = true; m_mpRegsChecked = false;
+    m_mpRegsBadStatus = 0; m_mpRegsErrors = 0;
+    m_cmd53Rx = 0; m_cmd53Tx = 0;
+    m_rxAggrBatches = 0; m_rxAggrSlots = 0;
+    m_txAggrBatches = 0; m_txAggrSlots = 0;
+    // A new firmware life starts both rings at slot 0 (above), so a batch
+    // staged against the OLD ring's ports must not be written into the new
+    // one.  Dropping it is the only correct answer -- those frames were
+    // addressed to ports that no longer mean what they meant.
+    m_txAggrCount = 0; m_txAggrLen = 0; m_txAggrStart = 0;
     // W12: the sticky interrupt state and its safety net are per-firmware-life
     // too.  A pending bit describes an upload the OLD firmware offered; the new
     // image's rings start empty at slot 0 (above), so carrying it over would
@@ -220,6 +233,15 @@ SdioHost::Status Iw416::refreshIoPort() {
 
 SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen) {
     wakeCardIfSleeping();
+    // W16: a staged TX batch must not sit behind a command.  waitCmdResp()
+    // can block for seconds, and data frames held across that would be a
+    // latency spike with no upper bound the caller can see.  Best-effort --
+    // a flush failure is reported through the ordinary data-path counters,
+    // and failing the COMMAND because a data write failed would be worse.
+    // ★ AFTER the wake gate, not before: flushing first would push the batch
+    // at a card that PS may have put to sleep, and the write's failure is
+    // discarded here, so the frames would be lost silently.
+    (void)flushTx();
     static uint8_t txBuf[SDIO_BLOCK_SIZE * 4];
     const uint16_t hostLen = (uint16_t)(8 + bodyLen);          // HostCmd header + body
     const uint16_t total   = (uint16_t)(INTF_HEADER_LEN + hostLen);
@@ -281,11 +303,11 @@ SdioHost::Status Iw416::readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *ou
     for (uint32_t i = 0; i < timeoutMs; i++) {
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
         if (s != SdioHost::OK) return s;
-        m_intSeen    |= st;
         // Only the two UPLOAD bits are ever serviced by anyone; latching the
         // download-side bits would make m_intPending's "unfinished work"
-        // meaning false forever (see its comment in Iw416.h).
-        m_intPending |= (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        // meaning false forever (see its comment in Iw416.h).  latchIntBits()
+        // is the single place that rule is applied.
+        latchIntBits(st);
         if (m_intPending & CMD_PORT_UPLD) {
             // This call now owns the command-port packet and reads it below,
             // so consume that bit here (whatever a later path may observe, it
@@ -553,16 +575,156 @@ SdioHost::Status Iw416::readRdBitmap32(uint32_t *out) {
     return SdioHost::OK;
 }
 
+// W16: the multiport register-port read -- see readMpRegs()/MpRegs in Iw416.h
+// for what it replaces and why it is not a cache.
+//
+// The address is function 1 register 0 with the address held FIXED (incrAddr
+// false) and the transfer in BYTE mode, which is exactly the CMD53 NXP's
+// wlan_interrupt() issues: bcnt=1 selects byte mode with count = MAX_MP_REGS,
+// and flags=0 leaves OP Code at 0.  On an ordinary SDIO function a fixed
+// address would re-read register 0 MP_REGS_LEN times; this card's register
+// port streams the register file instead.  That is taken from NXP's driver,
+// not from a capture on this board -- if silicon disagrees the snapshot is
+// unmistakable (every bitmap and length identical to register 0) and the
+// fallback is OP Code 1.
+void Iw416::latchIntBits(uint8_t st) {
+    m_intSeen |= st;
+    const uint8_t serviced = (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+    // Count the ARRIVAL, not the state: a bit that is already pending has
+    // already been counted, and counting it again would make serviceLink
+    // decline to clear a condition it really did finish servicing.
+    if ((serviced & HOST_INT_UP_LD) && !(m_intPending & HOST_INT_UP_LD)) {
+        m_intUpldLatches++;
+    }
+    m_intPending |= serviced;
+}
+
+SdioHost::Status Iw416::readMpRegs(MpRegs *out, bool txPath) {
+    // A card whose register port has already been rejected never gets asked
+    // again -- see mpRegsUsable() for the failure this protects against.
+    if (!m_mpRegsOk) return readMpRegsCmd52(out, txPath);
+
+    uint8_t *regs = (uint8_t *)(void *)m_mpRaw;
+    SdioHost::Status s = m_host.cmd53ReadBytes(1, 0, false, regs, MP_REGS_LEN);
+    if (s != SdioHost::OK) {
+        // ★ THE CARD HAS ALREADY CONSUMED HOST_INT_STATUS by the time a
+        // transfer can fail -- the register is clear-on-read and the bytes
+        // clocked out of it before the PIO loop or the CRC check tripped.  So
+        // the bits are gone whatever we do, and the only safe assumption is
+        // the pessimistic one: latch BOTH serviced conditions.  A spurious
+        // HOST_INT_UP_LD costs one drain that finds an empty ring and clears
+        // itself; a DROPPED one is W12 fault #5, RX dead until reflash.  This
+        // read's failure surface is far larger than the single CMD52 it
+        // replaced (a 49-word PIO loop with its own timeouts), so the choice
+        // matters more here than it ever did there.
+        latchIntBits((uint8_t)(HOST_INT_UP_LD | CMD_PORT_UPLD));
+        m_mpRegsErrors++;
+        return s;
+    }
+    // Counted only on success, matching the two data-port CMD53 sites.
+    if (txPath) m_cmd53RegsTx++; else m_cmd53RegsSvc++;
+
+    // The once-per-firmware-life proof that this port streams the register
+    // file at all.  CARD_STATUS is inside NXP's window and begin() already
+    // read it by CMD52, so this compares the two transports against each
+    // other rather than against a constant.  See mpRegsUsable().
+    if (!m_mpRegsChecked) {
+        m_mpRegsChecked = true;
+        const uint8_t st = regs[CARD_STATUS_REG];
+        if (m_cardStatus != 0 && st != m_cardStatus) {
+            m_mpRegsBadStatus = st;
+            m_mpRegsOk = false;
+            // The bits this read consumed still have to be accounted for
+            // before falling back, or the very first register-port read would
+            // eat an interrupt on its way out.
+            latchIntBits(regs[HOST_INT_STATUS]);
+            return readMpRegsCmd52(out, txPath);
+        }
+    }
+
+    out->intStatus = regs[HOST_INT_STATUS];
+    out->rdBitmap  = (uint32_t)regs[RD_BITMAP_L_REG] |
+                     ((uint32_t)regs[RD_BITMAP_U_REG]  << 8) |
+                     ((uint32_t)regs[RD_BITMAP_1L_REG] << 16) |
+                     ((uint32_t)regs[RD_BITMAP_1U_REG] << 24);
+    out->wrBitmap  = (uint32_t)regs[WR_BITMAP_L_REG] |
+                     ((uint32_t)regs[WR_BITMAP_U_REG]  << 8) |
+                     ((uint32_t)regs[WR_BITMAP_1L_REG] << 16) |
+                     ((uint32_t)regs[WR_BITMAP_1U_REG] << 24);
+    out->cmdRdLen  = (uint16_t)(regs[CMD_RD_LEN_0] |
+                                ((uint16_t)regs[CMD_RD_LEN_1] << 8));
+    for (uint8_t p = 0; p < MAX_DATA_PORTS; p++) {
+        const uint32_t off = RD_LEN_P0_L_REG + ((uint32_t)p << 1);
+        out->rdLen[p] = (uint16_t)(regs[off] | ((uint16_t)regs[off + 1] << 8));
+    }
+
+    // W12 LAYER 1, in its newest home: this read took the clear-on-read
+    // HOST_INT_STATUS out of the card, so its bits MUST land in the sticky
+    // accumulator or they are gone for good.  Masked to the two conditions
+    // anything in this driver actually services, per m_intPending's rule.
+    latchIntBits(out->intStatus);
+    m_dbgStatusOr |= out->intStatus;
+    m_dbgBitmapOr |= out->rdBitmap;
+    return SdioHost::OK;
+}
+
 SdioHost::Status Iw416::readWrBitmap32(uint32_t *out) {
     uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     SdioHost::Status s;
-    // W11: this is the CMD52 traffic sendDataFrame's wait loop pays per poll
-    // -- see m_cmd52PollsTx's comment in Iw416.h.
+    // W11: this is the CMD52 traffic sendDataFrame's wait loop used to pay per
+    // poll.  W16 moved it into the register-port snapshot; this remains as the
+    // fallback's TX half -- see readMpRegsCmd52().
     s = m_host.cmd52Read(1, WR_BITMAP_L_REG,  &b0); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
     s = m_host.cmd52Read(1, WR_BITMAP_U_REG,  &b1); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
     s = m_host.cmd52Read(1, WR_BITMAP_1L_REG, &b2); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
     s = m_host.cmd52Read(1, WR_BITMAP_1U_REG, &b3); m_cmd52PollsTx++; if (s != SdioHost::OK) return s;
     *out = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    return SdioHost::OK;
+}
+
+// W16: the same information, one CMD52 at a time -- what this driver did
+// before the register port existed.  Used only when the register port has been
+// rejected (mpRegsUsable() false), which on a card that behaves as NXP's
+// driver expects is never.
+//
+// It fills the WHOLE MpRegs, including all 32 RD_LENs, so that every caller
+// sees the same struct whichever transport filled it and no call site has to
+// know which one ran.  That is expensive -- 64 CMD52s for the lengths alone --
+// but this path exists to keep a link ALIVE on a card that surprised us, not
+// to be fast, and reading them lazily would put a transport test on the hot
+// path of the case that works.
+SdioHost::Status Iw416::readMpRegsCmd52(MpRegs *out, bool txPath) {
+    memset(out, 0, sizeof(*out));
+    SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &out->intStatus);
+    if (txPath) m_cmd52PollsTx++; else m_cmd52PollsSvc++;
+    if (s != SdioHost::OK) {
+        // Same reasoning as the register-port path: the read may have taken
+        // the bits with it, so assume the worst rather than lose them.
+        latchIntBits((uint8_t)(HOST_INT_UP_LD | CMD_PORT_UPLD));
+        return s;
+    }
+    latchIntBits(out->intStatus);
+    m_dbgStatusOr |= out->intStatus;
+
+    s = readRdBitmap32(&out->rdBitmap);
+    if (s != SdioHost::OK) return s;
+    m_dbgBitmapOr |= out->rdBitmap;
+    s = readWrBitmap32(&out->wrBitmap);
+    if (s != SdioHost::OK) return s;
+    uint8_t lo = 0, hi = 0;
+    s = m_host.cmd52Read(1, CMD_RD_LEN_0, &lo); m_cmd52PollsSvc++;
+    if (s != SdioHost::OK) return s;
+    s = m_host.cmd52Read(1, CMD_RD_LEN_1, &hi); m_cmd52PollsSvc++;
+    if (s != SdioHost::OK) return s;
+    out->cmdRdLen = (uint16_t)(lo | ((uint16_t)hi << 8));
+    // Only the slots the card is actually offering: a length register for a
+    // slot with no upload is 0 anyway, and 64 CMD52s to re-read zeros would
+    // treble the cost of every poll on an idle link.
+    for (uint8_t p = 0; p < MAX_DATA_PORTS; p++) {
+        if (!((out->rdBitmap >> p) & 1u)) continue;
+        s = readRdLenPort(p, &out->rdLen[p]);
+        if (s != SdioHost::OK) return s;
+    }
     return SdioHost::OK;
 }
 
@@ -580,16 +742,27 @@ SdioHost::Status Iw416::readRdLenPort(uint8_t port, uint16_t *out) {
     return SdioHost::OK;
 }
 
-SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
-                                       uint8_t *portOut) {
+SdioHost::Status Iw416::readRingBatch(MpRegs *regs, uint8_t *buf, uint32_t bufCap,
+                                      uint32_t *outLen, uint8_t *slotsOut,
+                                      uint8_t *startOut, uint16_t *lensOut,
+                                      uint8_t maxSlots) {
+    if (outLen)   *outLen = 0;
+    if (slotsOut) *slotsOut = 0;
+    if (maxSlots == 0) return SdioHost::CMD_TIMEOUT;
+
     // The firmware uploads to ports strictly in ring order, so the only port
     // worth checking is m_rxPort.  (Verified against NXP's own stack with
     // CONFIG_WIFI_IO_DEBUG: rd_bitmap walks 0x100, 0x200, 0x400... as the
     // ESP's 1 Hz broadcasts arrive -- see transcript_hw_evkb.txt W8.)
     uint32_t bitmap = 0;
-    SdioHost::Status s = readRdBitmap32(&bitmap);
-    if (s != SdioHost::OK) return s;
-    m_dbgBitmapOr |= bitmap;
+    SdioHost::Status s;
+    if (regs) {
+        bitmap = regs->rdBitmap;      // W16: from this pass's register snapshot
+    } else {
+        s = readRdBitmap32(&bitmap);
+        if (s != SdioHost::OK) return s;
+        m_dbgBitmapOr |= bitmap;
+    }
     if (!(bitmap & (1u << m_rxPort))) {
         if (bitmap != 0) {
             // Bitmap has a packet somewhere else: the ring model was wrong or
@@ -602,40 +775,101 @@ SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *
             return SdioHost::CMD_TIMEOUT;      // nothing pending
         }
     }
-    const uint8_t p = m_rxPort;
-    if (portOut) *portOut = p;
 
-    uint16_t len = 0;
-    s = readRdLenPort(p, &len);
-    if (s != SdioHost::OK) return s;
-    if (len == 0) {
-        // W13: the card offered this slot in the bitmap but has published no
-        // length for it.  Reported as CMD_TIMEOUT -- the SAME status as a
-        // genuinely empty ring -- which is why this is counted: serviceLink's
-        // drain reads that as "finished" and clears HOST_INT_UP_LD.  See
-        // rxSlotNotReady() in Iw416.h for the whole argument and for what to
-        // do once a soak has confirmed or killed it.
-        m_rxSlotNotReady++;
-        return SdioHost::CMD_TIMEOUT;
+    const uint8_t start = m_rxPort;
+    if (startOut) *startOut = start;
+    uint32_t total = 0;
+    uint8_t  slots = 0;
+    while (slots < maxSlots) {
+        const uint32_t p = (uint32_t)start + slots;
+        if (p >= MAX_DATA_PORTS) break;        // no wrap inside one CMD53
+        if (!(bitmap & (1u << p))) break;      // run of occupied slots ended
+        uint16_t len = 0;
+        if (regs) {
+            len = regs->rdLen[p];
+        } else {
+            s = readRdLenPort((uint8_t)p, &len);
+            if (s != SdioHost::OK) return s;
+        }
+        if (len == 0) {
+            // W13: the card offered this slot in the bitmap but has published
+            // no length for it.  A SET BIT IS NOT EVIDENCE on this firmware --
+            // ~6100 such resyncs over 110 blasts found no data at all -- so
+            // the run stops here rather than reading a slot the card has not
+            // filled.  Counted only when it is the FIRST slot, because that is
+            // the case serviceLink's drain then reads as "ring empty" and
+            // clears HOST_INT_UP_LD on; a zero length that merely ends a batch
+            // is an ordinary run boundary and is re-examined next pass.
+            if (slots == 0) m_rxSlotNotReady++;
+            break;
+        }
+        const uint32_t padded = ((uint32_t)len + SDIO_BLOCK_SIZE - 1) /
+                                SDIO_BLOCK_SIZE * SDIO_BLOCK_SIZE;
+        if (total + padded > bufCap) {
+            // A single packet that cannot fit at all is a bug, not a boundary,
+            // and it must be reported rather than silently skipped: skipping a
+            // port wedges every later upload behind it.
+            if (slots == 0) return SdioHost::BAD_CIS;
+            break;
+        }
+        if (lensOut) lensOut[slots] = len;
+        total += padded;
+        slots++;
     }
+    if (slots == 0) return SdioHost::CMD_TIMEOUT;
 
+    // The aggregated multiport address, NXP's encoding (wifi_tx_data() /
+    // wlan_get_rd_port()).  ONE slot keeps the plain ioport|port form -- the
+    // card is not offered a run it did not need.
+    const uint32_t addr = (slots == 1)
+        ? (m_ioPort | start)
+        : ((m_ioPort | MPA_ADDR_BASE | ((uint32_t)(slots - 1) << 8)) + start);
+    const uint16_t blocks = (uint16_t)(total / SDIO_BLOCK_SIZE);
+    s = m_host.cmd53Read(1, addr, false, buf, SDIO_BLOCK_SIZE, blocks);
+    if (s != SdioHost::OK) return s;
+    // Counted only on a successful read, matching m_dbgReads/m_rxPort's own
+    // success-only bookkeeping below.  ONE CMD53 for `slots` packets is the
+    // entire point: this is the counter a gate divides by the frame count.
+    m_cmd53Rx++;
+    m_cmd53Bytes += total;
+    if (slots > 1) { m_rxAggrBatches++; m_rxAggrSlots += slots; }
+
+    // The card has now cleared these slots' bits; keep the caller's snapshot in
+    // step so a multi-batch drain advances instead of re-reading them.
+    if (regs) {
+        for (uint8_t i = 0; i < slots; i++) {
+            regs->rdBitmap &= ~(1u << (uint32_t)(start + i));
+        }
+    }
+    m_rxPort = (uint8_t)(((uint32_t)start + slots) % MAX_DATA_PORTS);
+    m_dbgReads += slots;
+    if (outLen)   *outLen = total;
+    if (slotsOut) *slotsOut = slots;
+    return SdioHost::OK;
+}
+
+// One packet from the ring: readRingBatch() bounded to a single slot, plus the
+// historical copy-out contract (BAD_CIS = read and dropped, the slot consumed
+// either way).  The diagnostic readers -- readDataPacket(), captureMonitor() --
+// are its only callers; serviceLink() takes batches.
+SdioHost::Status Iw416::readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
+                                       uint8_t *portOut, MpRegs *regs) {
     // Always read into scratch and consume the ring slot -- an unread port
     // stalls every later upload, so "too big" must still drain the packet.
     static uint8_t scratch[SDIO_BLOCK_SIZE * 16];
-    if (len > sizeof(scratch)) return SdioHost::BAD_CIS;   // cannot drain; bug
-    uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-    // W11: the RX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
-    // counters' comment in Iw416.h.  Counted only on a successful read, to
-    // match m_dbgReads/m_rxPort's own success-only bookkeeping just below.
-    s = m_host.cmd53Read(1, m_ioPort | p, false, scratch, SDIO_BLOCK_SIZE, blocks);
-    if (s == SdioHost::OK) { m_cmd53Count++; m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE; }
+    uint32_t got = 0;
+    uint8_t  slots = 0, start = 0;
+    uint16_t lens[1] = {0};
+    SdioHost::Status s = readRingBatch(regs, scratch, sizeof(scratch), &got,
+                                       &slots, &start, lens, 1);
     if (s != SdioHost::OK) return s;
-    m_rxPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
-    m_dbgReads++;
+    if (portOut) *portOut = start;
 
     // Trust the SDIOPkt's own size field, not the block-padded read length.
     uint16_t pktSize = (uint16_t)(scratch[0] | ((uint16_t)scratch[1] << 8));
-    if (pktSize > len) pktSize = len;
+    // Clamp to the CARD's length for this slot, not to the block-padded
+    // transfer size: the padding is ours, the length is the card's.
+    if (pktSize > lens[0]) pktSize = lens[0];
     if (outLen) *outLen = pktSize;
     if (pktSize > bufCap) return SdioHost::BAD_CIS;        // read+dropped
     memcpy(buf, scratch, pktSize);
@@ -667,8 +901,7 @@ SdioHost::Status Iw416::readDataPacket(uint8_t *buf, uint16_t bufLen, uint16_t *
     for (uint32_t i = 0; i < timeoutMs; i++) {
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &st);
         if (s != SdioHost::OK) return s;
-        m_intSeen     |= st;
-        m_intPending  |= (uint8_t)(st & (HOST_INT_UP_LD | CMD_PORT_UPLD));   // serviced bits only
+        latchIntBits(st);          // W12 Layer 1: serviced bits only
         m_dbgStatusOr |= st;
         if (st & HOST_INT_UP_LD) { up = true; break; }
         delay(1);
@@ -1058,9 +1291,8 @@ SdioHost::Status Iw416::diagConnect(uint32_t timeoutMs) {
         uint8_t fresh = 0;
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
         if (s != SdioHost::OK) return s;
-        m_intSeen    |= fresh;
         // W12: never discard a bit anyone services (see m_intPending).
-        m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        latchIntBits(fresh);
         // W13: branch on the accumulator, not on this read alone (the M5
         // shape -- see readHostResp).  Legal here for BOTH bits because both
         // branches below clear the bit they service; associate() runs
@@ -1141,9 +1373,8 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
         uint8_t fresh = 0;
         SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
         if (s != SdioHost::OK) return s;
-        m_intSeen    |= fresh;
         // W12: never discard a bit anyone services (see m_intPending).
-        m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+        latchIntBits(fresh);
         // W13: branch on the accumulator -- same reasoning as diagConnect, and
         // this is the watcher connectStation() actually uses, so an upload
         // accumulated by associate()'s readHostResp reaches its drain here
@@ -1215,9 +1446,21 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
 SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                       uint32_t timeoutMs) {
     wakeCardIfSleeping();
-    static uint8_t tx[SDIO_BLOCK_SIZE * 8];
     const uint16_t total = (uint16_t)(INTF_HEADER_LEN + TXPD_LEN + frameLen);
-    if (total > sizeof(tx)) return SdioHost::BAD_CIS;
+    const uint32_t padded = ((uint32_t)total + SDIO_BLOCK_SIZE - 1) /
+                            SDIO_BLOCK_SIZE * SDIO_BLOCK_SIZE;
+    if (padded > sizeof(m_txAggrBuf)) return SdioHost::BAD_CIS;
+    // W16: this frame cannot join the batch in progress if the batch is full,
+    // the buffer has no room, or the ring has come back to slot 0 -- a run
+    // never wraps inside one CMD53 (see readRingBatch's comment).  Flush and
+    // start a new one.
+    if (m_txAggrCount &&
+        (m_txAggrCount >= AGGR_PKT_LIMIT ||
+         m_txAggrLen + padded > sizeof(m_txAggrBuf) ||
+         m_txPort == 0)) {
+        SdioHost::Status fs = flushTx();
+        if (fs != SdioHost::OK) return fs;
+    }
 
     // Wait for OUR ring port to be free.  W8: the 32 download ports are a
     // ring; the firmware transmits each write promptly but only re-publishes
@@ -1225,19 +1468,50 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     // own comment: DN_LD "is usually when we write to port most significant
     // port").  So the port to watch is m_txPort, and picking "lowest set bit"
     // instead permanently stalls at 16 sends on a 16-bit bitmap view.
+    //
+    // W16: the wr-bitmap comes out of the register-port snapshot -- ONE CMD53
+    // per poll instead of four CMD52s.  A side effect that is not a side
+    // effect: that read also consumes the clear-on-read HOST_INT_STATUS, which
+    // readWrBitmap32() never touched.  readMpRegs() accumulates those bits into
+    // m_intPending, so the TX poll now LATCHES interrupts for serviceLink to
+    // service rather than being blind to them -- the W12 Layer 1 rule applied
+    // to a path that previously had no reason to obey it.  (It is also what
+    // NXP does: their wlan_interrupt() is the only register reader either.)
+    //
+    // The poll itself is UNCHANGED, and deliberately so: it still re-reads the
+    // real register on every iteration and still waits on OUR ring port.  W11
+    // proved that this read-per-frame pattern is accidentally load-bearing --
+    // it paces the host to the firmware's own credit cadence -- and that a
+    // stale cached view in its place costs 2.5x.  Only the transport got
+    // cheaper.
     uint32_t bitmap = 0;
     for (uint32_t waited = 0;; waited++) {
-        SdioHost::Status s = readWrBitmap32(&bitmap);
+        MpRegs mp;
+        SdioHost::Status s = readMpRegs(&mp, /*txPath=*/true);
         if (s != SdioHost::OK) return s;
+        bitmap = mp.wrBitmap;
         m_lastWrBitmap = bitmap;
         if (bitmap & (1u << m_txPort)) break;
+        // W16: never sit on staged frames while waiting for a credit.  The
+        // card frees download ports in batches once the ring's top has been
+        // written (W8), so holding a batch back during the wait can only make
+        // the wait longer -- and it would add the whole timeout to the latency
+        // of frames that were ready to go.
+        if (m_txAggrCount) {
+            SdioHost::Status fs = flushTx();
+            if (fs != SdioHost::OK) return fs;
+            continue;
+        }
         if (waited >= timeoutMs) return SdioHost::CMD_TIMEOUT;
         delay(1);
     }
     const uint8_t p = m_txPort;
 
-    uint16_t blocks = (uint16_t)((total + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
-    memset(tx, 0, (uint32_t)blocks * SDIO_BLOCK_SIZE);
+    // W16: stage at the aggregation buffer's current fill point.  Read AFTER
+    // the two paths above that can empty it -- the "cannot join this batch"
+    // flush and the wr-bitmap wait's flush -- because either moves m_txAggrLen.
+    uint8_t *tx = (uint8_t *)(void *)m_txAggrBuf + m_txAggrLen;
+    memset(tx, 0, padded);
     tx[0] = (uint8_t)(total & 0xFF); tx[1] = (uint8_t)(total >> 8);
     tx[2] = (uint8_t)MLAN_TYPE_DATA; tx[3] = 0;
     // TxPD: only tx_pkt_length (offset 2) and tx_pkt_offset (offset 4) are
@@ -1248,19 +1522,60 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     tx[INTF_HEADER_LEN + 5] = 0;
     memcpy(&tx[INTF_HEADER_LEN + TXPD_LEN], frame, frameLen);
 
-    SdioHost::Status s = m_host.cmd53Write(1, m_ioPort | p, false, tx,
+    // W16: the frame is now STAGED, not written.  The ring port is consumed
+    // here -- in order, exactly as before -- and the bus write happens in
+    // flushTx(), which is called below when the batch is complete, or by the
+    // caller's poll loop, or by the next send that cannot join this batch.
+    if (m_txAggrCount == 0) m_txAggrStart = p;
+    m_txAggrLen += padded;
+    m_txAggrCount++;
+    m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
+    // With aggregation off this flushes every frame immediately, which is
+    // byte-for-byte the pre-W16 behaviour: one CMD53 per frame at
+    // m_ioPort|port, m_dataTxCount incremented once, the same counters moved.
+    if (!m_txAggr || m_txAggrCount >= AGGR_PKT_LIMIT || m_txPort == 0) {
+        return flushTx();
+    }
+    return SdioHost::OK;
+}
+
+// W16.  Write the staged batch as ONE CMD53 at the aggregated multiport
+// address, or at the plain ioport|port form when it holds a single frame.
+//
+// ★ THE RING PORTS ARE CONSUMED WHETHER OR NOT THE WRITE SUCCEEDS, and the
+// batch is reset before the write for that reason.  m_txPort advanced when
+// each frame was staged (that is what reserved its slot), so a failed write
+// cannot be retried onto the same ports without either re-using a slot the
+// card may have partly taken or rewinding a ring position the card's own
+// bitmap disagrees with.  NXP has the same property -- wlan_get_wr_port_data()
+// takes the port out of the bitmap before the write -- and the consequence is
+// benign: the skipped slots simply stay marked free in WR_BITMAP until the
+// firmware's next batch recycle.  Losing the frames is correct; wedging the
+// ring would not be.
+SdioHost::Status Iw416::flushTx() {
+    if (m_txAggrCount == 0) return SdioHost::OK;
+    const uint8_t  start = m_txAggrStart;
+    const uint8_t  count = m_txAggrCount;
+    const uint32_t total = m_txAggrLen;
+    m_txAggrCount = 0;
+    m_txAggrLen   = 0;
+    m_txAggrStart = 0;
+
+    const uint32_t addr = (count == 1)
+        ? (m_ioPort | start)
+        : ((m_ioPort | MPA_ADDR_BASE | ((uint32_t)(count - 1) << 8)) + start);
+    const uint16_t blocks = (uint16_t)(total / SDIO_BLOCK_SIZE);
+    SdioHost::Status s = m_host.cmd53Write(1, addr, false,
+                                           (const uint8_t *)(void *)m_txAggrBuf,
                                            SDIO_BLOCK_SIZE, blocks);
     if (s != SdioHost::OK) return s;
-    // W11: the TX-direction half of m_cmd53Count/m_cmd53Bytes -- see those
-    // counters' comment in Iw416.h.  Counted only on success (the early
-    // `return s` above already filtered the failure case out, matching the
-    // RX site's success-only bookkeeping).  m_cmd53Bytes takes the
-    // block-padded length successfully issued (blocks * SDIO_BLOCK_SIZE),
-    // not frameLen.
-    m_cmd53Count++;
-    m_cmd53Bytes += (uint32_t)blocks * SDIO_BLOCK_SIZE;
-    m_txPort = (uint8_t)((p + 1) % MAX_DATA_PORTS);
-    m_dataTxCount++;
+    // W11: the TX-direction half of the data-CMD53 counters -- see their
+    // comment in Iw416.h.  Counted only on success, matching the RX site.
+    // ONE command for `count` frames is the whole point.
+    m_cmd53Tx++;
+    m_cmd53Bytes += total;
+    if (count > 1) { m_txAggrBatches++; m_txAggrSlots += count; }
+    m_dataTxCount += count;
     return SdioHost::OK;
 }
 
@@ -1362,16 +1677,26 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
             else m_host.armCardInt();
         }
         bool netTick = (uint16_t)(m_svcQuietPasses + 1) >= RX_BITMAP_CHECK_PASSES;
-        uint8_t fresh = 0;
-        if (!m_intMode || intFired || netTick) {
-            SdioHost::Status s = m_host.cmd52Read(1, HOST_INT_STATUS, &fresh);
-            m_cmd52PollsSvc++;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
+        // W16: ONE register-port CMD53 in place of the CMD52 that used to read
+        // HOST_INT_STATUS -- and it brings both ring bitmaps, all 32 per-slot
+        // lengths and the command-port length with it, so the drain, the
+        // safety net and the command-port branch below all read from `mp`
+        // rather than issuing bus traffic of their own.  See readMpRegs().
+        //
+        // A pass with a bit ALREADY pending (latched by another reader, e.g.
+        // sendDataFrame's own register read) also takes a snapshot even in
+        // interrupt mode: it is about to service that condition and needs the
+        // registers to do it.  Without that clause an interrupt-mode pass
+        // could reach the command-port branch with no length to read.
+        MpRegs mp;
+        bool haveMp = false;
+        if (!m_intMode || intFired || netTick || m_intPending) {
+            SdioHost::Status s = readMpRegs(&mp);
             if (s != SdioHost::OK) return s;
-            m_intSeen    |= fresh;
-            // Serviced bits only -- HOST_INT_DN_LD/CMD_PORT_DNLD are never consumed
-            // by anyone, so latching them would pin m_intPending non-zero for the
-            // rest of the firmware's life (see its comment in Iw416.h).
-            m_intPending |= (uint8_t)(fresh & (HOST_INT_UP_LD | CMD_PORT_UPLD));
+            haveMp = true;
+            // readMpRegs has already accumulated the serviced bits into
+            // m_intPending and the raw union into m_intSeen -- same rule as
+            // every other HOST_INT_STATUS reader (W12 Layer 1).
         }
         // W12 LAYER 1: work from the union of this read and everything the
         // other four HOST_INT_STATUS readers took out of the clear-on-read
@@ -1379,6 +1704,12 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
         // gotDrop` early return below safe: anything not finished this pass
         // is still set in m_intPending and is serviced on a later pass.
         uint8_t st = m_intPending;
+        // W16: sampled WITH `st`.  Anything that latches a NEW HOST_INT_UP_LD
+        // while this pass is servicing -- above all sendDataFrame's own
+        // register read, which the FrameSink contract lets the sink call from
+        // inside the drain -- moves this counter, and the post-drain clear
+        // below declines to run.  See latchIntBits().
+        const uint32_t upldGen = m_intUpldLatches;
 
         // W12 LAYER 2: the net.  If no upload is indicated, the card may still
         // be holding one whose interrupt was lost before Layer 1 existed -- or
@@ -1426,10 +1757,16 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
         bool viaDesync = false;
         if (!drainNow) {
             if (++m_svcQuietPasses >= RX_BITMAP_CHECK_PASSES) {
-                uint32_t bm = 0;
-                if (readRdBitmap32(&bm) == SdioHost::OK) {
-                    // Re-arm only on a check that actually happened: a failing
-                    // bus must not buy itself another 64 passes of silence.
+                // W16: the bitmap and the candidate slot's length both come out
+                // of this pass's register snapshot, so the net now costs ZERO
+                // extra bus commands rather than 4 CMD52s (+2 for the desync
+                // probe).  `haveMp` stands in for the old "the read succeeded"
+                // test: a pass that took no snapshot has nothing to check with,
+                // and must not re-arm -- a failing bus must not buy itself
+                // another 64 passes of silence.  netTick forces the snapshot
+                // above, so in practice haveMp is true whenever this runs.
+                if (haveMp) {
+                    uint32_t bm = mp.rdBitmap;
                     m_svcQuietPasses = 0;
                     if (bm & (1u << m_rxPort)) {
                         drainNow = true;                   // (a) aligned
@@ -1439,14 +1776,12 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                         // before letting the drain move the ring position.
                         uint8_t p = 0;
                         while (p < MAX_DATA_PORTS && !((bm >> p) & 1u)) p++;
-                        uint16_t clen = 0;
-                        if (p < MAX_DATA_PORTS &&
-                            readRdLenPort(p, &clen) == SdioHost::OK && clen != 0) {
+                        if (p < MAX_DATA_PORTS && mp.rdLen[p] != 0) {
                             drainNow  = true;
                             viaNet    = true;
                             viaDesync = true;
                         }
-                        // clen == 0 => stale bit: no drain, no resync, no
+                        // rdLen == 0 => stale bit: no drain, no resync, no
                         // counter, and m_rxPort does NOT move.  This is the
                         // whole point of the positive check.
                     }
@@ -1459,9 +1794,30 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
             // Drain every upload queued at the ring position (W8: the 32
             // ports are a ring; the packets sit at consecutive slots).
             bool drainedAny = false;
+            // W16: the ring is drained in BATCHES -- one CMD53 per run of
+            // consecutive occupied slots rather than one per packet.  With
+            // aggregation off the bound is 1, which is byte-for-byte the
+            // pre-W16 behaviour; that is what makes the gate's two arms a
+            // controlled A/B on one image.
+            //
+            // The batch buffer is separate from `rx` (which stays the
+            // command/event port's staging): frames are handed to the sink
+            // straight out of it, which is still exactly the FrameSink
+            // contract -- a pointer into driver-owned staging, valid only for
+            // the duration of the callback.
+            // uint32_t-backed: SdioHost's PIO loop casts the destination to
+            // uint32_t*, and a bare uint8_t array carries no such alignment
+            // guarantee (the same reason m_mpRaw and m_txAggrBuf are).
+            static uint32_t batch32[(uint32_t)SDIO_BLOCK_SIZE * AGGR_BUF_BLOCKS / 4];
+            uint8_t *batch = (uint8_t *)(void *)batch32;
+            uint16_t lens[AGGR_PKT_LIMIT] = {0};
             for (;;) {
-                uint16_t pktSize = 0;
-                SdioHost::Status rs = readRingPacket(rx, sizeof(rx), &pktSize, nullptr);
+                uint32_t batchLen = 0;
+                uint8_t  slots = 0, start = 0;
+                SdioHost::Status rs = readRingBatch(haveMp ? &mp : nullptr,
+                                                    batch, sizeof(batch32), &batchLen,
+                                                    &slots, &start, lens,
+                                                    m_rxAggr ? AGGR_PKT_LIMIT : 1);
                 if (rs == SdioHost::CMD_TIMEOUT) break;         // ring drained
                 if (rs != SdioHost::OK) {
                     // W12 follow-up: THE prime suspect for a residual
@@ -1476,17 +1832,54 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                     break;                                      // dropped/bus error
                 }
                 drainedAny = true;
-                uint16_t pkttype = (uint16_t)(rx[2] | ((uint16_t)rx[3] << 8));
-                if (pkttype != MLAN_TYPE_DATA) continue;
-                m_rxDataCount++;
-                // RxPD: rx_pkt_length at +2, rx_pkt_offset at +4; the 802.3
-                // frame at INTF_HEADER_LEN + rx_pkt_offset.
-                const uint8_t *rxpd = &rx[INTF_HEADER_LEN];
-                uint16_t plen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
-                uint16_t poff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
-                if ((uint32_t)INTF_HEADER_LEN + poff + plen > pktSize) continue;
-                gotFrame = true;
-                if (sink) sink(ctx, &rx[INTF_HEADER_LEN + poff], plen);
+                // Split the batch the way NXP's receive loop does
+                // (wifi-sdio.c): take each packet's own SDIOPkt size, round it
+                // UP to a 256-byte boundary, and step by that -- the card pads
+                // every slot's packet to a block boundary so the run is
+                // self-describing.  A zero size ends the walk; `slots` bounds
+                // it so a corrupt length cannot spin.
+                //
+                // ★ THE WALK STEPS BY THE CARD'S PER-SLOT RD_LEN, NOT BY EACH
+                // PACKET'S OWN SIZE FIELD.  Those lengths are what sized the
+                // transfer, so they are the only thing guaranteed to land on
+                // the boundaries the card actually used.  Stepping by the
+                // payload's self-report instead makes every packet's position
+                // depend on the one before it: a single slot where the two
+                // round differently would desynchronise the rest of the batch
+                // and silently drop frames whose ring slots had ALREADY been
+                // consumed -- unrecoverable, and invisible, because nothing
+                // downstream can tell a short batch from a short burst.  A
+                // packet whose size disagrees with its slot is skipped and
+                // counted (rxSplitMismatch); the ones behind it still arrive.
+                uint32_t off = 0;
+                for (uint8_t i = 0; i < slots; i++) {
+                    const uint16_t slotLen = lens[i];
+                    const uint32_t padded = ((uint32_t)slotLen + SDIO_BLOCK_SIZE - 1) /
+                                            SDIO_BLOCK_SIZE * SDIO_BLOCK_SIZE;
+                    if (off + padded > batchLen) break;   // cannot happen: same sum
+                    uint16_t pktSize = (uint16_t)(batch[off] |
+                                                  ((uint16_t)batch[off + 1] << 8));
+                    if (pktSize == 0 || pktSize > slotLen) {
+                        m_rxSplitMismatch++;
+                        off += padded;
+                        continue;
+                    }
+                    uint16_t pkttype = (uint16_t)(batch[off + 2] |
+                                                  ((uint16_t)batch[off + 3] << 8));
+                    if (pkttype == MLAN_TYPE_DATA) {
+                        m_rxDataCount++;
+                        // RxPD: rx_pkt_length at +2, rx_pkt_offset at +4; the
+                        // 802.3 frame at INTF_HEADER_LEN + rx_pkt_offset.
+                        const uint8_t *rxpd = &batch[off + INTF_HEADER_LEN];
+                        uint16_t plen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
+                        uint16_t poff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
+                        if ((uint32_t)INTF_HEADER_LEN + poff + plen <= pktSize) {
+                            gotFrame = true;
+                            if (sink) sink(ctx, &batch[off + INTF_HEADER_LEN + poff], plen);
+                        }
+                    }
+                    off += padded;
+                }
             }
             // Honest counter: only a drain the NET initiated, that actually
             // pulled a packet off the ring, is a recovered strand.  A bitmap
@@ -1515,17 +1908,40 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
             // and swallowing it here would re-create the very fault Layer 1
             // exists to prevent.  (When the drain came from the net, `st`'s bit
             // was clear and this is correctly a no-op.)
-            m_intPending &= (uint8_t)~(st & HOST_INT_UP_LD);
+            //
+            // W16: and only if no NEW upload was announced while we were
+            // draining.  Scoping to the snapshot decides WHETHER to clear; it
+            // cannot distinguish WHICH arrival is being cleared, and since W16
+            // the TX path consumes HOST_INT_STATUS too, so a frame queued
+            // mid-drain can have its bit taken by sendDataFrame and then wiped
+            // here on the strength of the bit this pass came in with.  The
+            // frame would then wait for the 64 ms safety net and show up as
+            // rxStrandedRecovered() -- W12 fault #5 rebuilt, wearing the
+            // costume of the counter that detects it.
+            if (m_intUpldLatches == upldGen) {
+                m_intPending &= (uint8_t)~(st & HOST_INT_UP_LD);
+            }
         }
         if (st & CMD_PORT_UPLD) {
             // Consumed on entry: the command port's flag entitles this branch
             // to one look, and it takes it below.  (Same rule as diagConnect.)
             m_intPending &= (uint8_t)~CMD_PORT_UPLD;
-            uint8_t lo = 0, hi = 0;
-            m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
-            m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
-            m_cmd52PollsSvc += 2;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
-            uint16_t len = (uint16_t)(lo | ((uint16_t)hi << 8));
+            // W16: the command-port length is in the register snapshot at
+            // 0xC0/0xC1, which is why NXP's MAX_MP_REGS reaches as far as
+            // 0xC3.  The two CMD52s this replaces were the last per-packet
+            // register polls on the service path.  The `haveMp` fallback is
+            // not dead code: it is what keeps this branch correct if the read
+            // condition above is ever narrowed again.
+            uint16_t len;
+            if (haveMp) {
+                len = mp.cmdRdLen;
+            } else {
+                uint8_t lo = 0, hi = 0;
+                m_host.cmd52Read(1, CMD_RD_LEN_0, &lo);
+                m_host.cmd52Read(1, CMD_RD_LEN_1, &hi);
+                m_cmd52PollsSvc += 2;   // W11: see m_cmd52PollsSvc's comment in Iw416.h
+                len = (uint16_t)(lo | ((uint16_t)hi << 8));
+            }
             if (len && len <= sizeof(rx)) {
                 uint16_t blocks = (uint16_t)((len + SDIO_BLOCK_SIZE - 1) / SDIO_BLOCK_SIZE);
                 // NOTE (W11): this CMD53 is the command/event port, not data --

@@ -18,6 +18,7 @@
 #define INT_STATUS_EN REG(0x34)
 #define INT_SIGNAL_EN REG(0x38)
 #define DATPORT      REG(0x20)
+#define WTMK_LVL     REG(0x44)
 #define MIX_CTRL     REG(0x48)
 #define VEND_SPEC    REG(0xC0)
 
@@ -399,9 +400,12 @@ static inline uint32_t cmd53Arg(bool write, uint8_t fn, uint32_t addr,
 }
 
 SdioHost::Status SdioHost::cmd53(uint8_t fn, uint32_t addr, bool incrAddr, bool write,
-                                 uint8_t *buf, uint16_t blockSize, uint16_t blocks) {
+                                 uint8_t *buf, uint16_t blockSize, uint16_t blocks,
+                                 bool blockMode) {
     // Program the transfer before issuing the command: BLK_ATT carries the
     // block size and count, MIX_CTRL the direction and multi-block flags.
+    // In BYTE mode (blockMode false) the caller passes blockSize = the byte
+    // count and blocks = 1, and the CMD53 count field carries the bytes.
     BLK_ATT  = ((uint32_t)blocks << 16) | blockSize;
     uint32_t mix = (1u << 1);                        // BCEN, block count enable
     if (blocks > 1) mix |= (1u << 5);                // MSBSEL, multi-block
@@ -409,7 +413,10 @@ SdioHost::Status SdioHost::cmd53(uint8_t fn, uint32_t addr, bool incrAddr, bool 
     MIX_CTRL = (MIX_CTRL & ~0x3Fu) | mix;
 
     INT_STATUS = 0xFFFFFFFFu;
-    CMD_ARG = cmd53Arg(write, fn, addr, incrAddr, true, blocks);
+    // Byte mode encodes the BYTE count, block mode the BLOCK count; 512 is
+    // spelled 0 in both, which is why the count is masked to 9 bits.
+    CMD_ARG = cmd53Arg(write, fn, addr, incrAddr, blockMode,
+                       blockMode ? blocks : blockSize);
     // DPSEL (bit 21) tells the controller a data phase follows.
     CMD_XFR_TYP = ((uint32_t)53 << 24) | (1u << 21) | RSP_48 | CHK_CRC | CHK_IDX;
 
@@ -453,4 +460,21 @@ SdioHost::Status SdioHost::cmd53Write(uint8_t fn, uint32_t addr, bool incrAddr,
 SdioHost::Status SdioHost::cmd53Read(uint8_t fn, uint32_t addr, bool incrAddr,
                                      uint8_t *dst, uint16_t blockSize, uint16_t blocks) {
     return cmd53(fn, addr, incrAddr, false, dst, blockSize, blocks);
+}
+
+SdioHost::Status SdioHost::cmd53ReadBytes(uint8_t fn, uint32_t addr, bool incrAddr,
+                                          uint8_t *dst, uint16_t bytes) {
+    // 512 is the largest a CMD53 byte count can express (as 0); the PIO port
+    // is 32 bits wide, so a partial word has nowhere to go.
+    if (bytes == 0 || bytes > 512 || (bytes & 3u)) return BAD_CIS;
+    // See cmd53ReadBytes()'s comment in the header: a one-word read watermark
+    // removes any question about how the controller announces a transfer whose
+    // word count is not a multiple of the watermark, at no cost to a loop that
+    // already polls per word.  Restored on the single exit below, so a failing
+    // register read cannot leave the proven 256-byte block path re-tuned.
+    const uint32_t savedWml = WTMK_LVL;
+    WTMK_LVL = (savedWml & ~0xFFu) | 1u;
+    Status s = cmd53(fn, addr, incrAddr, false, dst, bytes, 1, false);
+    WTMK_LVL = savedWml;
+    return s;
 }

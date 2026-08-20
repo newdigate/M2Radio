@@ -340,9 +340,121 @@ public:
     // how many frames it delivers.  Reset per firmware life, like the other
     // service counters.
     uint32_t cardInts() const { return m_cardInts; }
-    uint32_t cmd53Count()     const { return m_cmd53Count; }     // data CMD53s, both directions
+    uint32_t cmd53Count()     const { return m_cmd53Rx + m_cmd53Tx; }  // data CMD53s, both directions
     uint32_t cmd53Bytes()     const { return m_cmd53Bytes; }     // bytes successfully issued on the bus
-    uint32_t cmd53ByteMode()  const { return m_cmd53ByteMode; }  // of those, how many were BYTE mode
+    // Data-port CMD53s issued in BYTE mode.  Still 0 by construction and still
+    // an invariant rather than a detector: both data-port sites pass block
+    // mode.  ★ W16 DID introduce byte-mode CMD53 to this driver -- the
+    // register-port read is one -- but that is not a DATA-port transfer and is
+    // counted in cmd53Regs(); if a data-port byte-mode path is ever added,
+    // this needs a real increment site, not a read of a value that already
+    // exists.
+    uint32_t cmd53ByteMode()  const { return m_cmd53ByteMode; }
+
+    // --- W16: the multiport REGISTER-PORT snapshot -------------------------
+    //
+    // NXP's wlan_interrupt() (wifidriver/wifi-sdio.c) never polls this card's
+    // status and bitmap registers with CMD52.  It reads the whole multiport
+    // register group in ONE byte-mode CMD53 at function 1 address 0 --
+    //   sdio_drv_read(REG_PORT | MLAN_SDIO_BYTE_MODE_MASK, 1, 1, MAX_MP_REGS, ..)
+    // -- and everything the service loop needs comes out of that one buffer:
+    //
+    //   0x0C        HOST_INT_STATUS   (clear-on-read, as we configure it)
+    //   0x10..0x13  RD_BITMAP         (32 bits)
+    //   0x14..0x17  WR_BITMAP         (32 bits)
+    //   0x18..0x57  RD_LEN_P0..P31    (32 LE pairs, 0x18 + (port << 1))
+    //   0xC0..0xC1  CMD_RD_LEN        (command-port reply length)
+    //
+    // Before W16 this driver paid SEVEN CMD52s per RX frame for exactly those
+    // values (1 status + 4 rd-bitmap + 2 RD_LEN) and four per TX wr-bitmap
+    // poll.  At the ~0.1 ms per bus command measured in W11 that IS the
+    // ~10-commands-per-frame ceiling.
+    //
+    // ★ THIS IS NOT A CACHE, AND THE DISTINCTION IS THE WHOLE W11 LESSON.
+    // W11 tried to amortise the bitmap reads by holding a STALE view across
+    // frames and regressed throughput 2.5x: the host burned every ring credit
+    // in a burst and then sat in a dry-wait against delay(1) granularity,
+    // because the read-per-frame pattern had accidentally been pacing it to
+    // the firmware's own cadence.  Here every service pass still issues a real
+    // read of the real registers -- one command instead of seven, same
+    // freshness, same pacing.  Never turn this into a view that outlives the
+    // pass that took it.
+    static const uint16_t MP_REGS_LEN = 196;   // MAX_MP_REGS for the SD8978
+    struct MpRegs {
+        uint8_t  intStatus;
+        uint32_t rdBitmap;
+        uint32_t wrBitmap;
+        uint16_t cmdRdLen;
+        uint16_t rdLen[MAX_DATA_PORTS];
+    };
+    // One register-port read.  Accumulates the interrupt bits into the W12
+    // sticky accumulator exactly as every other HOST_INT_STATUS reader does --
+    // this read CONSUMES the clear-on-read register, so a site that dropped
+    // the bits here would re-create fault #5 in a new place.
+    // `txPath` splits the cost the same way m_cmd52PollsTx/m_cmd52PollsSvc
+    // split it: the TX-side wr-bitmap wait and the service-side poll are
+    // separately attributable, which is what let W11 pin its 2.5x regression on
+    // the TX path specifically.  Collapsing them into one number would have
+    // hidden that.
+    SdioHost::Status readMpRegs(MpRegs *out, bool txPath = false);
+    // Has the register port been PROVEN to work on this card?
+    //
+    // ★ THIS EXISTS BECAUSE THE ONE UNVERIFIED ASSUMPTION IN W16 FAILS
+    // SILENTLY, AND FAILS LOOKING HEALTHY.  NXP reads the register file with
+    // the CMD53 address held FIXED (OP Code 0).  On an ordinary SDIO function
+    // that means "read register 0, 196 times"; we believe this card's register
+    // port streams the file instead, because NXP's driver depends on it -- but
+    // no capture in this tree proves it.  Register 0 is HOST_POWER_UP, which
+    // reads back 0, so a card that took OP Code 0 literally would hand us 196
+    // zero bytes: intStatus 0, both bitmaps 0, every RD_LEN 0.  That is
+    // BYTE-IDENTICAL to a healthy idle card.  RX would go permanently silent
+    // (the safety net sees an empty bitmap and never fires), TX would time out
+    // on an empty wr-bitmap, and the read would still be eating the card's
+    // clear-on-read interrupt status the whole time.
+    //
+    // So the FIRST snapshot of each firmware life is checked against something
+    // that cannot be zero: CARD_STATUS (0x5C) sits inside NXP's 196-byte window
+    // and reads 0x0D on this silicon -- a value begin() has already fetched by
+    // CMD52 and stored in cardStatus(), so the check compares the register port
+    // against the CMD52 path rather than against a constant this driver
+    // invented.  On a mismatch the register port is abandoned for the rest of
+    // the firmware life and every caller falls back to the CMD52 reads this
+    // driver used before W16.  Slow, and correct, and LOUD: mpRegsUsable()
+    // reads false and mpRegsRejected() says what came back.
+    bool     mpRegsUsable()   const { return m_mpRegsOk; }
+    uint8_t  mpRegsRejected() const { return m_mpRegsBadStatus; }
+    // Register-port reads that failed on the bus (not the sanity check).
+    // Non-zero means interrupt bits were consumed by a transfer that then
+    // errored -- see readMpRegs() for what is done about that.
+    uint32_t mpRegsErrors()   const { return m_mpRegsErrors; }
+    // Register-port CMD53s.  Deliberately NOT folded into cmd53Count(), which
+    // stays DATA-port-only so that "data CMD53s per frame" remains the clean
+    // aggregation metric: aggregation is supposed to drive that number below
+    // one per frame, and mixing register reads into it would hide exactly that.
+    uint32_t cmd53RegsTx()  const { return m_cmd53RegsTx; }
+    uint32_t cmd53RegsSvc() const { return m_cmd53RegsSvc; }
+    uint32_t cmd53Regs()    const { return m_cmd53RegsTx + m_cmd53RegsSvc; }
+    // Every SDIO command this driver issued on the DATA and SERVICE paths,
+    // summed: the two CMD52 poll counters, both data-port CMD53 directions,
+    // and both register-port reads.  THE number to normalise per frame when
+    // judging a throughput change -- W11 measured the ceiling as ~10 of these
+    // per frame at ~0.1 ms each.  A change that moves one term at another's
+    // expense shows up here as flat, which is exactly what it should do.
+    //
+    // NOT included, deliberately: command/event-port CMD53s and one-off CMD52
+    // WRITES (the PS wake gate, the config registers).  Those are per-command
+    // or per-connection costs, not per-frame ones, and folding them in would
+    // make a busy link's number move with how many host commands were sent.
+    // ★ IT MUST NAME EVERY PER-FRAME COUNTER BY MEMBER.  W16 split
+    // m_cmd53Count into m_cmd53Rx/m_cmd53Tx and this sum kept adding the old
+    // member, which no longer had an increment site -- so it silently stopped
+    // counting data CMD53s, the one term aggregation exists to move, while
+    // still compiling and still looking like a total.  Any future split of a
+    // term in here has to be reflected here in the same commit.
+    uint32_t busCommands() const {
+        return m_cmd52PollsTx + m_cmd52PollsSvc + m_cmd53Rx + m_cmd53Tx +
+               m_cmd53RegsTx + m_cmd53RegsSvc;
+    }
 
     // One-call station bring-up (W9): scan -> find `ssid` (exact byte match
     // against the beacon SSID; first match wins -- fine for a single-AP
@@ -434,8 +546,77 @@ public:
     // CMD53-written to the lowest free WR_BITMAP port.  CMD_TIMEOUT means the
     // card never freed a TX buffer inside timeoutMs -- lastWrBitmap() carries
     // the final bitmap read as evidence.
+    // W16: with TX aggregation enabled (setTxAggregation) this ACCUMULATES the
+    // frame instead of writing it, and the bus write happens in flushTx().  A
+    // ring port is still reserved here, in order, and the wr-bitmap is still
+    // waited on here -- only the CMD53 is deferred, and only as far as the end
+    // of the caller's current poll iteration.
     SdioHost::Status sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                    uint32_t timeoutMs = 1000);
+
+    // --- W16: multiport aggregation (MPA) ----------------------------------
+    //
+    // The card's data ports can be addressed as a RUN: one CMD53 carrying N
+    // consecutive slots, at
+    //     (ioport | SDIO_MPA_ADDR_BASE | ((N - 1) << 8)) + start_port
+    // with each slot's packet padded to a 256-byte boundary and laid back to
+    // back.  That is NXP's own encoding (wifidriver/wifi-sdio.c, wifi_tx_data()
+    // and wlan_get_rd_port()); a single-slot transfer keeps the plain
+    // ioport|port form.  Aggregation is the direct attack on the quantity W11
+    // measured as the ceiling -- SDIO commands per frame -- because it is the
+    // only one that can push DATA CMD53s BELOW one per frame.
+    static const uint32_t MPA_ADDR_BASE = 0x1000;   // NXP SDIO_MPA_ADDR_BASE
+    // NXP's SDIO_MP_AGGR_DEF_PKT_LIMIT for the SD8978 with WMM.  Their
+    // _MAX is 16; 8 is the value their default build actually uses.
+    static const uint8_t  AGGR_PKT_LIMIT  = 8;
+    // 8 KB per direction: five 1.5 KB frames, or the packet limit's worth of
+    // small ones, whichever comes first.
+    static const uint16_t AGGR_BUF_BLOCKS = 32;
+
+    // RX aggregation: ON by default.  It is transparent -- a batch read
+    // delivers exactly the frames a run of single reads would have delivered,
+    // in the same order, with no deferred semantics for a caller to trip over.
+    // The switch exists so a gate can run the SAME image with and without it
+    // and divide the two, which is a controlled A/B rather than an anecdote.
+    void setRxAggregation(bool on) { m_rxAggr = on; }
+    bool rxAggregation() const     { return m_rxAggr; }
+
+    // TX aggregation: OFF by default, and that is deliberate.  It changes what
+    // sendDataFrame() MEANS -- the frame is queued, not on the wire -- and a
+    // caller that sends one frame and then waits for a reply without ever
+    // calling flushTx() would wait forever.  Every caller in this tree that
+    // has a poll loop (the lwip netif) turns it on and flushes each iteration;
+    // the probe and monitor examples, which send a frame and expect it gone,
+    // are untouched by default.
+    void setTxAggregation(bool on) { m_txAggr = on; }
+    bool txAggregation() const     { return m_txAggr; }
+    // Write whatever sendDataFrame() has accumulated, as ONE CMD53.  A no-op
+    // (and OK) when nothing is queued, so a poll loop can call it every
+    // iteration unconditionally.  MUST be called by any caller that enables TX
+    // aggregation, or frames sit in the buffer.
+    SdioHost::Status flushTx();
+    uint8_t txQueued() const { return m_txAggrCount; }
+
+    // Data CMD53s split by direction.  cmd53Count() stays the sum, so every
+    // existing reader keeps working; the split is what makes "data CMD53s per
+    // RX frame" measurable in an example that also transmits.
+    uint32_t cmd53Rx() const { return m_cmd53Rx; }
+    uint32_t cmd53Tx() const { return m_cmd53Tx; }
+    // Slots carried by CMD53s that carried more than one, per direction.  The
+    // un-fakeable "aggregation actually happened" pair: a driver that reads or
+    // writes one slot per command cannot make these non-zero however many
+    // frames it moves, and however fast.
+    // Packets a batch split had to skip because the SDIOPkt size disagreed with
+    // the slot length the card published for it.  Zero is the expected value;
+    // non-zero means the two ends of the block-padding inference (model NOTE 11
+    // -- RD_LEN is published UNPADDED, which is inferred, not measured) do not
+    // agree, and the frames behind the bad one were still delivered because the
+    // walk steps by RD_LEN rather than by the payload.
+    uint32_t rxSplitMismatch() const { return m_rxSplitMismatch; }
+    uint32_t rxAggrBatches() const { return m_rxAggrBatches; }
+    uint32_t rxAggrSlots()   const { return m_rxAggrSlots; }
+    uint32_t txAggrBatches() const { return m_txAggrBatches; }
+    uint32_t txAggrSlots()   const { return m_txAggrSlots; }
     // RECONFIGURE_TX_BUFF (0x00D9): tell the firmware the host's per-port TX
     // buffer size.  NXP's wlan_fw_init_cfg() sends this UNCONDITIONALLY between
     // GET_HW_SPEC and MAC_CONTROL ("firmware looses alignment of SDIO Tx
@@ -451,6 +632,12 @@ public:
     // wlan_enable_amsdu (SET, enable=1).
     SdioHost::Status amsduAggrCtrl();
     uint32_t lastWrBitmap() const { return m_lastWrBitmap; }
+    // Frames the card has actually been given.  ★ W16: incremented at FLUSH,
+    // not at sendDataFrame() -- with TX aggregation on, a successful
+    // sendDataFrame() means the frame is STAGED, and counting it there would
+    // make this number describe intent rather than bus traffic.  It is
+    // therefore the honest partner of cmd53Tx(): frames sent, over commands
+    // used.
     uint32_t dataTxCount() const { return m_dataTxCount; }
     // Ring positions, for the probe's report: which TX/RX port the driver will
     // use next.  Both reset to 0 when the firmware is (re)downloaded.
@@ -699,17 +886,86 @@ private:
 
     SdioHost::Status setCardBits(uint32_t reg, uint8_t bits,
                                  uint8_t *preOut, uint8_t *postOut);
-    // Full 32-bit multiport bitmaps (all four bytes each).
-    SdioHost::Status readRdBitmap32(uint32_t *out);
+    // Fill an MpRegs the slow way, one CMD52 at a time: HOST_INT_STATUS, both
+    // bitmaps, CMD_RD_LEN and only the per-slot RD_LEN the caller can reach.
+    // This is the pre-W16 traffic, kept as the fallback for a card whose
+    // register port does not behave as NXP's driver implies (mpRegsUsable()).
+    SdioHost::Status readMpRegsCmd52(MpRegs *out, bool txPath);
+    // THE one place HOST_INT_STATUS bits enter the sticky accumulator (W12
+    // Layer 1).  Every reader of that clear-on-read register calls this with
+    // what it read; the masking rule (only the two conditions anything here
+    // services) lives here rather than being restated at each site.
+    //
+    // It also counts UP_LD ARRIVALS, and that count is load-bearing.
+    // serviceLink() clears HOST_INT_UP_LD after its drain, scoped to the
+    // snapshot it entered the drain with -- but "scoped to the snapshot" only
+    // decides WHETHER to clear, not WHICH arrival is being cleared.  Since W16
+    // the TX path reads the register too (sendDataFrame -> readMpRegs), and
+    // the FrameSink contract explicitly allows sendDataFrame from inside the
+    // drain, so a NEW upload's UP_LD can be latched mid-drain and then be
+    // wiped by a clear that was authorised by the OLD one.  That is W12 fault
+    // #5 rebuilt in a new place: the frame would sit until the 64 ms safety
+    // net, inflating rxStrandedRecovered() -- the very counter this tree reads
+    // to decide whether that fault class is back.  Comparing this counter
+    // across the drain is what tells the two apart.
+    void latchIntBits(uint8_t st);
+    // The 32-bit WR bitmap as four CMD52s (the fallback's TX half).
     SdioHost::Status readWrBitmap32(uint32_t *out);
+    // The 32-bit RD bitmap as four CMD52s.  Kept -- rather than replaced by
+    // readMpRegs() -- because probeRdBitmap()'s whole contract is that it does
+    // NOT touch the clear-on-read HOST_INT_STATUS (a diagnostic that steals
+    // interrupt bits causes the stall it was called to explain), and the
+    // register port necessarily does.
+    SdioHost::Status readRdBitmap32(uint32_t *out);
     // Read the upload waiting at the RX ring position, if any: check the
     // rd-bitmap bit at m_rxPort, read RD_LEN_P<m_rxPort>, CMD53-read the
     // packet (into an internal scratch so an oversized packet still CONSUMES
     // its ring slot -- skipping a port wedges the ring), advance the ring,
     // copy out.  CMD_TIMEOUT = nothing at the ring position (not an error).
     // BAD_CIS = packet read and dropped (did not fit bufCap).
+    // W16: `regs`, when non-null, supplies the rd-bitmap and the per-slot
+    // length from a register-port snapshot the caller already took this pass,
+    // instead of the four + two CMD52s this used to issue per packet.  The
+    // caller's copy is MUTATED: the consumed slot's bit is cleared, which is
+    // what lets a multi-packet drain walk the ring from one snapshot without
+    // re-reading the same slot forever (NXP's mp_rd_bitmap is maintained the
+    // same way).  Passing nullptr keeps the original CMD52 path, which is what
+    // the diagnostic readers (readDataPacket, captureMonitor) still use --
+    // they read ONE packet and hold no snapshot.
     SdioHost::Status readRingPacket(uint8_t *buf, uint16_t bufCap, uint16_t *outLen,
-                                    uint8_t *portOut);
+                                    uint8_t *portOut, MpRegs *regs = nullptr);
+    // W16: THE ring read.  Walks CONSECUTIVE occupied slots from m_rxPort and
+    // pulls them all in one CMD53 at the aggregated multiport address; `buf`
+    // receives the slots' packets back to back, each padded to a 256-byte
+    // boundary, exactly as the card lays them out.  *outLen is the total
+    // padded length, *slotsOut how many slots it covers, *startOut the first
+    // slot (which may differ from the m_rxPort the caller saw, because the
+    // resync lives in here).
+    //
+    // maxSlots == 1 reproduces the pre-W16 one-packet-per-CMD53 behaviour
+    // EXACTLY, and readRingPacket() is now a thin wrapper around that case.
+    // One ring model, one resync, one positive-length check: two
+    // implementations of this walk is how W8 and W12 each stayed hidden for
+    // days, so the aggregating and non-aggregating paths are the same code
+    // with a different bound.
+    //
+    // It never WRAPS past slot 31 inside one CMD53.  NXP's span test allows a
+    // wrapped aggregate of up to 16 ports, but no capture in this tree has
+    // ever shown one, and a wrapped transfer is the one shape where a wrong
+    // port_count encoding would be invisible in emulation.  Stopping at the
+    // ring top costs at most one extra CMD53 per lap of the ring.
+    // `lensOut` receives the CARD-PUBLISHED length of each slot in the run, in
+    // run order.  It is not a convenience: it is the authoritative way to split
+    // the batch afterwards.  A caller that instead walked the buffer by each
+    // packet's own SDIOPkt size would be re-deriving the boundaries from the
+    // payload, and any slot where the two round differently desynchronises the
+    // walk for EVERY packet behind it -- losing the rest of a batch whose slots
+    // have already been consumed, silently, with nothing counted.  RD_LEN is
+    // what sized the transfer, so RD_LEN is what must step through it.
+    SdioHost::Status readRingBatch(MpRegs *regs, uint8_t *buf, uint32_t bufCap,
+                                   uint32_t *outLen, uint8_t *slotsOut,
+                                   uint8_t *startOut, uint16_t *lensOut,
+                                   uint8_t maxSlots);
     // Length the card has published for data port `port`, in bytes.
     //
     // ★ REGISTER LAYOUT (W13): RD_LEN is PER SLOT, not one shared register --
@@ -827,11 +1083,22 @@ private:
     //    pair 1:1 with an existing PS counter (psHostWakes() and psWakes()
     //    respectively), so counting them here would double up PS-wake
     //    accounting rather than add new information.
-    //  - m_cmd52PollsTx counts only readWrBitmap32()'s CMD52 reads, which is
-    //    called solely from sendDataFrame's wr_bitmap wait loop.
-    //  - m_cmd52PollsSvc counts serviceLink()'s own HOST_INT_STATUS and
-    //    CMD_RD_LEN_0/1 reads, plus readRdBitmap32()/readRingPacket()'s CMD52
-    //    reads.  The latter two are also reached from diagConnect(),
+    //  - m_cmd52PollsTx counted readWrBitmap32()'s CMD52 reads, issued solely
+    //    from sendDataFrame's wr_bitmap wait loop.  ★ SINCE W16 IT READS 0 BY
+    //    CONSTRUCTION: that wait takes the wr-bitmap out of the register-port
+    //    snapshot instead, and readWrBitmap32() no longer exists.  Its
+    //    successor is cmd53RegsTx().  The accessor is kept because examples
+    //    and the soak harness print it and a silently vanishing field is worse
+    //    than a documented zero -- and because it is the honest way to show
+    //    that the TX-side CMD52 polling really did go to nothing rather than
+    //    moving somewhere unlabelled.
+    //  - m_cmd52PollsSvc counted serviceLink()'s own HOST_INT_STATUS and
+    //    CMD_RD_LEN_0/1 reads, plus readRdBitmap32()/readRingBatch()'s CMD52
+    //    reads.  ★ SINCE W16 the first three of those come out of the
+    //    register-port snapshot instead and are counted in cmd53RegsSvc(); what
+    //    still lands here is probeRdBitmap()'s four CMD52s (the freeze
+    //    diagnostic, which must not touch HOST_INT_STATUS and so cannot use the
+    //    snapshot) and the CMD52 fallback path (see mpRegsUsable()).  The latter two are also reached from diagConnect(),
     //    watchConnect() and readDataPacket() (connection-setup/monitor
     //    diagnostics, not serviceLink) -- splitting that by caller would need
     //    an extra parameter threaded through a hot RX path for no throughput
@@ -862,9 +1129,42 @@ private:
     // delivery of, and is per-firmware-life like the counters above.
     bool     m_intMode        = false;
     uint32_t m_cardInts       = 0;
-    uint32_t m_cmd53Count     = 0;
+    // W16: aggregation state.  m_txAggrBuf is uint32_t-backed because the
+    // uSDHC PIO port is 32 bits wide and SdioHost casts the caller's pointer.
+    bool     m_rxAggr         = true;
+    bool     m_txAggr         = false;
+    uint32_t m_txAggrBuf[(uint32_t)AGGR_BUF_BLOCKS * SDIO_BLOCK_SIZE / 4] = {0};
+    uint32_t m_txAggrLen      = 0;   // padded bytes staged
+    uint8_t  m_txAggrCount    = 0;   // frames staged
+    uint8_t  m_txAggrStart    = 0;   // ring port the batch starts at
+    uint32_t m_cmd53Rx        = 0;
+    uint32_t m_cmd53Tx        = 0;
+    uint32_t m_rxSplitMismatch = 0;
+    uint32_t m_rxAggrBatches  = 0;
+    uint32_t m_rxAggrSlots    = 0;
+    uint32_t m_txAggrBatches  = 0;
+    uint32_t m_txAggrSlots    = 0;
     uint32_t m_cmd53Bytes     = 0;
     uint32_t m_cmd53ByteMode  = 0;
+    // W16: register-port CMD53s, and the word-aligned landing buffer for them
+    // (the uSDHC data port is 32 bits wide, so the PIO loop casts this to
+    // uint32_t*; a bare uint8_t array carries no such alignment guarantee).
+    // Per-firmware-life like the other bus counters.
+    uint32_t m_cmd53RegsTx    = 0;
+    uint32_t m_cmd53RegsSvc   = 0;
+    // W16 register-port health.  m_mpRegsOk starts true and can only go false;
+    // m_mpRegsChecked makes the sanity check a once-per-firmware-life cost
+    // rather than a per-read one.  Both reset with the firmware, because a
+    // re-download re-runs begin()'s CMD52 read of CARD_STATUS and the question
+    // is worth re-asking against the new life.
+    bool     m_mpRegsOk       = true;
+    bool     m_mpRegsChecked  = false;
+    uint8_t  m_mpRegsBadStatus = 0;
+    uint32_t m_mpRegsErrors   = 0;
+    // Bumped by latchIntBits() whenever HOST_INT_UP_LD is newly latched; read
+    // across serviceLink's drain.  Wraps harmlessly -- only equality matters.
+    uint32_t m_intUpldLatches = 0;
+    uint32_t m_mpRaw[(MP_REGS_LEN + 3) / 4] = {0};
     bool     m_diagEapol      = false;
     uint16_t m_diagDataFrames = 0;
     uint16_t m_diagFirstEthertype = 0;

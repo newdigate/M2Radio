@@ -75,6 +75,34 @@ public:
     Status cmd53Read(uint8_t fn, uint32_t addr, bool incrAddr,
                      uint8_t *dst, uint16_t blockSize, uint16_t blocks);
 
+    // CMD53 IO_RW_EXTENDED in BYTE mode: one transfer of `bytes` bytes rather
+    // than N blocks of the function's block size.  Added in W16 for the
+    // IW416's multiport REGISTER port, which NXP's own driver reads exactly
+    // this way (wlan_interrupt(): bcnt=1 -> byte mode, count = MAX_MP_REGS,
+    // flags=0 -> OP Code 0 / fixed address) to fetch the interrupt status,
+    // both ring bitmaps and all 32 per-slot lengths in ONE bus command.
+    //
+    // `bytes` must be a multiple of 4 (the PIO port is 32 bits wide) and at
+    // most 512, which is the largest a CMD53 byte count can express.
+    //
+    // ★ IT SETS THE READ WATERMARK TO ONE WORD FOR THE TRANSFER, AS A
+    // DELIBERATE BELT AND BRACES.  WTMK_LVL[RD_WML] resets to 16 words, the
+    // PIO loop gates every word on PRES_STATE[BREN], and 196 bytes is 49 words
+    // -- not a multiple of 16.  The reference manual says the controller DOES
+    // announce a short tail (32.6.2: "if the block size is not a multiple of
+    // the value in the Watermark Level Register ... the software must access
+    // exactly the remaining number of words at the end of each block", with a
+    // worked 4,4,2 example), so a 16-word watermark should be fine here.  This
+    // does not rely on that: RD_WML = 1 makes the tail question not arise at
+    // all, costs nothing (the loop already polls per word), and is restored
+    // afterwards so the proven 256-byte block path -- 64 words, an exact
+    // multiple, and never tested at any other watermark -- is untouched.
+    // Stated this way round on purpose: an earlier draft of this comment
+    // asserted the controller would NOT announce the tail, which the manual
+    // contradicts, and a wrong mechanism in a comment outlives the change.
+    Status cmd53ReadBytes(uint8_t fn, uint32_t addr, bool incrAddr,
+                          uint8_t *dst, uint16_t bytes);
+
     // CMD52 IO_RW_DIRECT.  `fn` is the SDIO function number (0 = CCCR/CIS).
     Status cmd52Read(uint8_t fn, uint32_t addr, uint8_t *out);
     Status cmd52Write(uint8_t fn, uint32_t addr, uint8_t value);
@@ -133,7 +161,8 @@ public:
 private:
     Status sendCommand(uint8_t index, uint32_t arg, uint32_t xferFlags, uint32_t *resp);
     Status cmd53(uint8_t fn, uint32_t addr, bool incrAddr, bool write,
-                 uint8_t *buf, uint16_t blockSize, uint16_t blocks);
+                 uint8_t *buf, uint16_t blockSize, uint16_t blocks,
+                 bool blockMode = true);
     Status setClock(uint32_t hz);
 
     uint8_t  m_ioFunctions = 0;
