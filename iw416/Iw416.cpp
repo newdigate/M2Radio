@@ -1595,8 +1595,25 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
 // selected by one branch.
 void Iw416::setInterruptMode(bool on) {
     if (on == m_intMode) return;
-    m_intMode = on;
-    m_host.enableCardInt(on);
+    if (on) {
+        // Card-side gate FIRST: SDIO card interrupts are enabled in CCCR
+        // 0x04 -- IENM (bit 0) AND IEN1 (bit 1) -- and without that write
+        // the card never asserts DAT1 no matter what HOST_INT_MASK says.
+        // Silicon proved the omission (W15 phase 3): uSDHC armed (INT_
+        // STATUS_EN/INT_SIGNAL_EN bit 8 set), INT_STATUS bit 8 never
+        // latched, cardints=0 for the whole run.  HOST_INT_MASK (fn1)
+        // selects WHICH conditions the fw raises; CCCR 0x04 gates the PIN.
+        // NXP's fsl_sdio.c SDIO_EnableIOInterrupt() writes this register.
+        // On failure stay polled and honest: interruptMode() reads false.
+        if (m_host.cmd52Write(0, 0x04, 0x03) != SdioHost::OK) return;
+        m_intMode = true;
+        m_host.enableCardInt(true);
+    } else {
+        m_intMode = false;
+        m_host.enableCardInt(false);
+        // Best-effort card-side disable; the controller is already deaf.
+        (void)m_host.cmd52Write(0, 0x04, 0x00);
+    }
 }
 
 // pollLink keeps its historical COPY contract for the probe (first frame
