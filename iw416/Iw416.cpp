@@ -1605,6 +1605,14 @@ void Iw416::setInterruptMode(bool on) {
         // selects WHICH conditions the fw raises; CCCR 0x04 gates the PIN.
         // NXP's fsl_sdio.c SDIO_EnableIOInterrupt() writes this register.
         // On failure stay polled and honest: interruptMode() reads false.
+        // NOTE: this early-out (on==m_intMode above) means a CARD-level
+        // reset (PDn toggle / power cycle) that clears CCCR 0x04 cannot be
+        // repaired by calling setInterruptMode(true) again -- m_intMode is
+        // still true, so the call no-ops and the mode silently reverts to
+        // tick-rate polling.  Any future recovery flow that resets the CARD
+        // must toggle false->true (or extend this to re-verify CCCR).  An
+        // in-band firmware re-download does NOT clear CCCR -- see
+        // downloadFirmware()'s note -- so this only bites on card resets.
         if (m_host.cmd52Write(0, 0x04, 0x03) != SdioHost::OK) return;
         m_intMode = true;
         m_host.enableCardInt(true);
