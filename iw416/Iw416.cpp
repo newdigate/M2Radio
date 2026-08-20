@@ -1918,32 +1918,60 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                 if (viaDesync) m_rxDesyncRecovered++;
                 else           m_rxStrandedRecovered++;
             }
-            // The DATA condition is finished: either the ring reported nothing
-            // more (the normal exit) or a read failed, and re-entering this
-            // loop on the very next pass could not help with that -- it would
-            // only re-run the drain forever and, because the delay(1) below is
-            // gated on these same bits, spin the poll at full speed instead of
-            // the 1 ms pacing every caller assumes.  The net above re-detects a
-            // genuinely still-pending upload within RX_BITMAP_CHECK_PASSES,
-            // which is precisely why it exists.
+            // ---- CLEARING HOST_INT_UP_LD: ON EVIDENCE, NOT ON A SNAPSHOT --
             //
-            // Scoped to the SNAPSHOT (`st`), not to the live field: this clears
-            // only the bit this pass actually acted on.  A HOST_INT_UP_LD that
-            // arrived after `st` was taken is a NEW upload nobody has serviced,
-            // and swallowing it here would re-create the very fault Layer 1
-            // exists to prevent.  (When the drain came from the net, `st`'s bit
-            // was clear and this is correctly a no-op.)
+            // The drain has exhausted the register snapshot it started from.
+            // That is NOT the same as the ring being empty: the snapshot was
+            // taken BEFORE the drain, and a drain can take milliseconds --
+            // W16's aggregated read moves up to ~12 KB in one PIO transfer.
+            // Anything the card queued during that window is absent from the
+            // snapshot, so the drain exits believing the ring is empty.
             //
-            // W16: and only if no NEW upload was announced while we were
-            // draining.  Scoping to the snapshot decides WHETHER to clear; it
-            // cannot distinguish WHICH arrival is being cleared, and since W16
-            // the TX path consumes HOST_INT_STATUS too, so a frame queued
-            // mid-drain can have its bit taken by sendDataFrame and then wiped
-            // here on the strength of the bit this pass came in with.  The
-            // frame would then wait for the 64 ms safety net and show up as
-            // rxStrandedRecovered() -- W12 fault #5 rebuilt, wearing the
-            // costume of the counter that detects it.
-            if (m_intUpldLatches == upldGen) {
+            // ★ CLEARING ON THAT BELIEF IS WHAT COST 4.6x THROUGHPUT.
+            // Measured on silicon: with RX aggregation on, tcp-rx fell from
+            // 10.96 to 2.39 Mbps while rxStrandedRecovered() rose 26 -> 139
+            // over a ten-second blast.  Every one of those strands is an
+            // upload cleared here on stale evidence and then rescued by the
+            // 64 ms safety-net tick; 139 of those do not fit in ten seconds.
+            // Bigger batch, longer window, more strands -- which is why the
+            // regression scaled with aggregation and why aggregation itself
+            // measured perfectly (0.43 CMD53s per frame, split=0).
+            //
+            // So: take a FRESH register read AFTER the drain and clear only if
+            // it says there is nothing left.  One extra register-port command
+            // per drain, against a 64 ms stall.  Two conditions, both
+            // necessary:
+            //   * the fresh HOST_INT_STATUS has no UP_LD -- nothing was
+            //     announced while we were draining;
+            //   * the fresh RD bitmap offers nothing at our ring slot -- the
+            //     firmware is not holding an upload it never announced (W13:
+            //     it does that, which is why the net exists at all).
+            // If either says otherwise the bit STAYS SET and the next pass
+            // drains again immediately, because the delay(1) below is gated on
+            // these same bits.  That is a spin only while the card genuinely
+            // has data, which is exactly when spinning is right; every caller
+            // in this tree drives serviceLink with waitMs=0 from its own poll
+            // loop, so control returns to the application between passes.
+            //
+            // On a read failure the bit is left set: the pessimistic choice,
+            // costing one wasted drain, versus W12 fault #5 -- RX dead until
+            // reflash -- for the optimistic one.
+            bool ringQuiet = false;
+            if (haveMp) {
+                MpRegs post;
+                if (readMpRegs(&post) == SdioHost::OK) {
+                    ringQuiet = !(post.intStatus & HOST_INT_UP_LD) &&
+                                !(post.rdBitmap & (1u << m_rxPort));
+                }
+            } else {
+                // No snapshot this pass (interrupt mode, no pending bits): the
+                // old scoped-clear rule is the best evidence available.
+                ringQuiet = (m_intUpldLatches == upldGen);
+            }
+            if (ringQuiet) {
+                // Scoped to the SNAPSHOT (`st`), not to the live field: clear
+                // only the bit this pass acted on.  When the drain came from
+                // the net, `st`'s bit was clear and this is correctly a no-op.
                 m_intPending &= (uint8_t)~(st & HOST_INT_UP_LD);
             }
         }
