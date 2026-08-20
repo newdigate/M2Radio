@@ -233,6 +233,12 @@ SdioHost::Status Iw416::refreshIoPort() {
 }
 
 SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen) {
+    // The STA interface, which is every command this driver sent before W17.
+    return sendHostCmdBss(cmd, body, bodyLen, BSS_TYPE_STA, 0);
+}
+
+SdioHost::Status Iw416::sendHostCmdBss(uint16_t cmd, const uint8_t *body, uint16_t bodyLen,
+                                       uint8_t bssType, uint8_t bssNum) {
     wakeCardIfSleeping();
     // W16: a staged TX batch must not sit behind a command.  waitCmdResp()
     // can block for seconds, and data frames held across that would be a
@@ -255,13 +261,27 @@ SdioHost::Status Iw416::sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t 
     txBuf[4] = (uint8_t)(cmd & 0xFF);        txBuf[5] = (uint8_t)(cmd >> 8);
     txBuf[6] = (uint8_t)(hostLen & 0xFF);    txBuf[7] = (uint8_t)(hostLen >> 8);
     // seq_num is only an 8-bit sequence: mlan's HostCmd_GET_SEQ_NO() masks
-    // the field with & 0x00FF, and the high byte carries bss_num/bss_type,
-    // which we always leave 0.  Wrap m_seq at 8 bits so the wire value
-    // (below) is unchanged by this -- txBuf[9] was already always 0 once
-    // m_seq stays <= 0xFF.
+    // the field with & 0x00FF, and the high byte carries bss_num/bss_type.
+    // Wrap m_seq at 8 bits so it never spills into that high byte -- before
+    // W17 it was the only thing there and txBuf[9] was always 0; now the
+    // caller's bss nibbles occupy it and the wrap is what keeps them clean.
     m_seq = (uint16_t)((m_seq + 1) & 0xFF);
     m_lastSentSeq = m_seq;   // waitCmdResp correlates the reply against this
-    txBuf[8] = (uint8_t)(m_seq & 0xFF);      txBuf[9] = (uint8_t)(m_seq >> 8);
+    // HostCmd_SET_SEQ_NO_BSS_INFO: seq in 7:0, bss_num in 11:8, bss_type in
+    // 15:12.  m_lastSentSeq deliberately keeps the BARE seq -- waitCmdResp
+    // masks the echoed value with 0xFF, so storing the packed word here would
+    // work today and break the moment that mask is reconsidered.
+    // ★ SILICON, W17 2026-08-20: the firmware ECHOES the bss nibbles back.  A
+    // bss_type=1 request comes back with seq_num 0x1004, 0x1006, ... against
+    // 0x0003, 0x0007, ... for bss_type=0 (m2_uap_probe's uap_bytes dumps show
+    // both).  So waitCmdResp's low-byte-only comparison is not a nicety -- a
+    // whole-word compare would reject every uAP reply.  Note QEMU's model
+    // zeroes the high byte instead, so emulation cannot catch that mistake;
+    // this is the divergence to remember if a uAP reply ever reads as stale.
+    const uint16_t seqWord = (uint16_t)((m_seq & 0x00FF) |
+                                        ((uint16_t)(bssNum  & 0x0F) << 8) |
+                                        ((uint16_t)(bssType & 0x0F) << 12));
+    txBuf[8] = (uint8_t)(seqWord & 0xFF);    txBuf[9] = (uint8_t)(seqWord >> 8);
     txBuf[10] = 0; txBuf[11] = 0;                              // result
     if (body && bodyLen) memcpy(&txBuf[12], body, bodyLen);
 
@@ -375,11 +395,19 @@ SdioHost::Status Iw416::waitCmdResp(uint16_t cmd, uint8_t *buf, uint16_t bufLen,
             // a sendSleepConfirm() this call never issued -- can be mistaken
             // for the answer to THIS request.  Compare only the LOW byte:
             // per mlan's HostCmd_GET_SEQ_NO() (& 0x00FF), seq_num's high byte
-            // carries bss_num/bss_type, which sendHostCmd always leaves 0 --
-            // masking here keeps the comparison honest even if that ever
-            // changes.  If a silicon soak ever shows mismatches on every
-            // call (fw not echoing seq faithfully), revert to the narrower
-            // action-based exclusion instead of this check.
+            // carries bss_num/bss_type.  Until W17 this driver always left it
+            // 0, and the mask was written speculatively -- "honest even if
+            // that ever changes".
+            // ★ W17 IS THAT CHANGE, and silicon proves the mask is
+            // load-bearing rather than tidy: uAP commands go out with
+            // bss_type=1 in bits 15:12 and the FIRMWARE ECHOES IT BACK
+            // (seq_num 0x1004 for a request sent as seq 4).  A whole-word
+            // compare would reject every uAP reply as stale.  QEMU's model
+            // zeroes the high byte instead, so no gate can catch that
+            // mistake -- see sendHostCmdBss().
+            // If a silicon soak ever shows mismatches on every call (fw not
+            // echoing seq faithfully), revert to the narrower action-based
+            // exclusion instead of this check.
             uint16_t respSeq = (uint16_t)(buf[8] | ((uint16_t)buf[9] << 8));
             if ((respSeq & 0xFF) == (m_lastSentSeq & 0xFF)) {
                 if (outLen) *outLen = len;

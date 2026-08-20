@@ -165,6 +165,38 @@ public:
     SdioHost::Status enableHostInt();
 
     SdioHost::Status sendHostCmd(uint16_t cmd, const uint8_t *body, uint16_t bodyLen);
+    // Same, addressed to a specific BSS.  mlan packs the target interface into
+    // seq_num's HIGH byte -- bits 11:8 bss_num, bits 15:12 bss_type
+    // (HostCmd_SET_SEQ_NO_BSS_INFO, mlan_fw.h; wlan_ops_uap_prepare_cmd is
+    // what routes an APCMD there).  Every command this driver sent before W17
+    // left both at 0, i.e. the STA interface, and sendHostCmd() above still
+    // does exactly that -- it delegates here with (0, 0), so no existing
+    // caller changes shape or wire bytes.
+    //
+    // BSS_TYPE_UAP is what the AP-mode commands (APCMD 0x00B0..0x00B3) need.
+    // ★ waitCmdResp() already compares only the LOW byte of the echoed
+    // seq_num, so a reply carrying a non-zero bss nibble still correlates --
+    // that masking was written speculatively in W12 ("keeps the comparison
+    // honest even if that ever changes") and this is the change it meant.
+    static const uint8_t BSS_TYPE_STA = 0;   // MLAN_BSS_TYPE_STA
+    static const uint8_t BSS_TYPE_UAP = 1;   // MLAN_BSS_TYPE_UAP
+    SdioHost::Status sendHostCmdBss(uint16_t cmd, const uint8_t *body, uint16_t bodyLen,
+                                    uint8_t bssType, uint8_t bssNum = 0);
+    // --- uAP (AP mode) command ids, mlan_fw.h ---------------------------------
+    // W17 Phase 0 only PROBES for these; nothing in this driver implements AP
+    // mode yet.  SYS_INFO/BSS_STOP/STA_LIST take an empty body (mlan sends
+    // S_DS_GEN and nothing else); SYS_CONFIGURE takes action(2) + TLVs;
+    // BSS_START is empty unless host-MLME is in use, which it is not here.
+    static const uint16_t CMD_APCMD_SYS_INFO      = 0x00AE;
+    static const uint16_t CMD_APCMD_SYS_CONFIGURE = 0x00B0;
+    static const uint16_t CMD_APCMD_BSS_START     = 0x00B1;
+    static const uint16_t CMD_APCMD_BSS_STOP      = 0x00B2;
+    static const uint16_t CMD_APCMD_STA_LIST      = 0x00B3;
+    // HostCmd_RESULT_* (mlan_fw.h).  The probe's whole question is which of
+    // these -- or a timeout, or no reply at all -- comes back.
+    static const uint16_t RESULT_OK          = 0x0000;
+    static const uint16_t RESULT_ERROR       = 0x0001;
+    static const uint16_t RESULT_NOT_SUPPORT = 0x0002;
     SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                   uint32_t timeoutMs = 2000);
     // Read command-port packets until the response to `cmd` arrives.  The port
