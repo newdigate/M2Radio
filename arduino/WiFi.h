@@ -144,6 +144,16 @@ public:
     // Default FALSE.  Turning it ON makes status() and loop() capable of
     // blocking ~45 s (see status()); reconnect NEVER runs from the yield pump,
     // so a 15 s scan can not fire inside an unrelated delay().
+    //
+    // It covers a FAILED begin() as well as a dropped link -- and that is not
+    // obvious, so it is worth stating: begin() arms reconnect intent whenever
+    // it fails with the card and lwip already up (i.e. association or DHCP
+    // failed, which a later attempt can fix), not only when a live link goes
+    // away.  Before that, a first attempt that failed on a marginal link was
+    // PERMANENT: intent was raised only by link loss, and a link that was
+    // never up cannot be lost.  Measured on silicon 2026-08-21 -- the board
+    // sat at tcp=0/0/0 for 39 minutes after one failed scan.
+    // A bring-up failure (no card, no firmware) is deliberately NOT armed.
     void setAutoReconnect(bool on) { m_autoReconnect = on; }
 
     // Escape hatches -- the facade is a floor, not a ceiling.

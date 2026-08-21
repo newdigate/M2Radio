@@ -150,6 +150,20 @@ int WiFiClass::begin(const char *ssid, const char *psk,
     }
     int st = connectAndDhcp(timeoutMs);
     m_status = (uint8_t)st;
+    // ★ ARM RECONNECT ON A FAILED FIRST ATTEMPT.  m_wantReconnect was raised
+    // ONLY by linkLost(), which needs the link to have been UP -- so a link
+    // that never came up had NO recovery path at all, and setAutoReconnect(true)
+    // did nothing for it.  Root-caused on silicon 2026-08-21: on a marginal RF
+    // link the first begin() failed (scan missed the AP), the facade never
+    // retried, and the board sat at tcp=0/0/0 for 39 minutes.  A hand-rolled
+    // retry in the sketch reached the AP on attempt 11 and everything worked.
+    //
+    // Only the RETRYABLE class arms it: card and lwip are up, so this is
+    // association or DHCP, which a later attempt can genuinely fix.  A
+    // bring-up failure (no card, no firmware) is NOT armed -- a missing card
+    // does not appear because you asked again, and retrying would re-run the
+    // 1 s board preamble forever.
+    if (st != WL_CONNECTED && m_cardUp && m_lwipUp) m_wantReconnect = true;
     // Attach the yield pump even on a FAILED connect: the sketch may call
     // status()/loop() and, with auto-reconnect on, the link comes back without
     // the sketch doing anything.  A pass with no link only ticks lwip timers.
