@@ -360,4 +360,132 @@ void WiFiClass::maybeReconnect() {
     m_lastReconnectMs = millis();
 }
 
-int WiFiClass::hostByName(const char *, IPAddress &, uint32_t) { return 0; }  // Task 8
+// --- hostByName (DNS) --------------------------------------------------------
+// ★ THE ARGUMENT WE HAND lwip MUST OUTLIVE THIS CALL.  dns_gethostbyname() is
+// the raw-API resolver: dns_enqueue() (lwip dns.c) copies BOTH the callback and
+// the void* arg into the file-scope dns_requests[] table, and the only things
+// that ever clear that entry are dns_call_found() -- the answer, the NXDOMAIN,
+// or the final give-up -- and one pcb-allocation failure path.  There is no
+// cancel API.  So `arg` stays registered after we stop waiting.
+//
+// For how long is not a rounding error.  dns_tmr() is a 1000 ms cyclic timer
+// (DNS_TMR_INTERVAL) run by our own sys_check_timeouts(); dns_check_entry()
+// re-sends at t = 0, 1, 2 and 4 s, and only at t = 7 s does retries reach
+// DNS_MAX_RETRIES (4).  If DHCP supplied a SECOND server, dns_backupserver_
+// available() then restarts the whole 7 s schedule on it -- ~14 s before the
+// entry is released.  With the 5 s default below, ABANDONING A LOOKUP THAT lwip
+// IS STILL WORKING ON IS THE NORMAL OUTCOME, not a race: every name that fails
+// to resolve leaves a live registration for another 2 to 9 seconds.
+//
+// 5 s is nonetheless the right default, and the schedule above is why: it
+// covers ALL FOUR transmissions to the primary server (t = 0, 1, 2, 4 s) and
+// gives up only during the last idle wait.  What it never reaches is the
+// SECOND server, if DHCP supplied one -- a caller who wants that failover has
+// to pass ~15 s and accept blocking for it.  Waiting longer buys nothing else,
+// and it is not what makes abandonment safe; the generation token below is.
+//
+// That is why the wait state is NOT a local.  `DnsWait w` on the stack, passed
+// as arg, is a use-after-free with a multi-second window -- the same shape the
+// connection pool was designed away from, where tcp_arg() points at a pool slot
+// and never at a caller's object (WiFiConnPool.h).
+//
+// A file-scope slot alone is not enough either, and the second half matters
+// more than the first: a late callback from lookup N would otherwise answer
+// lookup N+1.  For a late TIMEOUT that means N+1 fails early; for a late
+// SUCCESS it means returning the WRONG HOST'S ADDRESS under the right name --
+// silent, and indistinguishable downstream from a correct resolve.  So each
+// lookup takes a generation token, and the token travels BY VALUE inside the
+// void*: nothing is dereferenced, so there is no pointer left to dangle even in
+// principle, and a callback whose token is not the live generation is dropped.
+namespace {
+struct DnsWait {
+    uint32_t      gen;    // token of the lookup that currently owns the slot
+    volatile bool done;   // polled through pumpUntil()'s cond
+    bool          ok;
+    ip_addr_t     addr;
+    bool          busy;   // re-entrancy latch; see hostByName()
+};
+DnsWait s_dns = { 0, false, false, { 0 }, false };
+
+void dnsFound(const char *, const ip_addr_t *ipaddr, void *arg) {
+    // The whole guard.  `arg` is a generation, not an address -- casting it
+    // back yields a number to compare, never something to write through.
+    if ((uint32_t)(uintptr_t)arg != s_dns.gen) return;   // abandoned lookup
+    if (ipaddr) { s_dns.addr = *ipaddr; s_dns.ok = true; }
+    s_dns.done = true;   // LAST: the fields above are what `done` publishes
+}
+bool dnsCond(void *) { return s_dns.done; }
+}  // namespace
+
+int WiFiClass::hostByName(const char *host, IPAddress &out, uint32_t timeoutMs) {
+    // ipaddr_aton() would fault on these; dns_gethostbyname() screens them
+    // itself (ERR_ARG) but we reach the parser first, so the check moves here.
+    if (host == nullptr || host[0] == '\0') return 0;
+    // DOTTED-QUAD ABOVE THE LINK GUARD, deliberately.  lwip does this same
+    // ipaddr_aton() first thing inside dns_gethostbyname_addrtype(), so
+    // hoisting it changes WHICH strings are accepted not at all (still
+    // inet_aton's a / a.b / a.b.c / a.b.c.d, still hex and octal, still
+    // rejecting anything that does not start with a digit or has trailing
+    // junk -- "1e100.net" is a name, not a literal).  It changes WHEN: a
+    // literal needs no name service and no link, and an Arduino author expects
+    // client.connect("192.168.4.1", 80) to work.  Below the guard it returned
+    // 0 on a down link, so WiFiClient::connect() reported DNS_FAILED for a
+    // string DNS was never asked about -- while its own check one line later
+    // would have said NO_LINK, which is the true reason.
+    ip_addr_t lit;
+    if (ipaddr_aton(host, &lit)) {
+        out = IPAddress(ip4_addr_get_u32(ip_2_ip4(&lit)));
+        return 1;
+    }
+    if (!m_lwipUp || !m_linkUp) return 0;
+    // NO DriverCmd GUARD HERE, and that is a decision rather than an omission.
+    // DNS is pure lwip: the query leaves through netif->linkoutput ->
+    // Iw416::sendDataFrame(), which is TX-ring only -- Iw416.h states outright
+    // that TX-side calls are safe alongside a service pass, and the reply
+    // arrives through serviceLink()'s ordinary data path.  Nothing here reads
+    // the command port, so there is no reply to steal.  Taking the guard would
+    // be actively wrong: it gates servicePass() off, so pumpUntil() below would
+    // pump nothing, no RX would be polled, and every lookup would time out.
+    //
+    // Re-entrancy latch, on the m_inReconnect precedent (WiFi.h).  pumpUntil()
+    // delay()s, delay() yields, and yield() dispatches every EventResponder --
+    // so a sketch responder calling hostByName() re-enters this from inside our
+    // own wait.  One file-scope slot cannot serve two lookups: the inner one
+    // would resolve, and the outer would then read the INNER answer as its own.
+    // Failing the nested call is the honest outcome, and it costs one bool.
+    if (s_dns.busy) return 0;
+    ScopeFlag inFlight(s_dns.busy);
+    // ARM THE SLOT BEFORE THE CALL, not after.  dns_enqueue() ends in
+    // dns_check_entry() -> dns_send(), which can invoke `found` SYNCHRONOUSLY
+    // (dns.c's "DNS server not valid anymore" branch) and still return
+    // ERR_INPROGRESS.  Arming afterwards would erase that answer and then wait
+    // the full timeout for a callback that had already come.  Bumping the
+    // generation here also RETIRES every still-registered older lookup before
+    // this one can be confused with it -- and it has to happen before, because
+    // dns_gethostbyname() itself can reach delay() through the TX path and so
+    // can dispatch a stale callback while we are still inside it.
+    const uint32_t token = s_dns.gen + 1;
+    s_dns.gen  = token;
+    s_dns.done = false;
+    s_dns.ok   = false;
+    ip_addr_t cached;
+    err_t e = dns_gethostbyname(host, &cached, dnsFound, (void *)(uintptr_t)token);
+    // ERR_OK is the ONLY case in which `cached` was written (dns_lookup() copies
+    // the table entry into it); the callback is not registered on this path.
+    if (e == ERR_OK) {
+        out = IPAddress(ip4_addr_get_u32(ip_2_ip4(&cached)));
+        s_dns.gen = token + 1;
+        return 1;
+    }
+    // Everything else is a refusal with no callback pending: ERR_ARG (name too
+    // long), ERR_VAL (no DNS server configured -- DHCP supplied none), ERR_MEM
+    // (all four table or request slots busy, or no UDP pcb).
+    if (e != ERR_INPROGRESS) { s_dns.gen = token + 1; return 0; }
+    const bool got = pumpUntil(dnsCond, nullptr, timeoutMs) && s_dns.ok;
+    if (got) out = IPAddress(ip4_addr_get_u32(ip_2_ip4(&s_dns.addr)));
+    // Retire the token on EVERY exit, so the invariant is local to this
+    // function: after it returns, no outstanding callback holds the live
+    // generation.  On the timeout path this is the abandonment itself.
+    s_dns.gen = token + 1;
+    return got ? 1 : 0;
+}
