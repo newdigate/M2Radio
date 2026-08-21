@@ -117,6 +117,36 @@ public:
     // m_listen null, so calling it again once WiFi is up succeeds.  That is
     // the intended shape for `if (up && !server) server.begin();` in loop().
     void begin() override;
+    // ★ THE CONNECTION LIVES AS LONG AS YOUR HANDLE, AND NOT ONE PASS LONGER.
+    // This differs from upstream Ethernet/WiFiNINA, where the socket outlives
+    // the WiFiClient that referenced it.  Here WiFiClient is refcounted and the
+    // pool closes the connection when the LAST handle dies (WiFiConnPool.cpp,
+    // release()).  So:
+    //
+    //     void loop() {                        // ONE-SHOT -- probably not
+    //       WiFiClient c = server.available(); // what you meant
+    //       if (c) { echo(c); }                // c dies here -> conn CLOSED
+    //     }
+    //
+    //     void loop() {                        // persistent: hold the handle
+    //       static WiFiClient c;               // across passes
+    //       if (!c) c = server.accept();
+    //       if (c) { echo(c); }
+    //     }
+    //
+    // The first shape is not a bug -- it is the canonical Arduino request/
+    // response server, where the handle's scope IS the session and the sketch
+    // was going to call stop() anyway.  It is only wrong if you expected the
+    // peer to be able to send a SECOND message on the same socket.
+    // examples/networking/wifi_server_test uses the first; wifi_client_test
+    // uses the second.
+    //
+    // available() vs accept() is also NOT stylistic where the pool's valves are
+    // concerned: available() only ever surfaces a conn that already has staged
+    // bytes, so silent connections stay unclaimed and therefore evictable and
+    // stall-reapable.  accept() surfaces silent ones too, and claiming makes
+    // them permanently exempt from BOTH valves -- an accept()-based server can
+    // claim all four slots in a millisecond and then refuse everything.
     WiFiClient available();              // a conn with data pending (claims it)
     WiFiClient accept();                 // any unclaimed accepted conn
     size_t write(uint8_t b) override { return write(&b, 1); }
