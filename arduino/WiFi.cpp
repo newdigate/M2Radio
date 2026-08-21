@@ -90,20 +90,29 @@ bool WiFiClass::bringUpCard(bool doBoardPreamble) {
     // request reaches any card sitting in it -- a 3.3 V-only microSD must not
     // meet a 1.8 V rail.  Run the M.2 Wi-Fi with J15 EMPTY.
     m_sdio.useIoVoltage1V8(true);
-    if (m_sdio.begin() != SdioHost::OK) return false;
-    if (m_iw416.begin() != SdioHost::OK) return false;
+    // Each exit names itself.  WL_NO_SHIELD is the shared return for all five,
+    // so without this a bench cannot tell "no card in the socket" from "the
+    // card is there and the firmware download failed".
+    SdioHost::Status st;
+    if ((st = m_sdio.begin())  != SdioHost::OK) { m_beginErr = SDIO_INIT;  m_driverSt = st; return false; }
+    if ((st = m_iw416.begin()) != SdioHost::OK) { m_beginErr = IW416_INIT; m_driverSt = st; return false; }
     if (m_iw416.fwStatus() == Iw416::FIRMWARE_READY) {
         // Already running: QEMU's fw-preboot model, or a warm card.
     } else if (m_fw != nullptr) {
-        if (m_iw416.downloadFirmware(m_fw, m_fwLen) != SdioHost::OK) return false;
+        if ((st = m_iw416.downloadFirmware(m_fw, m_fwLen)) != SdioHost::OK) {
+            m_beginErr = FW_DOWNLOAD; m_driverSt = st; return false;
+        }
     } else {
-        return false;                               // no firmware, none supplied
+        m_beginErr = NO_FIRMWARE;                   // no firmware, none supplied
+        return false;
     }
     (void)m_iw416.refreshIoPort();
     delay(50);
     (void)m_iw416.enableHostInt();
     uint32_t fwRel = 0; uint16_t hwVer = 0;
-    if (m_iw416.getHwSpec(g_mac, &fwRel, &hwVer) != SdioHost::OK) return false;
+    if ((st = m_iw416.getHwSpec(g_mac, &fwRel, &hwVer)) != SdioHost::OK) {
+        m_beginErr = HW_SPEC; m_driverSt = st; return false;
+    }
     (void)m_iw416.reconfigureTxBuffers(2048);
     (void)m_iw416.macControl(Iw416::MAC_RX_ON | Iw416::MAC_TX_ON |
                              Iw416::MAC_ETHERNETII | Iw416::MAC_RTS_CTS);
@@ -119,8 +128,13 @@ int WiFiClass::begin(const char *ssid, const char *psk,
     // "SSID not found" and a silently-shortened passphrase as a wrong key --
     // both maximally confusing on a bench.  32 is the 802.11 SSID limit; 63 is
     // the driver's own WPA2-PSK ceiling (Iw416.cpp, setPassphrase).
-    if (ssid && strlen(ssid) > 32)      { m_status = WL_CONNECT_FAILED; return m_status; }
-    if (psk  && strlen(psk)  > 63)      { m_status = WL_CONNECT_FAILED; return m_status; }
+    // Arm the diagnosis channel for THIS attempt.  Sticky until the next
+    // begin(), so a sketch that retries can print the reason each attempt
+    // failed rather than only the last one.
+    m_beginErr = BEGIN_OK;
+    m_driverSt = SdioHost::OK;
+    if (ssid && strlen(ssid) > 32) { m_beginErr = BAD_SSID_LEN; m_status = WL_CONNECT_FAILED; return m_status; }
+    if (psk  && strlen(psk)  > 63) { m_beginErr = BAD_PSK_LEN;  m_status = WL_CONNECT_FAILED; return m_status; }
     strncpy(m_ssid, ssid ? ssid : "", sizeof(m_ssid) - 1);
     strncpy(m_psk,  psk  ? psk  : "", sizeof(m_psk)  - 1);
     if (m_linkUp) disconnect();         // re-begin() on a live link: tear the
@@ -160,8 +174,15 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
         c = m_iw416.connectStation(m_ssid, m_psk[0] ? m_psk : nullptr);
     }                                          // psOn defaults true: IEEE PS
                                                // stays ON (W10 erratum)
-    if (c == SdioHost::BAD_CIS) return WL_NO_SSID_AVAIL;   // scan ran, SSID absent
-    if (c != SdioHost::OK)      return WL_CONNECT_FAILED;  // assoc/handshake/bus
+    m_driverSt = c;
+    // ★ THE TWO EXITS BELOW DO NOT DEAUTHENTICATE, and that is diagnostically
+    // load-bearing: connectStation() can associate at 802.11 level and still
+    // return non-OK (its connect watcher not seeing EVENT_PORT_RELEASE inside
+    // its window), so the AP goes on listing the station while we report
+    // failure.  An AP showing a station while the board says it failed is
+    // therefore this path, NOT the DHCP one below -- which does deauth.
+    if (c == SdioHost::BAD_CIS) { m_beginErr = SSID_NOT_FOUND;  return WL_NO_SSID_AVAIL; }
+    if (c != SdioHost::OK)      { m_beginErr = ASSOC_FAILED;    return WL_CONNECT_FAILED; }
     m_linkUp = true;
     netif_set_link_up(&m_netif);
     dhcp_start(&m_netif);
@@ -189,8 +210,10 @@ int WiFiClass::connectAndDhcp(uint32_t timeoutMs) {
         // source notes correct DHCP behaviour does not depend on it) and
         // netif_set_addr(ANY,ANY,ANY) clears the address either way.
         linkDownAndAbort();
+        m_beginErr = DHCP_TIMEOUT;   // ASSOCIATED -- distinct from ASSOC_FAILED
         return WL_CONNECT_FAILED;
     }
+    m_beginErr = BEGIN_OK;
     m_wantReconnect = false;   // we are up: nothing left to want back
     return WL_CONNECTED;
 }
@@ -416,6 +439,37 @@ void dnsFound(const char *, const ip_addr_t *ipaddr, void *arg) {
 }
 bool dnsCond(void *) { return s_dns.done; }
 }  // namespace
+
+const char *WiFiClass::beginErrorName(uint8_t e) {
+    switch ((BeginError)e) {
+        case BEGIN_OK:       return "OK";
+        case BAD_SSID_LEN:   return "BAD_SSID_LEN";
+        case BAD_PSK_LEN:    return "BAD_PSK_LEN";
+        case SDIO_INIT:      return "SDIO_INIT";
+        case IW416_INIT:     return "IW416_INIT";
+        case NO_FIRMWARE:    return "NO_FIRMWARE";
+        case FW_DOWNLOAD:    return "FW_DOWNLOAD";
+        case HW_SPEC:        return "HW_SPEC";
+        case SSID_NOT_FOUND: return "SSID_NOT_FOUND";
+        case ASSOC_FAILED:   return "ASSOC_FAILED";
+        case DHCP_TIMEOUT:   return "DHCP_TIMEOUT";
+    }
+    return "?";
+}
+
+const char *WiFiClass::driverStatusName(int8_t s) {
+    switch ((SdioHost::Status)s) {
+        case SdioHost::OK:               return "ok";
+        case SdioHost::NO_IO_FUNCTION:   return "no-io-function";
+        case SdioHost::CMD_TIMEOUT:      return "cmd-timeout";
+        case SdioHost::CMD_CRC:          return "cmd-crc";
+        case SdioHost::CLOCK_UNSTABLE:   return "clock-unstable";
+        case SdioHost::BAD_CIS:          return "bad-cis";
+        case SdioHost::CMD5_NO_RESPONSE: return "cmd5-no-response";
+        case SdioHost::INIT_CLK_STUCK:   return "init-clk-stuck";
+    }
+    return "unknown";
+}
 
 int WiFiClass::hostByName(const char *host, IPAddress &out, uint32_t timeoutMs) {
     // nullptr would fault the parser; "" merely fails it (ip4addr_aton reads

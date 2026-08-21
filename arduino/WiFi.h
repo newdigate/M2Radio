@@ -49,6 +49,41 @@ public:
     // localIP() is real).  Blocking, but pumps the stack while it waits.
     int begin(const char *ssid, const char *psk = nullptr,
               uint32_t timeoutMs = 30000, bool doBoardPreamble = true);
+
+    // WHICH of begin()'s exits fired.  status() alone cannot say: WL_NO_SHIELD
+    // is the shared exit of five bring-up failures, and WL_CONNECT_FAILED of
+    // three more -- including the two that matter most on a bench, "the
+    // association attempt was refused" and "we associated but no DHCP lease
+    // ever arrived".  Those two need OPPOSITE responses and look identical
+    // from status(), which is how a silicon run ends up inferring the answer
+    // from the AP's station count instead of reading it.
+    //
+    // Sticky until the next begin().  Pair it with lastDriverStatus() and
+    // radio().lastEvent() -- see the sketch in
+    // examples/networking/wifi_client_test.
+    enum BeginError : uint8_t {
+        BEGIN_OK = 0,
+        BAD_SSID_LEN,    // 1  > 32 chars, rejected before any bring-up
+        BAD_PSK_LEN,     // 2  > 63 chars (the driver's own WPA2-PSK ceiling)
+        SDIO_INIT,       // 3  SdioHost::begin()      -> lastDriverStatus()
+        IW416_INIT,      // 4  Iw416::begin()         -> lastDriverStatus()
+        NO_FIRMWARE,     // 5  card cold and setFirmware() was never called
+        FW_DOWNLOAD,     // 6  downloadFirmware()     -> lastDriverStatus()
+        HW_SPEC,         // 7  getHwSpec()            -> lastDriverStatus()
+        SSID_NOT_FOUND,  // 8  scan ran, SSID absent from the results
+        ASSOC_FAILED,    // 9  associate/handshake/bus -> lastDriverStatus()
+                         //    + radio().lastEvent() names the firmware event
+        DHCP_TIMEOUT,    // 10 ASSOCIATED, but no lease inside timeoutMs
+    };
+    uint8_t lastError() const { return (uint8_t)m_beginErr; }
+    // The raw SdioHost::Status behind the exits marked above; SdioHost::OK
+    // otherwise.  This is the same code m2_lwip_test prints as `connect=`.
+    // int8_t, NOT uint8_t: SdioHost::Status is a signed enum with negative
+    // values (CMD5_NO_RESPONSE = -6), and an unsigned accessor renders that
+    // as 250 -- which is how the first cut of this instrument printed it.
+    int8_t lastDriverStatus() const { return (int8_t)m_driverSt; }
+    static const char *beginErrorName(uint8_t e);
+    static const char *driverStatusName(int8_t s);
     void disconnect();
 
     // CAN BLOCK ~45 s, but only with setAutoReconnect(true): status() drives
@@ -159,6 +194,8 @@ private:
     // under us); cleared by a successful connect and by disconnect(), which
     // clears it even when there was no link to drop -- that is how a sketch
     // cancels auto-reconnect.
+    BeginError m_beginErr = BEGIN_OK;
+    SdioHost::Status m_driverSt = SdioHost::OK;
     bool m_wantReconnect = false;
     // Re-entrancy latch for maybeReconnect().  The 5 s throttle is NOT
     // sufficient insurance: once lwip callbacks can call back into sketch code
