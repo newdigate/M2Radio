@@ -143,7 +143,7 @@ int WiFiClient::connect(IPAddress ip, uint16_t port) {
 
 int WiFiClient::connect(const char *host, uint16_t port) {
     IPAddress ip;
-    if (!WiFi.hostByName(host, ip)) {           // stub until Task 8 lands DNS
+    if (!WiFi.hostByName(host, ip)) {           // lwip DNS; see WiFi.cpp hostByName
         stop();                                 // same replace-the-connection
         m_err = DNS_FAILED;                     // rule as the IP overload
         return 0;

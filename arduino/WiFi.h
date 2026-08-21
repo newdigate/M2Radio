@@ -67,6 +67,25 @@ public:
     // SCAN-TIME RSSI of the AP we associated to -- the driver has no live-RSSI
     // command.  0 if never connected.
     int32_t   RSSI();
+    // Returns 1 and fills `out` on success, 0 on any failure.  Four failure
+    // modes are worth knowing before you debug one:
+    //   - A DOTTED-QUAD LITERAL succeeds with NO LINK and no lwip: it is parsed
+    //     above the link guard, so client.connect("192.168.4.1", 80) reports
+    //     WiFiClient's NO_LINK rather than DNS_FAILED, agreeing with the
+    //     IPAddress overload instead of differing purely by spelling.
+    //   - A NESTED call returns 0 unconditionally.  There is one lookup slot;
+    //     a sketch that calls this from an EventResponder dispatched inside
+    //     our own pumpUntil() gets the refusal rather than two lookups
+    //     corrupting each other.
+    //   - It can return 0 in ~0 ms having sent nothing, when lwip's 4-entry
+    //     request table is still full of ABANDONED lookups.  We give up at
+    //     timeoutMs; lwip keeps retrying to ~6-7 s (one server) or ~13-14 s
+    //     (two), so short timeouts can stack up.  Self-clearing.
+    //   - A retry for a name already in flight ATTACHES to the existing query
+    //     (LWIP_DNS_SECURE's NO_MULTIPLE_OUTSTANDING) and inherits what is
+    //     left of its schedule -- so a second call can fail far sooner than
+    //     timeoutMs suggests.  The 5 s default covers all four transmissions
+    //     to the primary server only on the FIRST attempt at a given name.
     int       hostByName(const char *host, IPAddress &out, uint32_t timeoutMs = 5000);
 
     // One bounded service pass; safe to call anywhere, any rate.

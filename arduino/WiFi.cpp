@@ -418,7 +418,8 @@ bool dnsCond(void *) { return s_dns.done; }
 }  // namespace
 
 int WiFiClass::hostByName(const char *host, IPAddress &out, uint32_t timeoutMs) {
-    // ipaddr_aton() would fault on these; dns_gethostbyname() screens them
+    // nullptr would fault the parser; "" merely fails it (ip4addr_aton reads
+    // '\0', fails lwip_isdigit, returns 0).  dns_gethostbyname() screens both
     // itself (ERR_ARG) but we reach the parser first, so the check moves here.
     if (host == nullptr || host[0] == '\0') return 0;
     // DOTTED-QUAD ABOVE THE LINK GUARD, deliberately.  lwip does this same
@@ -440,10 +441,14 @@ int WiFiClass::hostByName(const char *host, IPAddress &out, uint32_t timeoutMs) 
     if (!m_lwipUp || !m_linkUp) return 0;
     // NO DriverCmd GUARD HERE, and that is a decision rather than an omission.
     // DNS is pure lwip: the query leaves through netif->linkoutput ->
-    // Iw416::sendDataFrame(), which is TX-ring only -- Iw416.h states outright
-    // that TX-side calls are safe alongside a service pass, and the reply
-    // arrives through serviceLink()'s ordinary data path.  Nothing here reads
-    // the command port, so there is no reply to steal.  Taking the guard would
+    // Iw416::sendDataFrame(), which is TX-ring only, and the reply arrives
+    // through serviceLink()'s ordinary data path.  Nothing here reads the
+    // command port, so there is no reply to steal.  (Iw416.h's note about
+    // TX-side calls sanctions the OPPOSITE direction -- calling TX from
+    // inside the RX sink -- so it is not the authority for this; what we
+    // actually rely on is serviceLink() re-entering from inside
+    // sendDataFrame(), which is pre-existing behaviour every WiFiClient
+    // write() and connect() already depends on via tcp_output.)  Taking the guard would
     // be actively wrong: it gates servicePass() off, so pumpUntil() below would
     // pump nothing, no RX would be polled, and every lookup would time out.
     //
@@ -455,15 +460,25 @@ int WiFiClass::hostByName(const char *host, IPAddress &out, uint32_t timeoutMs) 
     // Failing the nested call is the honest outcome, and it costs one bool.
     if (s_dns.busy) return 0;
     ScopeFlag inFlight(s_dns.busy);
-    // ARM THE SLOT BEFORE THE CALL, not after.  dns_enqueue() ends in
-    // dns_check_entry() -> dns_send(), which can invoke `found` SYNCHRONOUSLY
-    // (dns.c's "DNS server not valid anymore" branch) and still return
-    // ERR_INPROGRESS.  Arming afterwards would erase that answer and then wait
-    // the full timeout for a callback that had already come.  Bumping the
-    // generation here also RETIRES every still-registered older lookup before
-    // this one can be confused with it -- and it has to happen before, because
-    // dns_gethostbyname() itself can reach delay() through the TX path and so
-    // can dispatch a stale callback while we are still inside it.
+    // ARM THE SLOT BEFORE THE CALL, not after -- load-bearing, do not move.
+    // dns_gethostbyname() can dispatch OUR OWN lookup's callback before it
+    // returns.  The path: the query leaves via Iw416::sendDataFrame(), which
+    // delay(1)s in its wr-bitmap wait (Iw416.cpp) and delay(2)s in
+    // wakeCardIfSleeping(); delay() yields, the EventResponder fires
+    // serviceEvent -> servicePass(), and m_inService is false here (we are in
+    // sketch context) so that nested pass really runs -- polling RX and
+    // running sys_check_timeouts().  It can therefore deliver BOTH a stale
+    // dns_call_found from dns_tmr AND the answer to this very query, all
+    // while we are still inside dns_gethostbyname().  Arming afterwards would
+    // overwrite that answer and then wait the full timeout for a callback
+    // that had already arrived.
+    //
+    // (An earlier version of this comment cited dns.c's "DNS server not valid
+    // anymore" branch as the synchronous path.  That branch is UNREACHABLE on
+    // the enqueue path -- dns_gethostbyname_addrtype returns ERR_VAL when
+    // server 0 is any-addr, and dns_check_entry(NEW) sets server_idx = 0 with
+    // nothing yielding in between.  The ordering is still required, for the
+    // stronger reason above; do not delete it on finding that citation dead.)
     const uint32_t token = s_dns.gen + 1;
     s_dns.gen  = token;
     s_dns.done = false;
