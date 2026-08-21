@@ -115,6 +115,23 @@ namespace WiFiPool {
     //     serverPort != 0) -- four failed connects and the pool is dead until
     //     reboot.  release() now also collects such a slot defensively, but
     //     do not rely on that: addRef first.
+    //
+    // ★ THE ACCEPT PATH IS THE ONE EXCEPTION, and it is not a relaxation --
+    // addRef() there would be a BUG.  An accepted-but-unclaimed conn has
+    // refs == 0 BY DESIGN: that is precisely the state connPoll's stall valve
+    // (!claimed && refs == 0) and the evictor (!claimed && serverPort != 0)
+    // exist to reap, because the sketch has never seen it and nothing else
+    // will ever free it.  addRef() with no handle to match it would make an
+    // accept immune to BOTH valves and leak it permanently -- the inverse of
+    // the bug the rule above prevents.  So an accept callback must instead:
+    //   - set serverPort != 0 BEFORE anything that can fail (that is what
+    //     makes the slot visible to the evictor), and
+    //   - leave claimed == false and refs == 0 until a WiFiClient handle
+    //     actually adopts it, which is where addRef finally happens.
+    // The rule and the exception are the same principle stated twice: a
+    // reserved slot must always be reachable by SOME reaper.  For a client
+    // connect the only reaper is release(), so it needs a refcount; for an
+    // accept the reapers are the valves, and they need the absence of one.
     void addRef(WiFiConn *c);
     // Drop a handle; frees the slot when refs==0 and the conn is dead.  Also
     // the exit for a RESERVED-but-abandoned slot: called on a slot with no
