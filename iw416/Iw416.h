@@ -197,6 +197,71 @@ public:
     static const uint16_t RESULT_OK          = 0x0000;
     static const uint16_t RESULT_ERROR       = 0x0001;
     static const uint16_t RESULT_NOT_SUPPORT = 0x0002;
+
+    // --- uAP configuration (SYS_CONFIGURE 0x00B0) -----------------------------
+    // ★ SILICON, W17 2026-08-21: THIS WORKS, and the reason it is worth saying
+    // so loudly is that a MINIMAL SYS_CONFIGURE does not -- it kills the command
+    // port outright, with no reply and nothing answering again for the rest of
+    // the firmware life.  Both facts were measured in ONE firmware life, on the
+    // same card, minutes apart:
+    //     SYSCFG.fullopen (this, 82-byte body)  st=ok result=0x0000  on BOTH bss
+    //     HWSPEC control immediately after      st=ok          <- port healthy
+    //     SYSCFG minimal (action + one TLV)     cmd-timeout, port dead
+    // So the firmware's 0x00B0 handler REQUIRES A POPULATED CONFIGURATION.  It
+    // is not that the command is unsupported, malformed, or interface-specific:
+    // three minimal shapes (bare action; action+CHAN_BAND GET; action+
+    // MAX_STA_CNT SET) all wedge identically, while this one is accepted.
+    //
+    // Two rules follow for anything built on this:
+    //   * NEVER send a partial SYS_CONFIGURE, not even to probe.  There is no
+    //     harmless GET -- a GET is exactly the shape that wedges.
+    //   * A wedge is recoverable ONLY by a card reset (M.2 reset GPIO + blob
+    //     re-download; no MCU reboot needed, no power cycle).  Nothing shorter
+    //     works: 30 retries over ~90 s never recovered, and draining the data
+    //     port found nothing to drain.
+    // Full account, with the wire bytes: rt1176-evkb
+    // examples/networking/m2_uap_probe/transcript_hw_evkb.txt, "W17 FAULT 1".
+    //
+    // Open (no security) for now -- it needs no credentials, which keeps this
+    // clear of the repo's standing SSID/PSK rule.  WPA2 adds AKMP/cipher/
+    // passphrase TLVs on top of the same builder.
+    // Configuring does NOT transmit; BSS_START (0x00B1) is what beacons.
+    enum UapTlv : uint16_t {
+        UAP_TLV_MAC      = 1u << 0,   // 0x012B  MAC address        len 6
+        UAP_TLV_SSID     = 1u << 1,   // 0x0000  SSID               len = strlen
+        UAP_TLV_BEACON   = 1u << 2,   // 0x012C  beacon period      len 2
+        UAP_TLV_DTIM     = 1u << 3,   // 0x012D  DTIM period        len 1
+        UAP_TLV_RATES    = 1u << 4,   // 0x0001  supported rates    len = count
+        UAP_TLV_BCAST    = 1u << 5,   // 0x0130  broadcast SSID ctl len 1
+        UAP_TLV_CHANBAND = 1u << 6,   // 0x012A  band cfg + channel len 2
+        UAP_TLV_AUTH     = 1u << 7,   // 0x011F  auth type          len 3
+        UAP_TLV_PROTOCOL = 1u << 8,   // 0x0140  encrypt protocol   len 2
+        // Everything mlan emits for an OPEN AP on a manual 2.4 GHz channel.
+        UAP_TLV_ALL_OPEN = 0x01FF,
+    };
+    // A mask rather than a fixed set, because the point is to BISECT: if the
+    // full configuration is accepted and a partial one is not, the boundary is
+    // the finding, and that can only be found by varying the set.
+    struct UapConfig {
+        const char    *ssid;          // NUL-terminated, <= 32 bytes
+        uint8_t        channel;       // 1..14; 2.4 GHz, BAND_CONFIG_MANUAL
+        const uint8_t *mac;           // 6 bytes, or nullptr to send zeros
+        uint16_t       beaconPeriod;  // mlan range 50..4000, its default is 100
+        uint8_t        dtimPeriod;    // mlan range 1..100
+        uint8_t        bcastSsidCtl;  // 0 hidden, 1 broadcast, 2 clear
+        uint16_t       tlvMask;       // UapTlv bits; UAP_TLV_ALL_OPEN for all
+    };
+    // Sends one SYS_CONFIGURE SET on the uAP interface and waits for the reply.
+    // Returns the transport status; the firmware's own verdict is in
+    // lastRespResult().  Does NOT transmit -- BSS_START is what beacons.
+    SdioHost::Status uapConfigure(const UapConfig &cfg);
+    // The request uapConfigure() last built, so a caller can put the exact
+    // bytes on the record.  This project's standard for a firmware claim is the
+    // wire bytes quoted, and a TLV soup is precisely the thing nobody should be
+    // asked to take on trust.  Valid until the next uapConfigure() call.
+    const uint8_t *uapCfgReq()    const { return m_uapCfgReq; }
+    uint16_t       uapCfgReqLen() const { return m_uapCfgReqLen; }
+
     SdioHost::Status readHostResp(uint8_t *buf, uint16_t bufLen, uint16_t *outLen,
                                   uint32_t timeoutMs = 2000);
     // Read command-port packets until the response to `cmd` arrives.  The port
@@ -1157,6 +1222,8 @@ private:
     uint16_t m_lastRespType   = 0;
     uint16_t m_lastRespCmd    = 0;
     uint16_t m_lastRespResult = 0;
+    const uint8_t *m_uapCfgReq = nullptr;
+    uint16_t m_uapCfgReqLen = 0;
     uint8_t  m_scanSets       = 0;
     uint16_t m_assocStatus    = 0xFFFF;
     uint16_t m_assocCapInfo   = 0;

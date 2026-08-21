@@ -1295,6 +1295,98 @@ SdioHost::Status Iw416::associate(const ScanResult &ap) {
     return (m_assocStatus == 0) ? SdioHost::OK : SdioHost::BAD_CIS;
 }
 
+// --- uAP configuration -------------------------------------------------------
+// Clean-room from the documented HostCmd_DS_SYS_CONFIG layout and the TLV
+// structs in mlan_fw.h; no NXP code is copied.  The TLV ORDER below is mlan's
+// emission order (wlan_uap_cmd_sys_configure), kept deliberately: a firmware
+// that parses TLVs positionally rather than by type would care, and matching
+// the reference costs nothing.
+//
+// ★ Every `len` here is the PAYLOAD length, not the whole TLV -- the trap that
+// makes a TLV soup silently mis-parse.  They are taken one by one from the
+// reference's own assignments rather than from sizeof() of our own bytes:
+//   MAC 6, SSID strlen, beacon 2, DTIM 1, rates <count>, bcast 1,
+//   chan/band 2, auth 3, protocol 2.
+// Note two that are easy to get wrong: DTIM and BCAST carry a ONE-byte payload
+// (mlan writes sizeof(t_u8) even though the field sits in a padded struct), and
+// AUTH is THREE bytes -- auth_type, PWE_derivation, transition_disable -- not
+// the two an open-system AP might suggest.
+SdioHost::Status Iw416::uapConfigure(const UapConfig &cfg) {
+    // 2.4 GHz basic + extended rates, mlan's rates_2ghz less its NUL terminator.
+    static const uint8_t kRates2GHz[] = {
+        0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C
+    };
+    static uint8_t body[192];   // static so uapCfgReq() can hand it back
+    uint16_t o = 0;
+
+    body[o++] = 0x01; body[o++] = 0x00;                 // action = HostCmd_ACT_GEN_SET
+
+    if (cfg.tlvMask & UAP_TLV_MAC) {
+        body[o++] = 0x2B; body[o++] = 0x01;             // 0x012B
+        body[o++] = 6;    body[o++] = 0;
+        if (cfg.mac) memcpy(&body[o], cfg.mac, 6); else memset(&body[o], 0, 6);
+        o = (uint16_t)(o + 6);
+    }
+    if (cfg.tlvMask & UAP_TLV_SSID) {
+        uint16_t n = cfg.ssid ? (uint16_t)strlen(cfg.ssid) : 0;
+        if (n > 32) n = 32;
+        body[o++] = 0x00; body[o++] = 0x00;             // 0x0000
+        body[o++] = (uint8_t)n; body[o++] = (uint8_t)(n >> 8);
+        if (n) memcpy(&body[o], cfg.ssid, n);
+        o = (uint16_t)(o + n);
+    }
+    if (cfg.tlvMask & UAP_TLV_BEACON) {
+        body[o++] = 0x2C; body[o++] = 0x01;             // 0x012C
+        body[o++] = 2;    body[o++] = 0;
+        body[o++] = (uint8_t)(cfg.beaconPeriod & 0xFF);
+        body[o++] = (uint8_t)(cfg.beaconPeriod >> 8);
+    }
+    if (cfg.tlvMask & UAP_TLV_DTIM) {
+        body[o++] = 0x2D; body[o++] = 0x01;             // 0x012D
+        body[o++] = 1;    body[o++] = 0;
+        body[o++] = cfg.dtimPeriod;
+    }
+    if (cfg.tlvMask & UAP_TLV_RATES) {
+        body[o++] = 0x01; body[o++] = 0x00;             // 0x0001
+        body[o++] = (uint8_t)sizeof(kRates2GHz); body[o++] = 0;
+        memcpy(&body[o], kRates2GHz, sizeof(kRates2GHz));
+        o = (uint16_t)(o + sizeof(kRates2GHz));
+    }
+    if (cfg.tlvMask & UAP_TLV_BCAST) {
+        body[o++] = 0x30; body[o++] = 0x01;             // 0x0130
+        body[o++] = 1;    body[o++] = 0;
+        body[o++] = cfg.bcastSsidCtl;
+    }
+    if (cfg.tlvMask & UAP_TLV_CHANBAND) {
+        body[o++] = 0x2A; body[o++] = 0x01;             // 0x012A
+        body[o++] = 2;    body[o++] = 0;
+        body[o++] = 0x00;                               // BAND_CONFIG_MANUAL, 2.4 GHz
+        body[o++] = cfg.channel;
+    }
+    if (cfg.tlvMask & UAP_TLV_AUTH) {
+        body[o++] = 0x1F; body[o++] = 0x01;             // 0x011F
+        body[o++] = 3;    body[o++] = 0;
+        body[o++] = 0x00;                               // MLAN_AUTH_MODE_OPEN
+        body[o++] = 0x00;                               // PWE_derivation
+        body[o++] = 0x00;                               // transition_disable
+    }
+    if (cfg.tlvMask & UAP_TLV_PROTOCOL) {
+        body[o++] = 0x40; body[o++] = 0x01;             // 0x0140
+        body[o++] = 2;    body[o++] = 0;
+        body[o++] = 0x01; body[o++] = 0x00;             // PROTOCOL_NO_SECURITY
+    }
+
+    m_uapCfgReq    = body;
+    m_uapCfgReqLen = o;
+
+    static uint8_t rx[SDIO_BLOCK_SIZE * 4];
+    uint16_t rxLen = 0;
+    SdioHost::Status s = sendHostCmdBss(CMD_APCMD_SYS_CONFIGURE, body, o, BSS_TYPE_UAP, 0);
+    if (s != SdioHost::OK) return s;
+    return waitCmdResp(CMD_APCMD_SYS_CONFIGURE, rx, sizeof(rx), &rxLen);
+}
+
+
 // Wait for the firmware to signal the WPA2 4-way handshake outcome.  Events
 // arrive on the command port (pkttype MLAN_TYPE_EVENT); the event id is the
 // u32 at INTF_HEADER_LEN.  EVENT_PORT_RELEASE (0x2B) = handshake done, port
