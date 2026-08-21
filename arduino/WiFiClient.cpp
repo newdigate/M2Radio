@@ -45,9 +45,11 @@ WiFiClient &WiFiClient::operator=(const WiFiClient &o) {
     // addRef the SOURCE before releasing the destination, not after.  This and
     // the self-guard above are ALTERNATIVE defences against the same bug and
     // either alone is sufficient -- MEASURED, not assumed, by the Task-7
-    // mutation run recorded in this file's commit message (13 mutations, 12
-    // caught by a named self-test check; this pair was the 13th and needed all
-    // four variants to pin down).  Reverting BOTH makes `a = a` release the
+    // mutation run recorded in this file's commit message (21 mutations, 20
+    // caught by a named self-test check; this pair needed all four variants to
+    // pin down and reds only when BOTH defences are reverted -- see gap (a)
+    // there.  The ONE uncaught mutation is 06, in connected(), not this
+    // pair).  Reverting BOTH makes `a = a` release the
     // last reference (refs 1 -> 0 -> closeConn + toFree) and then read the
     // just-nulled o.m_conn, destroying the connection and leaving a null
     // handle; reverting either ONE leaves every check green.  Both are kept

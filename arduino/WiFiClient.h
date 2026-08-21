@@ -25,6 +25,15 @@
  *     pool caps a staged chain at WIFI_RX_MAX_PBUFS, so `if (c.available() >=
  *     N)` can stall forever for a large N.  Consume incrementally:
  *     `while (c.available()) ...`.
+ *     COROLLARY, and the reason to take that seriously: with bytes staged,
+ *     available()/read()/peek()/connected() do NOT service the link (that
+ *     short-circuit is what makes byte-at-a-time reading fast -- 31 service
+ *     passes down to 1 over a 15-byte drain).  So a loop that POLLS WITHOUT
+ *     CONSUMING and never returns to loop() stops servicing the link
+ *     ENTIRELY.  The bug is the same one as above, but it stops presenting
+ *     as "this read stalls" and starts presenting as "the radio is dead",
+ *     which is much harder to diagnose at a bench.  Consume, or return to
+ *     loop(), or call WiFi.loop() yourself.
  *   - stop() puts an RST on the wire whenever ANY received byte is left
  *     unread -- tcp_recved() is deferred to read(), so an unread byte leaves
  *     the receive window short and tcp.c resets rather than closing gracefully.
@@ -34,6 +43,10 @@
  * TIMING a caller must budget for: connect() calls stop() first, so on a live
  * client its worst case is the 5 s send-buffer drain PLUS the 10 s connect
  * timeout = 15 s, not the 10 s the .cpp's constant suggests on its own.
+ * write()'s 5 s is likewise a STALL budget, not a total: it restarts on every
+ * accepted tcp_write, so a peer that trickles ACKs can keep a single write()
+ * blocking indefinitely.  Bounded only by 5 s without an ACK.  That is the
+ * right trade for a large write on a slow link, but it is not a cap.
  */
 #pragma once
 #include "Client.h"
