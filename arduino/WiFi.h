@@ -83,6 +83,21 @@ public:
     // as 250 -- which is how the first cut of this instrument printed it.
     int8_t lastDriverStatus() const { return (int8_t)m_driverSt; }
     static const char *beginErrorName(uint8_t e);
+
+    // Run a scan and report what the card actually sees.  Returns the number
+    // written to `out`, or -1 if the scan itself failed; setsSeen (optional)
+    // receives the number of BSSes the FIRMWARE reported, which can exceed
+    // what fits -- connectStation() keeps only 12, in scan order rather than
+    // by strength, so a weak AP on a busy bench can be crowded out of its own
+    // connect attempt.  Comparing setsSeen against the count is how you tell
+    // "the AP is not on the air" from "the AP is on the air but did not make
+    // the cut".
+    //
+    // Call THIS rather than radio().scan() from a sketch: the command port is
+    // held under the same guard begin() uses, so the yield pump cannot steal
+    // the scan reply (Iw416.h documents that race).
+    int scanNetworks(Iw416::ScanResult *out, uint8_t maxOut,
+                     uint8_t *setsSeen = nullptr);
     static const char *driverStatusName(int8_t s);
     void disconnect();
 

@@ -440,6 +440,22 @@ void dnsFound(const char *, const ip_addr_t *ipaddr, void *arg) {
 bool dnsCond(void *) { return s_dns.done; }
 }  // namespace
 
+int WiFiClass::scanNetworks(Iw416::ScanResult *out, uint8_t maxOut,
+                            uint8_t *setsSeen) {
+    if (setsSeen) *setsSeen = 0;
+    if (!m_cardUp) return -1;
+    uint8_t n = 0;
+    SdioHost::Status s;
+    {   // Same guard begin() holds: scan() is a command-port exchange, and a
+        // concurrent service pass steals or misparses the reply.
+        DriverCmd guard(m_inDriverCmd);
+        s = m_iw416.scan(out, maxOut, &n);
+    }
+    if (setsSeen) *setsSeen = m_iw416.scanSetsSeen();
+    m_driverSt = s;
+    return (s == SdioHost::OK) ? (int)n : -1;
+}
+
 const char *WiFiClass::beginErrorName(uint8_t e) {
     switch ((BeginError)e) {
         case BEGIN_OK:       return "OK";
