@@ -69,11 +69,21 @@ err_t WiFiServer::acceptCb(void *arg, struct tcp_pcb *newpcb, err_t err) {
 
 // --- listen -----------------------------------------------------------------
 void WiFiServer::begin() {
-    // Idempotent -- and this guard is worth more than it looks.  Removing it
-    // changes nothing OBSERVABLE (measured: a Task-9 mutation run deleting
-    // this line left all 128 self-test checks green), because lwip's tcp_bind
-    // refuses a second bind to a port something already listens on and returns
-    // ERR_USE.  What it costs is the tcp_new() on the way to that refusal, and
+    // Idempotent, and the guard is load-bearing twice over.
+    //
+    // First, it is what makes lastError() mean "the last REAL attempt".
+    // Without it a redundant begin() reaches tcp_bind, gets ERR_USE (lwip
+    // refuses a second bind to a port something already listens on), and
+    // overwrites m_err with BIND_FAILED -- while m_listen still holds the
+    // FIRST, perfectly good listener.  The server is up and lastError() says
+    // it failed, in exactly the `if (up && !server) server.begin();` idiom
+    // this header recommends.  (This line WAS a mutation survivor when the
+    // measurement in an earlier version of this comment was taken; that was
+    // before lastError() existed, and it is caught now.  Stated as a
+    // mechanism rather than a check count on purpose -- the instrumentation
+    // is reverted, so a check name is not verifiable from this tree.)
+    //
+    // Second, it saves the tcp_new() on the way to that refusal, and
     // tcp_new -> tcp_alloc is not a benign allocation: when memp_malloc fails
     // it runs tcp_kill_timewait(), tcp_kill_state(LAST_ACK),
     // tcp_kill_state(CLOSING) and finally tcp_kill_prio() -- which ABORTS AN
@@ -192,7 +202,12 @@ size_t WiFiServer::write(const uint8_t *buf, size_t size) {
         // message whose second half is never sent.  tcp_write itself is
         // all-or-nothing for the length given, so the only way to split one
         // would be to ask for less on purpose.
-        u16_t room = tcp_sndbuf(c->pcb);
+        // tcpwnd_size_t, not u16_t: the 0xFFFF clamp above anticipates a
+    // TCP_SND_BUF over 65535, and in that configuration lwip widens
+    // tcpwnd_size_t to u32_t -- a u16_t here would truncate snd_buf and
+    // read a large send buffer as small.  Harmless at 11680; the two
+    // defences should agree.
+    tcpwnd_size_t room = tcp_sndbuf(c->pcb);
         if ((size_t)room < want ||
             tcp_write(c->pcb, buf, (u16_t)want, TCP_WRITE_FLAG_COPY) != ERR_OK) {
             partial = true;                  // this peer missed it
