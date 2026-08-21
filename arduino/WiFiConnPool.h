@@ -149,11 +149,24 @@ namespace WiFiPool {
     int  availableBytes(const WiFiConn *c);
     int  peekByte(const WiFiConn *c);
     int  consume(WiFiConn *c, uint8_t *buf, int len);  // + tcp_recved
-    // Silicon-visible counters, one per safety valve.  Both exist because a
-    // connection that vanishes on its own must leave evidence: evictions() is
-    // the accept-path valve (an unclaimed accept dropped to make room),
-    // stallAborts() is the idle-path valve (connPoll reaping a stalled,
-    // unheld, unclaimed conn at 30-40 s).
+    // Silicon-visible counters, one per way a connection can disappear without
+    // the sketch asking.  All three exist for the same reason -- something that
+    // fails on its own must leave evidence -- and they are deliberately
+    // separate, because they mean different things at a bench:
+    //   evictions()      the accept-path valve: an unclaimed accept was dropped
+    //                    to make room for a newer one.  The pool was full of
+    //                    connections nobody had picked up.
+    //   stallAborts()    the idle-path valve: connPoll reaped a stalled,
+    //                    unheld, unclaimed conn at 30-40 s.
+    //   acceptRefusals() no valve fired at all -- every slot was CLAIMED, so
+    //                    there was nothing to evict and the accept was refused
+    //                    (ERR_MEM; lwip aborts the pcb).  This is the one that
+    //                    says "the sketch is holding four connections", which
+    //                    is a bug in the SKETCH, not in the pool.  Without it a
+    //                    starved server refuses callers leaving no trace, while
+    //                    both of its neighbours count what they drop.
     uint32_t evictions();
     uint32_t stallAborts();
+    uint32_t acceptRefusals();
+    void     countAcceptRefusal();      // called by WiFiServer::acceptCb
 }

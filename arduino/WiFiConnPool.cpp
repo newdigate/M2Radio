@@ -6,12 +6,18 @@
 static WiFiConn s_conns[WIFI_MAX_CONNS];
 static uint32_t s_evictions = 0;
 static uint32_t s_stallAborts = 0;
+static uint32_t s_acceptRefusals = 0;
 
 namespace WiFiPool {
 
 WiFiConn *slot(uint8_t i) { return (i < WIFI_MAX_CONNS) ? &s_conns[i] : nullptr; }
 uint32_t evictions() { return s_evictions; }
 uint32_t stallAborts() { return s_stallAborts; }
+uint32_t acceptRefusals() { return s_acceptRefusals; }
+// Counted HERE rather than in WiFiServer so all three "a connection vanished"
+// counters live in one place and read off one object at a bench.  The refusal
+// itself is the server's decision; the pool only records it.
+void countAcceptRefusal() { s_acceptRefusals++; }
 
 // Every callback lwip can reach this slot through, cleared in one place --
 // tcp_connected INCLUDED.  There is no tcp_connected() setter (the callback is
