@@ -236,20 +236,43 @@ public:
         UAP_TLV_CHANBAND = 1u << 6,   // 0x012A  band cfg + channel len 2
         UAP_TLV_AUTH     = 1u << 7,   // 0x011F  auth type          len 3
         UAP_TLV_PROTOCOL = 1u << 8,   // 0x0140  encrypt protocol   len 2
+        // WPA2-PSK/CCMP.  Only meaningful together -- the firmware wants the
+        // key management, both cipher suites and the passphrase, and a partial
+        // set is the kind of half-configuration this handler is known to
+        // dislike (see FAULT 1 above).
+        UAP_TLV_AKMP     = 1u << 9,   // 0x0141  key mgmt           len 4
+        UAP_TLV_PWK      = 1u << 10,  // 0x0191  pairwise cipher    len 4
+        UAP_TLV_GWK      = 1u << 11,  // 0x0192  group cipher       len 2
+        UAP_TLV_PASSPHR  = 1u << 12,  // 0x013C  passphrase         len = strlen
         // Everything mlan emits for an OPEN AP on a manual 2.4 GHz channel.
         UAP_TLV_ALL_OPEN = 0x01FF,
+        // ...and for a WPA2-PSK one.  UAP_TLV_PROTOCOL carries PROTOCOL_WPA2
+        // instead of PROTOCOL_NO_SECURITY when any WPA2 bit is present, so the
+        // two sets are alternatives rather than things to OR together loosely.
+        UAP_TLV_ALL_WPA2 = 0x1FFF,
     };
     // A mask rather than a fixed set, because the point is to BISECT: if the
     // full configuration is accepted and a partial one is not, the boundary is
     // the finding, and that can only be found by varying the set.
+    // ★ EVERY MEMBER HAS A DEFAULT, and that is not decoration.  Callers build
+    // this field by field (`UapConfig cfg; cfg.ssid = ...;`), so a member added
+    // later is silently UNINITIALISED in every existing caller -- and `psk` is
+    // a pointer this code dereferences.  Defaults here mean adding a field can
+    // never turn an old call site into a wild read.
     struct UapConfig {
-        const char    *ssid;          // NUL-terminated, <= 32 bytes
-        uint8_t        channel;       // 1..14; 2.4 GHz, BAND_CONFIG_MANUAL
-        const uint8_t *mac;           // 6 bytes, or nullptr to send zeros
-        uint16_t       beaconPeriod;  // mlan range 50..4000, its default is 100
-        uint8_t        dtimPeriod;    // mlan range 1..100
-        uint8_t        bcastSsidCtl;  // 0 hidden, 1 broadcast, 2 clear
-        uint16_t       tlvMask;       // UapTlv bits; UAP_TLV_ALL_OPEN for all
+        const char    *ssid = nullptr;    // NUL-terminated, <= 32 bytes
+        uint8_t        channel = 6;       // 1..14; 2.4 GHz, BAND_CONFIG_MANUAL
+        const uint8_t *mac = nullptr;     // 6 bytes, or nullptr to send zeros
+        uint16_t       beaconPeriod = 100;// mlan range 50..4000
+        uint8_t        dtimPeriod = 1;    // mlan range 1..100
+        uint8_t        bcastSsidCtl = 1;  // 0 hidden, 1 broadcast, 2 clear
+        // WPA2 passphrase, 8..63 characters.  nullptr or empty = open network.
+        // ★ NEVER give this a literal in tracked source.  The repo rule is
+        // configure-time cache var -> generated header in the BUILD directory
+        // (gitignored), and nowhere else: live Wi-Fi passwords reached this
+        // project's pushed history once already.
+        const char    *psk = nullptr;
+        uint16_t       tlvMask = 0;   // UapTlv bits; UAP_TLV_ALL_OPEN/ALL_WPA2
     };
     // Sends one SYS_CONFIGURE SET on the uAP interface and waits for the reply.
     // Returns the transport status; the firmware's own verdict is in

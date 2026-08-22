@@ -1316,7 +1316,8 @@ SdioHost::Status Iw416::uapConfigure(const UapConfig &cfg) {
     static const uint8_t kRates2GHz[] = {
         0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6C
     };
-    static uint8_t body[192];   // static so uapCfgReq() can hand it back
+    static uint8_t body[288];   // static so uapCfgReq() can hand it back;
+                                // sized for the full WPA2 set incl. a 63-char PSK
     uint16_t o = 0;
 
     body[o++] = 0x01; body[o++] = 0x00;                 // action = HostCmd_ACT_GEN_SET
@@ -1370,10 +1371,41 @@ SdioHost::Status Iw416::uapConfigure(const UapConfig &cfg) {
         body[o++] = 0x00;                               // PWE_derivation
         body[o++] = 0x00;                               // transition_disable
     }
+    // WPA2 is selected by the presence of any WPA2 TLV in the mask, so the
+    // protocol TLV cannot be written before that is known.
+    const bool wpa2 = (cfg.tlvMask & (UAP_TLV_AKMP | UAP_TLV_PWK |
+                                      UAP_TLV_GWK | UAP_TLV_PASSPHR)) != 0;
     if (cfg.tlvMask & UAP_TLV_PROTOCOL) {
         body[o++] = 0x40; body[o++] = 0x01;             // 0x0140
         body[o++] = 2;    body[o++] = 0;
-        body[o++] = 0x01; body[o++] = 0x00;             // PROTOCOL_NO_SECURITY
+        // PROTOCOL_WPA2 (0x0020) or PROTOCOL_NO_SECURITY (0x0001).
+        body[o++] = wpa2 ? 0x20 : 0x01; body[o++] = 0x00;
+    }
+    if (cfg.tlvMask & UAP_TLV_AKMP) {
+        body[o++] = 0x41; body[o++] = 0x01;             // 0x0141
+        body[o++] = 4;    body[o++] = 0;                // key_mgmt + operation
+        body[o++] = 0x02; body[o++] = 0x00;             // KEY_MGMT_PSK
+        body[o++] = 0x00; body[o++] = 0x00;             // key_mgmt_operation
+    }
+    if (cfg.tlvMask & UAP_TLV_PWK) {
+        body[o++] = 0x91; body[o++] = 0x01;             // 0x0191
+        body[o++] = 4;    body[o++] = 0;                // protocol + cipher + rsvd
+        body[o++] = 0x20; body[o++] = 0x00;             // PROTOCOL_WPA2
+        body[o++] = 0x08;                               // CIPHER_AES_CCMP
+        body[o++] = 0x00;                               // reserved
+    }
+    if (cfg.tlvMask & UAP_TLV_GWK) {
+        body[o++] = 0x92; body[o++] = 0x01;             // 0x0192
+        body[o++] = 2;    body[o++] = 0;                // cipher + rsvd
+        body[o++] = 0x08;                               // CIPHER_AES_CCMP
+        body[o++] = 0x00;                               // reserved
+    }
+    if ((cfg.tlvMask & UAP_TLV_PASSPHR) && cfg.psk) {
+        uint16_t n = (uint16_t)strlen(cfg.psk);
+        if (n > 63) n = 63;                             // WPA2 passphrase max
+        body[o++] = 0x3C; body[o++] = 0x01;             // 0x013C
+        body[o++] = (uint8_t)n; body[o++] = (uint8_t)(n >> 8);
+        memcpy(&body[o], cfg.psk, n); o = (uint16_t)(o + n);
     }
 
     m_uapCfgReq    = body;
