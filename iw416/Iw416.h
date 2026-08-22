@@ -962,6 +962,20 @@ public:
     uint32_t rxDropped()   const { return m_rxDropped; }
     uint32_t rxDataCount() const { return m_rxDataCount; }
 
+    // --- W17: which BSS an RX frame arrived on -------------------------------
+    // mlan runs BOTH interfaces over the SAME rings, tagged per-packet in the
+    // RxPD's first two bytes.  The W17 handoff says to VERIFY that rather than
+    // assume it, and these are how: rxFramesByBss(1) counting up while a uAP
+    // client is the only thing transmitting is the verification.
+    // Read-only for now -- the RX path does not yet ROUTE on these.  Recording
+    // and routing are separate changes on purpose: this is the hot path that
+    // W8, W12 and W16 were each dug out of, and a counter that turns out to
+    // read the wrong byte is a cheap mistake while a misrouted netif is not.
+    uint8_t  lastRxBssType()      const { return m_lastRxBssType; }
+    uint8_t  lastRxBssNum()       const { return m_lastRxBssNum; }
+    uint32_t rxFramesByBss(uint8_t t) const { return t < 2 ? m_rxFramesByBss[t] : m_rxFramesBssOther; }
+    uint32_t rxFramesBssOther()   const { return m_rxFramesBssOther; }
+
     struct MonitorFrame {
         uint16_t frameControl;   // little-endian; 0x80 = beacon
         uint8_t  rssi;           // dBm = -rssi (snr - nf from the RxPD)
@@ -1351,6 +1365,10 @@ private:
     uint32_t m_dataTxCount    = 0;
     uint32_t m_rxDropped      = 0;
     uint32_t m_rxDataCount    = 0;
+    uint8_t  m_lastRxBssType = 0xFF;
+    uint8_t  m_lastRxBssNum  = 0xFF;
+    uint32_t m_rxFramesByBss[2] = {0, 0};
+    uint32_t m_rxFramesBssOther = 0;
     uint8_t  m_txPort         = 0;   // TX download-port ring position
     uint8_t  m_rxPort         = 0;   // RX upload-port ring position
     uint16_t m_rxRingResyncs  = 0;

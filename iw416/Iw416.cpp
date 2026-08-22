@@ -2016,6 +2016,22 @@ SdioHost::Status Iw416::serviceLink(FrameSink sink, void *ctx, bool *dropped,
                         // RxPD: rx_pkt_length at +2, rx_pkt_offset at +4; the
                         // 802.3 frame at INTF_HEADER_LEN + rx_pkt_offset.
                         const uint8_t *rxpd = &batch[off + INTF_HEADER_LEN];
+                        // ★ W17: the RxPD's FIRST TWO BYTES are bss_type and
+                        // bss_num, and until now this driver read straight past
+                        // them -- every frame was assumed to be the STA
+                        // interface's because there was only ever one BSS.  With
+                        // a uAP BSS live that assumption silently mis-delivers
+                        // AP-client traffic to the STA netif, which is the
+                        // hazard the W17 handoff flags against this exact path.
+                        // Recording them is the prerequisite for keying on them;
+                        // NOTHING is routed on them yet, deliberately -- this is
+                        // the hot path W8/W12/W16 were dug out of, so the read
+                        // and the routing change land separately and each gets
+                        // its own evidence.
+                        m_lastRxBssType = rxpd[0];
+                        m_lastRxBssNum  = rxpd[1];
+                        if (rxpd[0] < 2) m_rxFramesByBss[rxpd[0]]++;
+                        else             m_rxFramesBssOther++;
                         uint16_t plen = (uint16_t)(rxpd[2] | ((uint16_t)rxpd[3] << 8));
                         uint16_t poff = (uint16_t)(rxpd[4] | ((uint16_t)rxpd[5] << 8));
                         if ((uint32_t)INTF_HEADER_LEN + poff + plen <= pktSize) {
