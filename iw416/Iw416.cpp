@@ -1590,6 +1590,13 @@ SdioHost::Status Iw416::watchConnect(uint32_t timeoutMs) {
 // through them, but always-lowest-set is equivalent at this traffic level.
 SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                       uint32_t timeoutMs) {
+    // The STA interface, which is every frame this driver sent before W17.
+    return sendDataFrameBss(frame, frameLen, 0, 0, timeoutMs);
+}
+
+SdioHost::Status Iw416::sendDataFrameBss(const uint8_t *frame, uint16_t frameLen,
+                                         uint8_t bssType, uint8_t bssNum,
+                                         uint32_t timeoutMs) {
     wakeCardIfSleeping();
     const uint16_t total = (uint16_t)(INTF_HEADER_LEN + TXPD_LEN + frameLen);
     const uint32_t padded = ((uint32_t)total + SDIO_BLOCK_SIZE - 1) /
@@ -1659,8 +1666,14 @@ SdioHost::Status Iw416::sendDataFrame(const uint8_t *frame, uint16_t frameLen,
     memset(tx, 0, padded);
     tx[0] = (uint8_t)(total & 0xFF); tx[1] = (uint8_t)(total >> 8);
     tx[2] = (uint8_t)MLAN_TYPE_DATA; tx[3] = 0;
-    // TxPD: only tx_pkt_length (offset 2) and tx_pkt_offset (offset 4) are
-    // non-zero.
+    // TxPD: bss_type (offset 0) and bss_num (offset 1) address the interface;
+    // tx_pkt_length (offset 2) and tx_pkt_offset (offset 4) describe the frame.
+    // Everything else stays zero (tx_pkt_type 0 = 802.3).
+    // ★ The memset above already zeroed these, so writing 0/0 here is exactly
+    // the pre-W17 wire image -- which is what makes the STA path provably
+    // unchanged rather than merely believed unchanged.
+    tx[INTF_HEADER_LEN + 0] = bssType;
+    tx[INTF_HEADER_LEN + 1] = bssNum;
     tx[INTF_HEADER_LEN + 2] = (uint8_t)(frameLen & 0xFF);
     tx[INTF_HEADER_LEN + 3] = (uint8_t)(frameLen >> 8);
     tx[INTF_HEADER_LEN + 4] = (uint8_t)TXPD_LEN;

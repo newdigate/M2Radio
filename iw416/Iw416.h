@@ -685,6 +685,22 @@ public:
     SdioHost::Status sendDataFrame(const uint8_t *frame, uint16_t frameLen,
                                    uint32_t timeoutMs = 1000);
 
+    // Same, addressed to a specific BSS.  The TxPD's first two bytes are
+    // bss_type and bss_num, and until W17 this driver left both at 0 -- the STA
+    // interface -- because there was only ever one BSS to send on.  A uAP BSS
+    // needs bss_type=1 or the firmware transmits the frame on the wrong
+    // interface, which with a client associated to the AP means it simply never
+    // arrives.
+    // ADDITIVE: sendDataFrame() above delegates here with (0, 0), so every
+    // existing caller puts exactly the same bytes on the wire as before.
+    // ★ Aggregation-safe: each frame carries its OWN TxPD, so a batch may mix
+    // interfaces and each packet still says which one it belongs to.  Verified
+    // on silicon only for the un-aggregated path (aggregation ships OFF); a
+    // mixed-BSS batch is untested and should be before anyone turns both on.
+    SdioHost::Status sendDataFrameBss(const uint8_t *frame, uint16_t frameLen,
+                                      uint8_t bssType, uint8_t bssNum = 0,
+                                      uint32_t timeoutMs = 1000);
+
     // --- W16: multiport aggregation (MPA) ----------------------------------
     //
     // The card's data ports can be addressed as a RUN: one CMD53 carrying N
