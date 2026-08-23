@@ -38,7 +38,15 @@ public:
         uint8_t len;           // bytes in params (return parameters AFTER the status byte)
         uint8_t params[254];
     };
-    typedef void (*DoneFn)(void *ctx, Error e, const Reply *reply);   // reply is null on failure
+    // reply is null on failure.  RE-ENTRANCY CONTRACT: `done` fires from
+    // inside service(), which means from inside the parser's emit path, with a
+    // packet half-processed on the stack.  Calling submit() from it is safe
+    // and intended (verified nested four deep -- it only touches the queue and
+    // may dispatch).  Calling service() or run() from it is NOT: re-entering
+    // the parser corrupts the packet in progress and loses it silently, with
+    // no fault raised and no counter moved.  Queue the work and let the outer
+    // service() return.
+    typedef void (*DoneFn)(void *ctx, Error e, const Reply *reply);
     typedef void (*EventFn)(void *ctx, uint8_t code, const uint8_t *params, uint8_t len);
     typedef void (*AclFn)(void *ctx, uint16_t handle, const uint8_t *data, uint16_t len);
 
@@ -70,7 +78,16 @@ public:
     uint32_t framing()   const { return m_framing; }      // parser faults seen
     uint32_t starved()   const { return m_starved; }
     uint32_t queueFull() const { return m_queueFull; }
-    uint32_t late()      const { return m_late; }         // replies to commands already given up on
+    // Replies to commands already given up on.  This is the one failure the
+    // file header's "every failure has a name and a counter" promise does not
+    // cover, and it is a real limitation rather than an oversight: matching is
+    // by OPCODE ONLY, because HCI carries no transaction id.  So after a
+    // TIMEOUT, a stale reply to the abandoned command is byte-for-byte
+    // indistinguishable from the reply to its retry, and if the retry is in
+    // flight the stale one is attributed to it -- counted as the answer, not
+    // as late.  late() therefore counts only the stale replies that arrive
+    // with nothing of the same opcode outstanding.
+    uint32_t late()      const { return m_late; }
     uint32_t events()    const { return m_events; }       // asynchronous events delivered
     Error    lastError() const { return m_lastError; }
 

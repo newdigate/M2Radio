@@ -110,7 +110,10 @@ int main() {
         FakeIo io; g_io = &io; Hci hci(io); hci.begin();
         Hci::Reply r;
         CHECK(hci.run(0x0C03, nullptr, 0, &r, 100, idle10) == Hci::TIMEOUT);
-        CHECK(hci.ncmd() == 0);
+        CHECK(hci.ncmd() == 1);   // the abandoned command's credit comes back;
+                                  // without it a retry loop never sends its
+                                  // second attempt -- nothing can raise a
+                                  // count that only replies assign
         io.deliver({0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00});
         hci.service();
         CHECK(hci.late() == 1); CHECK(hci.ncmd() == 1);

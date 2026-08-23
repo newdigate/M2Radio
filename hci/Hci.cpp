@@ -14,7 +14,18 @@ const char *Hci::errorName(Error e) {
     return "unknown";
 }
 
-Hci::Hci(HciIo &io) : m_io(io) { begin(); }
+Hci::Hci(HciIo &io) : m_io(io) {
+    // The event and ACL registrations are made ONCE, here, and deliberately
+    // NOT in begin().  begin() is documented as "reset state; one credit" and
+    // is the natural call for re-initialising a link after a bad fault --
+    // nulling the callbacks there would silently unhook every asynchronous
+    // event and every ACL packet from that point on, with no fault, no
+    // counter, and a link that merely looks quiet.  Registration survives a
+    // re-init; everything begin() resets is per-link state.
+    m_onEvent = nullptr; m_eventCtx = nullptr;
+    m_onAcl = nullptr; m_aclCtx = nullptr;
+    begin();
+}
 
 void Hci::begin() {
     m_parser.reset();
@@ -26,8 +37,6 @@ void Hci::begin() {
     m_resync = false; m_lastByteAt = 0;
     m_timeouts = m_framing = m_starved = m_queueFull = m_late = m_events = 0;
     m_lastError = OK;
-    m_onEvent = nullptr; m_eventCtx = nullptr;
-    m_onAcl = nullptr; m_aclCtx = nullptr;
 }
 
 void Hci::packetThunk(void *ctx, uint8_t type, const uint8_t *pkt, size_t len) {
@@ -61,8 +70,16 @@ void Hci::dispatch() {
         return;
     }
     if (now - c.queuedAt >= m_timeoutMs) {
-        if (m_ncmd == 0) { m_starved++; finish(NCMD_STARVED, nullptr); }
-        else             { finish(FRAMING, nullptr); }          // the line never went quiet
+        // Name the reason we could not send, and test the resync FIRST.  Both
+        // conditions can hold at once -- a resync is also why a credit never
+        // came back, since the reply carrying it is among the bytes being
+        // discarded -- and reporting that as ncmd_starved sends the reader to
+        // the credit accounting when a framing fault is what actually
+        // happened.  For a class whose whole claim is that every exit has a
+        // name, the wrong name is worse than a bare error code.
+        if (m_resync)         { finish(FRAMING, nullptr); }      // the line never went quiet
+        else if (m_ncmd == 0) { m_starved++; finish(NCMD_STARVED, nullptr); }
+        else                  { finish(FRAMING, nullptr); }
     }
 }
 
@@ -76,7 +93,32 @@ void Hci::service() {
         m_parser.feed((uint8_t)b);
     }
     if (m_resync && (now - m_lastByteAt) >= IDLE_RESYNC_MS) { m_resync = false; m_parser.reset(); }
-    if (m_inflight && (now - m_sentAt) >= m_timeoutMs) { m_timeouts++; finish(TIMEOUT, nullptr); }
+    if (m_inflight && (now - m_sentAt) >= m_timeoutMs) {
+        m_timeouts++;
+        // Give back the credit dispatch() spent on the command we are about to
+        // abandon.  This is the SAME absolute-assignment deadlock onFault()
+        // describes below, reached down a different road: m_ncmd is assigned
+        // ABSOLUTELY from each reply, so a reply that never arrives leaves the
+        // count stuck low with nothing able to raise it -- no credit means no
+        // command, and no command means no reply.
+        // Measured, before this line existed, by m2_hci_probe -- which retries
+        // HCI Reset ten times because the card's settle time after firmware
+        // download is unknown -- against a QEMU run with no controller at all:
+        //   hci_reset=fail reason=ncmd_starved attempts=10 timeouts=1 framing=0 starved=9 qfull=0 late=0
+        // ONE command reached the wire.  Attempt 1 spent the single startup
+        // credit and timed out without returning it; attempts 2-10 never
+        // dispatched and aged out as NCMD_STARVED.  The retry loop was
+        // decoration, and a card that answered on attempt 3 would have been
+        // reported dead -- the exact wrong answer from a probe whose only job
+        // is to find out whether Bluetooth answers.
+        // This restores only what dispatch() spent (it cannot fire unless we
+        // sent), so it cannot invent a credit that was never ours.  Over by one
+        // is bounded at one and the next reply reassigns the true count; a
+        // deadlock does not self-correct.  Guarded against wrap for the reason
+        // onFault() gives.
+        if (m_ncmd < 0xFF) m_ncmd++;
+        finish(TIMEOUT, nullptr);
+    }
     dispatch();
 }
 
@@ -131,7 +173,17 @@ void Hci::onPacket(uint8_t type, const uint8_t *pkt, size_t len) {
 
 void Hci::onFault() {
     m_framing++;
-    m_resync = true; m_lastByteAt = m_io.nowMs();
+    // Do NOT stamp m_lastByteAt here.  service()'s drain loop has already
+    // stamped it, with the same `now` it captured at the top of the pass, for
+    // this very byte -- the one whose parse faulted.  Re-reading the clock can
+    // land a millisecond later, making m_lastByteAt LATER than that `now`, and
+    // the unsigned (now - m_lastByteAt) in service() then underflows to a huge
+    // value that satisfies the idle test and clears the resync in the SAME
+    // pass.  The next command would be dispatched into a still-desynced
+    // stream, defeating the only recovery an H4 link has.  Note the test suite
+    // cannot see this: the fake clock advances only inside idle(), never
+    // during a drain.
+    m_resync = true;
     if (m_inflight) {
         // Give back the credit dispatch() spent on the command we are about to
         // kill.  m_ncmd is assigned ABSOLUTELY from each reply, so if the reply
@@ -147,7 +199,13 @@ void Hci::onFault() {
         // deadlock does not.  The nothing-in-flight case needs no help: a
         // controller freeing a buffer sends a NOP (opcode 0x0000) Command
         // Complete carrying the credit, which onPacket() already accepts.
-        m_ncmd++;
+        // The wrap guard is not paranoia: the grant is ABSOLUTE and assigned
+        // before the opcode match, so a reply arriving while we are in flight
+        // can legitimately set m_ncmd to 255, and m_ncmd is uint8_t.  An
+        // unguarded ++ would roll 255 -> 0 and manufacture exactly the
+        // starvation deadlock this restore exists to prevent -- and would make
+        // the "one too many" above wrong in that one corner.
+        if (m_ncmd < 0xFF) m_ncmd++;
         finish(FRAMING, nullptr);
     }
 }
