@@ -163,6 +163,56 @@ int main() {
         CHECK(hci.submit(0x0C03, nullptr, 0, nullptr, nullptr) == Hci::OK);
         CHECK(hci.run(0x1001, nullptr, 0, &r, 100, idle10) == Hci::BUSY);
     }
+    {   // 13. begin() preserves callbacks registered before it -- a re-init
+        //     after a bad fault must not silently unhook events/ACL (the
+        //     m_onEvent/m_eventCtx/m_onAcl/m_aclCtx registrations live in the
+        //     constructor now, not in begin()).  Model the event/ACL bytes on
+        //     cases 10 and 11 so this is obviously about begin(), not parsing.
+        FakeIo io; g_io = &io; Hci hci(io); hci.begin();
+        struct Ev { int n = 0; uint8_t code = 0; uint8_t len = 0; uint8_t p0 = 0xEE;
+                    static void fn(void *c, uint8_t code, const uint8_t *p, uint8_t len) { Ev *e = (Ev *)c; e->n++; e->code = code; e->len = len; e->p0 = len ? p[0] : 0xEE; } } ev;
+        struct A { uint16_t h = 0; uint16_t len = 0; uint8_t d0 = 0;
+                   static void fn(void *c, uint16_t h, const uint8_t *d, uint16_t len) { A *a = (A *)c; a->h = h; a->len = len; a->d0 = d[0]; } } a;
+        hci.onEvent(Ev::fn, &ev);
+        hci.onAcl(A::fn, &a);
+        hci.begin();                                          // SECOND begin(): must not unhook either callback
+        io.deliver({0x04, 0x01, 0x01, 0x00});                  // Inquiry Complete, status 0 (case 10)
+        io.deliver({0x02, 0x01, 0x20, 0x02, 0x00, 0xAA, 0xBB}); // handle 0x0001, PB flags 0x2 (case 11)
+        hci.service();
+        CHECK(ev.n == 1); CHECK(ev.code == 0x01); CHECK(ev.len == 1); CHECK(ev.p0 == 0);
+        CHECK(a.h == 0x0001); CHECK(a.len == 2); CHECK(a.d0 == 0xAA);
+    }
+    {   // 14. A fault must not cancel its own resync when the clock ticks
+        //     mid-drain (onFault() no longer re-reads the clock: service()
+        //     already stamped m_lastByteAt with the `now` it captured at the
+        //     top of the pass, and re-reading in onFault() could stamp a
+        //     millisecond later, making the unsigned (now - m_lastByteAt)
+        //     test below underflow and clear the resync in the SAME pass).
+        //     FakeIo can't express this -- its clock only moves inside
+        //     idle(), never during a drain -- so this needs its own fake
+        //     whose read() ticks the clock by 1 ms per byte, which is what a
+        //     drain straddling a millisecond tick does on real hardware.
+        struct TickingIo : HciIo {
+            std::vector<uint8_t> tx;
+            std::deque<uint8_t>  rx;
+            uint32_t now = 0;
+            int writes = 0;
+            size_t write(const uint8_t *p, size_t n) override { tx.insert(tx.end(), p, p + n); writes++; return n; }
+            int available() override { return (int)rx.size(); }
+            int read() override { if (rx.empty()) return -1; uint8_t b = rx.front(); rx.pop_front(); now += 1; return b; }
+            uint32_t nowMs() override { return now; }
+            void deliver(std::initializer_list<uint8_t> b) { rx.insert(rx.end(), b); }
+        };
+        TickingIo io; Hci hci(io); hci.begin();
+        io.deliver({0xFF});                     // garbage byte: parser faults -> resync
+        hci.service();
+        CHECK(hci.framing() == 1);
+        CHECK(hci.submit(0x0C03, nullptr, 0, nullptr, nullptr) == Hci::OK);
+        CHECK(io.writes == 0);                  // still resyncing: not written to the wire
+        io.now += Hci::IDLE_RESYNC_MS;          // clock passes the idle threshold
+        hci.service();
+        CHECK(io.writes == 1);                  // resync released: the queued command is sent now
+    }
     printf("hci_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
