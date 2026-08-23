@@ -180,9 +180,10 @@ void Hci::onFault() {
     // the unsigned (now - m_lastByteAt) in service() then underflows to a huge
     // value that satisfies the idle test and clears the resync in the SAME
     // pass.  The next command would be dispatched into a still-desynced
-    // stream, defeating the only recovery an H4 link has.  Note the test suite
-    // cannot see this: the fake clock advances only inside idle(), never
-    // during a drain.
+    // stream, defeating the only recovery an H4 link has.  Test case 14 covers
+    // this with its own TickingIo, whose read() advances the clock per byte --
+    // the shared FakeIo cannot express it, because that clock moves only
+    // inside idle(), never during a drain.
     m_resync = true;
     if (m_inflight) {
         // Give back the credit dispatch() spent on the command we are about to

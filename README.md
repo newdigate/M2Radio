@@ -136,8 +136,11 @@ dispatched at all — measured `timeouts=1 starved=9`, one command ever reaching
 the wire. `H4Parser`, `Hci` and `HciEvents` are pure C++ with host unit tests
 (`hci/test/run.sh`).
 
-Example: `networking/m2_hci_probe` in the rt1176-evkb repo (card-absent gate,
-a `[hci]` gate against `hci_peer.py`, and the silicon transcript).
+Example: `networking/m2_hci_probe` in the rt1176-evkb repo (a card-absent gate
+and a `[hci]` gate against `hci_peer.py`, a Python fake controller on LPUART2).
+**Nothing here has been run on silicon yet** -- no HCI command has ever been
+answered by a real IW416, so every value in the tests and the fake is written
+from the specification rather than captured from a card.
 
 ## Licence
 
