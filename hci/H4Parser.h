@@ -7,9 +7,12 @@
 //   0x02 ACL data  : [type][handle lo][handle hi][len lo][len hi][data ...]
 // (loopback-mode echoes arrive as Loopback Command EVENTS, not as command
 // packets; SCO is unused on this board.)  Any other type byte is a framing
-// fault.  H4 has no sync marker, so a lost byte desyncs the stream for good;
-// the recovery policy (discard until the line is idle) belongs to the owner,
-// which is told through the fault callback and calls reset().
+// fault.  H4 has no sync marker, so a lost byte desyncs the stream for good.
+// This class recovers its OWN state immediately -- fault() has already reset
+// it to WAIT_TYPE by the time the callback runs -- but that is not enough on a
+// real link: the next bytes are still mid-packet garbage.  The LINK recovery
+// policy (discard until the line has been idle a while) belongs to the owner,
+// which the fault callback exists to tell.
 //
 // MIT.  Clean-room from the specification.
 #pragma once
