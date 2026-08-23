@@ -102,6 +102,43 @@ Examples: `networking/wifi_client_test` (client echo + a held `accept()`
 session) and `networking/wifi_server_test` (one-shot `available()` server, with
 a Mac-side `wifi_peer.py` as the authoritative peer).
 
+## `hci/` — the Bluetooth HCI transport (BT-1)
+
+`import_evkb_library(M2Radio hci)` gives a sketch the host side of an HCI link
+over `Serial2` (LPUART2 = the M.2 socket's BT UART): H4 framing, a command queue
+that honours `Num_HCI_Command_Packets`, Command Complete/Status matching with
+timeouts, and callbacks for asynchronous events and ACL data. `sdio`/`iw416`
+are still needed to bring the card up — the Bluetooth firmware rides the combo
+blob downloaded over SDIO — but `hci/` never compiles the Wi-Fi data path.
+
+```cpp
+static HciTransport io(Serial2);  static Hci hci(io);  static HciPump pump;
+io.begin(115200); hci.begin(); pump.attach(hci);       // one service() per yield()
+Hci::Reply r;
+Hci::Error e = hci.run(0x0C03 /*Reset*/, nullptr, 0, &r, 500, [](){ delay(1); });
+```
+
+**Every exit is named** — `Hci::errorName()` gives `no_response`, `framing`,
+`ncmd_starved`, `queue_full`, `status`, `busy` — and counted, because H4 has
+no sync marker and LPUART2 has no flow control on this board: a lost byte
+desyncs the stream for good, the parser's fault starts a 50 ms idle resync,
+and the command in flight fails as `framing`, not `timeout`.
+
+**An abandoned command's credit is given back, on a `timeout` as well as on a
+`framing` fault.** `Num_HCI_Command_Packets` is assigned *absolutely* from
+each reply, so a reply lost to a resync — or simply never sent — leaves
+nothing able to raise the count back up: no credit means no command, and no
+command means no reply. That is a permanent deadlock, not a slow recovery, and
+it is what made a ten-attempt retry loop around `HCI_Reset` in the example
+silently send only once, against a controller that never answers: attempt 1
+spent the one startup credit and timed out without it, and attempts 2–10 never
+dispatched at all — measured `timeouts=1 starved=9`, one command ever reaching
+the wire. `H4Parser`, `Hci` and `HciEvents` are pure C++ with host unit tests
+(`hci/test/run.sh`).
+
+Example: `networking/m2_hci_probe` in the rt1176-evkb repo (card-absent gate,
+a `[hci]` gate against `hci_peer.py`, and the silicon transcript).
+
 ## Licence
 
 MIT. Nothing is vendored here.
