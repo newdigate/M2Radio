@@ -7,10 +7,10 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 CXX=${CXX:-c++}
-for t in h4parser_test hci_test hcievents_test; do
+for t in h4parser_test hci_test hcievents_test btfwloader_test; do
     [ -f "$DIR/$t.cpp" ] || continue
     $CXX -std=c++11 -Wall -Wextra -Werror -I"$DIR/.." "$DIR/$t.cpp" \
-        "$DIR/../H4Parser.cpp" "$DIR/../Hci.cpp" "$DIR/../HciEvents.cpp" -o "$OUT/$t"
+        "$DIR/../H4Parser.cpp" "$DIR/../Hci.cpp" "$DIR/../HciEvents.cpp" "$DIR/../BtFwLoader.cpp" -o "$OUT/$t"
     "$OUT/$t"
 done
 echo "HCI-HOST-TESTS: PASS"
