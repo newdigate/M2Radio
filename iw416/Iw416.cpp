@@ -135,7 +135,7 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
     static uint8_t blockBuf[SDIO_BLOCK_SIZE * 64];
     const uint32_t maxChunk = sizeof(blockBuf);
 
-    m_bytesSent = 0; m_chunksSent = 0; m_lastRequest = 0;
+    m_bytesSent = 0; m_chunksSent = 0; m_lastRequest = 0; m_maxPauseMs = 0;
     uint32_t offset = 0, remaining = len;
 
     while (remaining > 0) {
@@ -143,7 +143,20 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
         // so poll rather than assuming the previous answer still holds.
         uint16_t want = 0;
         SdioHost::Status s = SdioHost::CMD_TIMEOUT;
-        for (uint32_t tries = 0; tries < 1000; tries++) {
+        // ★ THE CARD REALLY DOES STOP EARLY, AND IT IS NOT OUR IMPATIENCE.
+        // This poll is only ever reached with bytes STILL UNSENT (the enclosing
+        // loop is `while (remaining > 0)`), so a zero length here never meant
+        // "the image is in" -- it means the card went quiet mid-image.  With
+        // the combo blob it stops at sent=402288/411064, 8,776 bytes short.
+        // That looked like a truncation caused by too short a wait, so the
+        // bound was raised to 15 s and measured on silicon 2026-08-24:
+        // `max_pause_ms=15000` -- it sat out the WHOLE window and asked for
+        // nothing more, with the WLAN firmware running perfectly
+        // (fw_status=0xFEDC, GET_HW_SPEC answered).  The card wants 402,288
+        // bytes and no more.  The bound is therefore back at 1 s; maxPauseMs()
+        // keeps the number visible so nobody has to re-run that experiment.
+        uint32_t waited = 0;
+        for (uint32_t tries = 0; tries < FW_IDLE_POLL_TRIES; tries++) {
             // Gate on the card declaring itself ready before trusting the
             // length, exactly as NXP do.  Skipping this means writing into a
             // card that is not listening, which corrupts the image silently:
@@ -156,8 +169,9 @@ SdioHost::Status Iw416::downloadFirmware(const uint8_t *fw, uint32_t len) {
                 if (s != SdioHost::OK) return s;
                 if (want != 0) break;
             }
-            delay(1);
+            delay(1); waited++;
         }
+        if (waited > m_maxPauseMs) m_maxPauseMs = waited;
         m_lastRequest = want;
         // A zero request after we have made progress means it stopped asking:
         // the image is in. Zero on the very first pass is a real failure.

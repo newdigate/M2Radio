@@ -51,6 +51,16 @@ public:
     // Then CARD_FW_STATUS0/1 must read FIRMWARE_READY (0xFEDC).
     SdioHost::Status downloadFirmware(const uint8_t *fw, uint32_t len);
 
+    // How long (ms) the bootloader was silent at its longest pause DURING the
+    // download.  Printed by the probes: it is the number that says whether a
+    // download that "stopped asking" had actually finished or merely paused.
+    uint32_t maxPauseMs() const { return m_maxPauseMs; }
+    // ★ MEASURED 2026-08-24: widening this to 15 s changed NOTHING -- the card
+    // waited the full window (max_pause_ms=15000) and never asked for another
+    // byte.  It stops at 402,288 of the 411,064-byte combo image DELIBERATELY.
+    // So this bound is back where it was: any larger value is pure latency on
+    // every download, for a pause that does not exist.
+    static const uint32_t FW_IDLE_POLL_TRIES = 1000;    // ~1 s
     uint32_t bytesSent()   const { return m_bytesSent; }
     uint32_t chunksSent()  const { return m_chunksSent; }
     uint16_t lastRequest() const { return m_lastRequest; }
@@ -1448,6 +1458,7 @@ private:
     uint16_t m_fwStatus     = 0;
     uint8_t  m_cardStatus   = 0;
     uint16_t m_requestedLen = 0;
+    uint32_t m_maxPauseMs = 0;
     uint32_t m_bytesSent    = 0;
     uint32_t m_chunksSent   = 0;
     uint16_t m_lastRequest  = 0;
