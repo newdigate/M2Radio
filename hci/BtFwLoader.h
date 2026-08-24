@@ -83,6 +83,17 @@ public:
     uint16_t lastCardErr() const { return m_lastCardErr; } // error bits the CARD reported
     uint32_t maxOffset()   const { return m_maxOffset; }   // highest offset+len served
 
+    // A small trace of the request sequence, for bring-up.  The first N are
+    // where the structure shows (header blocks vs data blocks); the last N are
+    // where a download that ends wrongly shows it.  Kept tiny and fixed-size.
+    static const uint8_t TRACE_N = 12;
+    uint8_t  traceFirstN() const { return m_tFirstN; }
+    uint8_t  traceLastN()  const { return m_tLastN; }
+    uint16_t traceFirstLen(uint8_t i) const { return m_tFirstLen[i]; }
+    uint32_t traceFirstOff(uint8_t i) const { return m_tFirstOff[i]; }
+    uint16_t traceLastLen(uint8_t i)  const { return m_tLastLen[i]; }
+    uint32_t traceLastOff(uint8_t i)  const { return m_tLastOff[i]; }
+
 private:
     void reset();
     void sendAck();
@@ -97,4 +108,6 @@ private:
     uint16_t m_lastCardErr;
     uint32_t m_lastOffset;   // for retransmit detection
     bool     m_haveLast;
+    uint16_t m_tFirstLen[TRACE_N]; uint32_t m_tFirstOff[TRACE_N]; uint8_t m_tFirstN;
+    uint16_t m_tLastLen[TRACE_N];  uint32_t m_tLastOff[TRACE_N];  uint8_t m_tLastN; uint8_t m_tLastHead;
 };

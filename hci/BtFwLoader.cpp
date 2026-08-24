@@ -28,6 +28,7 @@ uint8_t BtFwLoader::crc8(const uint8_t *p, uint32_t n) {
 void BtFwLoader::reset() {
     m_startInds = m_chunks = m_bytesSent = m_retransmits = m_crcErrors = m_maxOffset = 0;
     m_lastCardErr = 0; m_lastOffset = 0; m_haveLast = false;
+    m_tFirstN = 0; m_tLastN = 0; m_tLastHead = 0;
 }
 
 void BtFwLoader::sendAck() {
@@ -72,6 +73,11 @@ BtFwLoader::Error BtFwLoader::onFrame(const uint8_t *f, uint32_t n, bool *sentAl
         // fail to authenticate, and the failure would surface far from here.
         return BAD_OFFSET;
     }
+
+    if (m_tFirstN < TRACE_N) { m_tFirstLen[m_tFirstN] = len; m_tFirstOff[m_tFirstN] = off; m_tFirstN++; }
+    m_tLastLen[m_tLastHead] = len; m_tLastOff[m_tLastHead] = off;
+    m_tLastHead = (uint8_t)((m_tLastHead + 1) % TRACE_N);
+    if (m_tLastN < TRACE_N) m_tLastN++;
 
     if (m_haveLast && off == m_lastOffset) m_retransmits++;
     m_lastOffset = off; m_haveLast = true;
