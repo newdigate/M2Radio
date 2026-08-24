@@ -18,6 +18,10 @@ static int g_fails = 0, g_checks = 0;
 #define CHECK(c) do { g_checks++; if (!(c)) { g_fails++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 // The card's real power-up frame, verbatim from the bench capture.
+// ★ EVERY case that expects run() to get anywhere must io.feed(REAL_START_IND)
+// first: the loader will not serve a byte until the card has greeted it.  This
+// was forgotten twice while writing these tests, each time presenting as a
+// wholesale failure of the case rather than as a missing greeting.
 static const uint8_t REAL_START_IND[5] = { 0xAB, 0x01, 0x72, 0x00, 0x47 };
 
 struct FakeIo : HciIo {
@@ -166,10 +170,31 @@ int main() {
         CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::OK);
         CHECK(ld.startInds() == 1);
     }
-    {   // 7. Any OTHER stray byte where a header is due IS a fault, by name.
+    {   // 7. Debris BEFORE the first frame is skipped and COUNTED, not fatal:
+        //    a greeting truncated by the ring reset leaves its tail behind, and
+        //    the [fwdnld] gate went intermittently red on exactly that.
         FakeIo io; g_io = &io; BtFwLoader ld(io);
-        static uint8_t img[16]; ld.setImage(img, sizeof img);
-        io.feed({0x5C});
+        static uint8_t img[64]; memset(img, 3, sizeof img);
+        ld.setImage(img, sizeof img);
+        io.feed({0x01, 0x72, 0x00, 0x47});      // the tail of a lost start indication
+        io.feed(REAL_START_IND, 5);
+        io.onWrite = [](FakeIo &f, const uint8_t *p, size_t n) {
+            if (n == 2 && p[0] == BtFwLoader::ACK && f.tx.size() == 2) {
+                std::vector<uint8_t> r; dataReq(r, 64, 0); f.feed(r.data(), r.size());
+            }
+        };
+        CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::OK);
+        CHECK(ld.preSyncSkipped() == 4);
+        CHECK(ld.startInds() == 1);
+    }
+    {   // 7b. AFTER synchronising, a stray byte IS a fault, by name -- the
+        //     tolerance above must not become a blanket one.
+        FakeIo io; g_io = &io; BtFwLoader ld(io);
+        static uint8_t img[64]; ld.setImage(img, sizeof img);
+        io.feed(REAL_START_IND, 5);
+        io.onWrite = [](FakeIo &f, const uint8_t *p, size_t n) {
+            if (n == 2 && p[0] == BtFwLoader::ACK && f.tx.size() == 2) f.feed({0x5C});
+        };
         CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::BAD_HEADER);
         CHECK(strcmp(BtFwLoader::errorName(BtFwLoader::BAD_HEADER), "bad_header") == 0);
     }
@@ -214,6 +239,79 @@ int main() {
         FakeIo io; g_io = &io; BtFwLoader ld(io);
         CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::NO_IMAGE);
         CHECK(io.tx.empty());
+    }
+    {   // 12. CRC-32 matches the SHIPPED IMAGE's own block header.
+        //     The first 16 bytes of uartIW416_bt.bin are
+        //       01 00 00 00 10 20 0a 00 00 08 00 00 83 df a3 ea
+        //     = type 1, addr 0x000A2010, length 2048, then a big-endian CRC-32
+        //     of the preceding twelve.  Recomputing it is how the CRC variant
+        //     was identified, so it is pinned here rather than described.
+        const uint8_t hdr12[12] = {0x01,0x00,0x00,0x00,0x10,0x20,0x0A,0x00,0x00,0x08,0x00,0x00};
+        CHECK(BtFwLoader::crc32(hdr12, 12) == 0x83DFA3EAu);
+    }
+    {   // 13. The injected UART-config block: served before the image, with the
+        //     card's offsets then mapping past it into the file.
+        FakeIo io; g_io = &io; BtFwLoader ld(io);
+        static uint8_t img[256]; for (int i = 0; i < 256; i++) img[i] = (uint8_t)(0xC0 + i);
+        ld.setImage(img, sizeof img);
+        ld.enableUartConfig(BtFwLoader::CLKDIV_115200, BtFwLoader::UARTDIV_115200);
+        io.feed(REAL_START_IND, 5);
+        int step = 0;
+        io.onWrite = [&step](FakeIo &f, const uint8_t *p, size_t n) {
+            if (!(n == 2 && p[0] == BtFwLoader::ACK)) return;
+            std::vector<uint8_t> r;
+            if (step == 0)      dataReq(r, 16, 0);        // header -> gets the config header
+            else if (step == 1) dataReq(r, 52, 16);       // -> gets the 52-byte config body
+            else if (step == 2) dataReq(r, 256, 68);      // stream 68 == file 0
+            if (step <= 2) f.feed(r.data(), r.size());
+            step++;
+        };
+        CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::OK);
+        CHECK(ld.injectedBytes() == 68);
+        CHECK(ld.bytesSent() == 256);                     // only the IMAGE counts as sent
+        CHECK(ld.maxOffset() == 256);
+        // Reconstruct what went out, minus the ACK frames.
+        std::vector<uint8_t> out; size_t i = 0;
+        while (i < io.tx.size()) {
+            if (io.tx[i] == BtFwLoader::ACK && i + 1 < io.tx.size() && io.tx[i+1] == 0x92) { i += 2; continue; }
+            out.push_back(io.tx[i++]);
+        }
+        CHECK(out.size() == 16 + 52 + 256);
+        // the type-5 header, its length field and its CRC
+        CHECK(out.size() > 15 && out[0] == 0x05);
+        CHECK(out.size() > 15 && out[8] == 52 && out[9] == 0 && out[10] == 0 && out[11] == 0);
+        if (out.size() > 15) {
+            uint8_t h[12]; memcpy(h, out.data(), 12);
+            uint32_t hc = BtFwLoader::crc32(h, 12);
+            CHECK(out[12] == (uint8_t)(hc >> 24) && out[15] == (uint8_t)hc);   // big-endian
+        }
+        // the first register write, little-endian, and the body CRC
+        if (out.size() > 68) {
+            CHECK(out[16] == 0x8F && out[17] == 0x00 && out[18] == 0x00 && out[19] == 0x7F);
+            uint8_t b[48]; memcpy(b, out.data() + 16, 48);
+            uint32_t bc = BtFwLoader::crc32(b, 48);
+            CHECK(out[64] == (uint8_t)(bc >> 24) && out[67] == (uint8_t)bc);
+        }
+        // and then the image itself, from file offset 0
+        CHECK(out.size() == 324 && memcmp(out.data() + 68, img, 256) == 0);
+    }
+    {   // 14. With injection ON, an offset that lands INSIDE the injected block
+        //     is a fault -- it cannot be mapped into the file.
+        FakeIo io; g_io = &io; BtFwLoader ld(io);
+        static uint8_t img[64]; ld.setImage(img, sizeof img);
+        ld.enableUartConfig(BtFwLoader::CLKDIV_115200, BtFwLoader::UARTDIV_115200);
+        io.feed(REAL_START_IND, 5);
+        int step = 0;
+        io.onWrite = [&step](FakeIo &f, const uint8_t *p, size_t n) {
+            if (!(n == 2 && p[0] == BtFwLoader::ACK)) return;
+            std::vector<uint8_t> r;
+            if (step == 0)      dataReq(r, 16, 0);
+            else if (step == 1) dataReq(r, 52, 16);
+            else if (step == 2) dataReq(r, 16, 40);       // 40 < 68: inside the injection
+            if (step <= 2) f.feed(r.data(), r.size());
+            step++;
+        };
+        CHECK(ld.run(1000, 10, 5000, idle1) == BtFwLoader::BAD_OFFSET);
     }
     printf("btfwloader_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

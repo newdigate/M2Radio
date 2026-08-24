@@ -60,6 +60,29 @@ public:
 
     // CRC-8, polynomial 0x07, init 0xFF, over the bytes as given.
     static uint8_t crc8(const uint8_t *p, uint32_t n);
+    // CRC-32, polynomial 0x04C11DB7, init 0, no reflection, no final xor.
+    // Verified against the shipped image's OWN block header, whose trailing
+    // four bytes are this CRC of the preceding twelve, stored big-endian.
+    static uint32_t crc32(const uint8_t *p, uint32_t n);
+
+    // ---- optional: inject the bootloader's UART-configuration block --------
+    // NXP's loader replaces the FIRST header the card asks for with a type-5
+    // "configure UART" header carrying twelve register writes (clock divisors,
+    // MCR/ICR/FCR and a re-init trigger), then lets the real image follow.  It
+    // does this whenever it changes baud, and subtracts the injected length
+    // from every later offset -- which is how we know the card's `offset`
+    // counts bytes IT has consumed from the STREAM, not position in the file.
+    //
+    // Enabling it with the CURRENT baud's divisors changes no rate at all: it
+    // tests only whether the card needs that register block written before its
+    // firmware will run.  That is a real question here, because the download
+    // completes perfectly on silicon and the controller then says nothing.
+    void enableUartConfig(uint32_t clkDivVal, uint32_t uartClkDivVal);
+    static const uint32_t CLKDIV_115200 = 0x0075F6FDu, UARTDIV_115200 = 16u;
+    uint32_t injectedBytes() const { return m_injected; }
+    uint16_t cfgUnexpectedLen() const { return m_cfgUnexpLen; }  // what it asked for instead
+    uint32_t cfgHdrResends()    const { return m_cfgResends; }
+    uint32_t preSyncSkipped()   const { return m_preSync; }   // debris before the first frame
 
     explicit BtFwLoader(HciIo &io) : m_io(io) { reset(); }
 
@@ -108,6 +131,17 @@ private:
     uint16_t m_lastCardErr;
     uint32_t m_lastOffset;   // for retransmit detection
     bool     m_haveLast;
+    enum Inject : uint8_t { INJ_OFF, INJ_HDR_DUE, INJ_CFG_DUE, INJ_DONE };
+    Inject   m_inject = INJ_OFF;
+    uint32_t m_injected = 0;          // stream bytes that did NOT come from the image
+    uint32_t m_clkDivVal = 0, m_uartClkDivVal = 0;
+    uint8_t  m_cfgHdr[16];
+    uint8_t  m_cfgBody[52];           // 12 x uint32 register writes + CRC-32
+    uint16_t m_cfgUnexpLen = 0;
+    uint32_t m_cfgResends = 0;
+    uint32_t m_preSync = 0;
+    void     buildUartConfig();
+
     uint16_t m_tFirstLen[TRACE_N]; uint32_t m_tFirstOff[TRACE_N]; uint8_t m_tFirstN;
     uint16_t m_tLastLen[TRACE_N];  uint32_t m_tLastOff[TRACE_N];  uint8_t m_tLastN; uint8_t m_tLastHead;
 };
