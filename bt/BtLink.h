@@ -17,18 +17,20 @@ public:
     Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection
     Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first; on failure Write_Simple_Pairing_Mode=0 and retry with PIN
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);   // forward from the app's Hci::EventFn
-    uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return m_bd; }
+    uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return (const uint8_t *)m_bd; }
     bool encrypted() const { return m_encrypted; } const char *pairedBy() const { return m_pairedBy; }
 private:
     void logf(const char *fmt, ...);                            // vsnprintf into m_lb; emit via m_log if set
-    Hci &m_hci; LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[160];
-    uint16_t m_handle = 0; uint8_t m_bd[6] = {0}; uint8_t m_psrm = 0; uint16_t m_clk = 0;
+    Hci &m_hci; LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[320];
+    volatile uint16_t m_handle = 0; volatile uint8_t m_bd[6] = {0}; volatile uint8_t m_psrm = 0; volatile uint16_t m_clk = 0;
     char m_pin[4] = {'1','2','3','4'}; const char *m_pairedBy = "none";
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;
     volatile bool m_encrypted = false; volatile bool m_haveLinkKey = false;
-    volatile bool m_inqComplete = false; volatile bool m_nameDone = false;
-    // A/V inquiry hits (major device class 0x04), enough for the bench.
-    struct Hit { uint8_t bd[6]; uint32_t cod; uint8_t psrm; uint16_t clk; bool named; uint8_t nameStatus; char name[249]; };
+    volatile bool m_inqComplete = false;
+    // A/V inquiry hits (major device class 0x04), enough for the bench.  `named` is
+    // per-hit (not a single shared flag) so a late Remote_Name_Complete for hit i
+    // can never be mistaken for hit i+1's answer while connect() waits on it.
+    struct Hit { uint8_t bd[6]; uint32_t cod; uint8_t psrm; uint16_t clk; volatile bool named; uint8_t nameStatus; char name[249]; };
     static const uint8_t MAX_HITS = 8; Hit m_hits[MAX_HITS]; uint8_t m_nHits = 0; int m_target = -1;
 };

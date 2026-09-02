@@ -4,8 +4,12 @@
 // clock (now()/idle(), replacing millis()/delay()) and the console (logf(),
 // replacing CONSOLE.print), which are what make this file Arduino-free and
 // host-compilable.  Opcodes, event codes and every byte layout below are
-// copied from the probe, not re-derived.  MIT, clean-room.
+// copied from the probe, not re-derived; the Inquiry Result / Remote Name
+// Complete parses and the BD formatter are the hci/HciEvents.{h,cpp} helpers
+// (already host-tested for truncated/out-of-range input) rather than
+// duplicated inline.  MIT, clean-room.
 #include "BtLink.h"
+#include "HciEvents.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -40,17 +44,6 @@ enum {
     EV_USER_CONF_REQUEST   = 0x33,
     EV_SIMPLE_PAIRING_DONE = 0x36,
 };
-
-// "11:22:33:44:55:66", MSB-first -- matches the probe's printBd()/hciFormatBd().
-void bdstr(const uint8_t bd[6], char out[18]) {
-    static const char hex[] = "0123456789ABCDEF";
-    char *o = out;
-    for (int i = 5; i >= 0; i--) {
-        *o++ = hex[bd[i] >> 4]; *o++ = hex[bd[i] & 0xF];
-        if (i) *o++ = ':';
-    }
-    *o = 0;
-}
 }  // namespace
 
 const char *BtLink::resultName(Result r) {
@@ -62,7 +55,6 @@ const char *BtLink::resultName(Result r) {
         case PIN_FAILED:        return "pin_failed";
         case ENCRYPTION_FAILED: return "encryption_failed";
         case TIMEOUT:            return "timeout";
-        default:                 return "?";
     }
     return "?";
 }
@@ -81,7 +73,7 @@ void BtLink::logf(const char *fmt, ...) {
 // probeConnect(). ---
 BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)()) {
     m_nHits = 0; m_target = -1;
-    m_inqComplete = false; m_nameDone = false;
+    m_inqComplete = false;
     // LAP = GIAC 0x9E8B33 little-endian, Inquiry_Length 0x0A = 12.8 s, Num_Responses 0 = unlimited
     const uint8_t params[5] = { 0x33, 0x8B, 0x9E, 0x0A, 0x00 };
     Hci::Reply r;
@@ -103,11 +95,14 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
         p[6] = h.psrm; p[7] = 0;
         p[8] = (uint8_t)(h.clk & 0xFF);
         p[9] = (uint8_t)((h.clk >> 8) | 0x80);
-        m_nameDone = false;
+        h.named = false;
         Hci::Error ne = m_hci.run(OP_REMOTE_NAME_REQ, p, sizeof p, &r, 1000, idle);
         t0 = now();
-        while (ne == Hci::OK && !m_nameDone && now() - t0 < 5000) idle();
-        char bs[18]; bdstr(h.bd, bs);
+        // Wait on THIS hit's own flag -- a late Remote_Name_Complete for an
+        // earlier hit must never be able to end an unrelated hit's wait (the
+        // shared-flag race this replaced).
+        while (ne == Hci::OK && !h.named && now() - t0 < 5000) idle();
+        char bs[18]; hciFormatBd(h.bd, bs);
         if (ne != Hci::OK)  { logf("inq_name: bd=%s fail reason=%s", bs, Hci::errorName(ne)); continue; }
         if (!h.named)       { logf("inq_name: bd=%s fail reason=no_name_event", bs); continue; }
         logf("inq_name: bd=%s status=0x%02X name=\"%s\"", bs, h.nameStatus, h.name);
@@ -124,8 +119,8 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     if (m_target < 0) { logf("connect=fail reason=no_inquiry_hit"); return NO_INQUIRY_HIT; }
 
     Hit &d = m_hits[m_target];
-    memcpy(m_bd, d.bd, 6); m_psrm = d.psrm; m_clk = d.clk;
-    char tbs[18]; bdstr(m_bd, tbs);
+    memcpy((void *)m_bd, d.bd, 6); m_psrm = d.psrm; m_clk = d.clk;
+    char tbs[18]; hciFormatBd((const uint8_t *)m_bd, tbs);
     logf("connect: target=%s name=\"%s\"", tbs, d.named ? d.name : "?");
 
     // Enable ALL HCI events, incl. the SSP request events (0x31-0x36) which sit
@@ -141,7 +136,7 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
 
     // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
     uint8_t p[13];
-    memcpy(p, m_bd, 6);
+    memcpy(p, (const void *)m_bd, 6);
     p[6] = 0x18; p[7] = 0xCC;
     p[8] = m_psrm; p[9] = 0x00;
     p[10] = (uint8_t)(m_clk & 0xFF);
@@ -164,7 +159,9 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
 // --- pairAndEncrypt(): Authentication_Requested (SSP path); on failure,
 // Write_Simple_Pairing_Mode=0 and retry (the PIN_Code_Request path);
 // Set_Connection_Encryption on success.  Ported from the second half of
-// probeConnect(). ---
+// probeConnect().  Every command that answers via Command Status is guarded
+// the way connect() guards Create_Connection: a rejected/unaccepted command
+// returns immediately instead of busy-waiting out the full event timeout. ---
 BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
     Hci::Reply r;
     uint8_t hp[2] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8) };
@@ -174,7 +171,11 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
     //   wait for Auth_Complete (not just Simple_Pairing_Complete) -- else
     //   Set_Connection_Encryption races ahead and fails with 0x2F.
     m_pairDone = false; m_authDone = false; m_haveLinkKey = false;
-    m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
+    Hci::Error ae = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
+    if (ae != Hci::OK || !r.statusEvent) {
+        logf("auth_requested=fail reason=%s status=0x%02X", ae == Hci::OK ? "not_command_status" : Hci::errorName(ae), r.status);
+        return PAIRING_FAILED;
+    }
     uint32_t t0 = now();
     while (!m_authDone && now() - t0 < 25000) idle();
     logf("pairing=%s auth=%s link_key=%s",
@@ -190,7 +191,11 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
         uint8_t sspOff = 0x00; Hci::Reply r2;
         m_hci.run(OP_WRITE_SSP_MODE, &sspOff, 1, &r2, 1000, idle);
         m_pairDone = false; m_authDone = false; m_haveLinkKey = false;
-        m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r2, 2000, idle);
+        Hci::Error ae2 = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r2, 2000, idle);
+        if (ae2 != Hci::OK || !r2.statusEvent) {
+            logf("auth_requested(pin)=fail reason=%s status=0x%02X", ae2 == Hci::OK ? "not_command_status" : Hci::errorName(ae2), r2.status);
+            return PAIRING_FAILED;
+        }
         t0 = now();
         while (!m_authDone && now() - t0 < 25000) idle();
         bool sawPin = strcmp(m_pairedBy, "pin") == 0;
@@ -205,7 +210,11 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
     // Set_Connection_Encryption -> Encryption_Change (status=0x00 enabled=1).
     m_encDone = false; m_encStatus = 0xFF; m_encrypted = false;
     uint8_t ep[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x01 };
-    m_hci.run(OP_SET_CONN_ENCRYPTION, ep, 3, &r, 2000, idle);
+    Hci::Error ee = m_hci.run(OP_SET_CONN_ENCRYPTION, ep, 3, &r, 2000, idle);
+    if (ee != Hci::OK || !r.statusEvent) {
+        logf("set_conn_encryption=fail reason=%s status=0x%02X", ee == Hci::OK ? "not_command_status" : Hci::errorName(ee), r.status);
+        return ENCRYPTION_FAILED;
+    }
     t0 = now();
     while (!m_encDone && now() - t0 < 10000) idle();
     if (m_encDone && m_encStatus == 0x00 && m_encrypted) {
@@ -221,49 +230,47 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
 // called from the app's Hci::EventFn, i.e. from inside Hci::service(). ---
 void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     if (code == EV_INQUIRY_RESULT) {
-        // Field-major: Num_Responses(1), then all BD_ADDRs(6n), PSRMs(n),
-        // Reserved(2n), CoDs(3n), Clock_Offsets(2n).  Keep only Audio/Video
-        // (major device class 0x04) hits -- enough for the bench.
-        if (len < 1) return;
-        uint8_t n = p[0];
-        if ((size_t)1 + (size_t)n * 14 > len) return;    // malformed / truncated
+        // Field-major parse via the tested HciEvents helper.  Keep only
+        // Audio/Video (major device class 0x04) hits -- enough for the bench
+        // -- and drop duplicates so a chatty peer can't consume more than one
+        // of the 8 A/V slots.
+        uint8_t n = hciInquiryResultCount(p, len);
         for (uint8_t i = 0; i < n; i++) {
-            const uint8_t *hbd  = p + 1 + 6 * i;
-            const uint8_t *psrm = p + 1 + 6 * n + i;
-            const uint8_t *cod  = p + 1 + 9 * n + 3 * i;    // after 6n bd + n psrm + 2n reserved
-            const uint8_t *clk  = p + 1 + 12 * n + 2 * i;
-            uint32_t codv = (uint32_t)cod[0] | ((uint32_t)cod[1] << 8) | ((uint32_t)cod[2] << 16);
-            uint16_t clkv = (uint16_t)(clk[0] | (clk[1] << 8));
-            char bs[18]; bdstr(hbd, bs);
-            logf("inq: bd=%s cod=0x%06lX psrm=%u clk=0x%04X", bs, (unsigned long)codv, *psrm, clkv);
-            if (((codv >> 8) & 0x1F) != 0x04) continue;     // not Audio/Video -- skip
+            HciInquiryResult ir;
+            if (!hciParseInquiryResult(p, len, i, &ir)) break;
+            char bs[18]; hciFormatBd(ir.bd, bs);
+            logf("inq: bd=%s cod=0x%06lX psrm=%u clk=0x%04X", bs, (unsigned long)ir.cod, ir.psrm, ir.clockOffset);
+            if (((ir.cod >> 8) & 0x1F) != 0x04) continue;     // not Audio/Video -- skip
+            bool dup = false;
+            for (uint8_t j = 0; j < m_nHits; j++)
+                if (memcmp(m_hits[j].bd, ir.bd, 6) == 0) { dup = true; break; }
+            if (dup) continue;
             if (m_nHits >= MAX_HITS) continue;
             Hit &h = m_hits[m_nHits++];
-            memcpy(h.bd, hbd, 6); h.cod = codv; h.psrm = *psrm; h.clk = clkv;
+            memcpy(h.bd, ir.bd, 6); h.cod = ir.cod; h.psrm = ir.psrm; h.clk = ir.clockOffset;
             h.named = false; h.nameStatus = 0xFF; h.name[0] = 0;
         }
+        if (n == 0) logf("inq: malformed len=%u", len);
     } else if (code == EV_INQUIRY_COMPLETE && len >= 1) {
         m_inqComplete = true;
     } else if (code == EV_REMOTE_NAME_DONE) {
-        // status(1) bd(6) name(248)
-        if (len < 7) return;
-        for (uint8_t i = 0; i < m_nHits; i++) {
-            if (memcmp(m_hits[i].bd, p + 1, 6) != 0) continue;
-            m_hits[i].nameStatus = p[0];
-            size_t n = (size_t)len - 7; if (n > 248) n = 248;
-            memcpy(m_hits[i].name, p + 7, n);
-            m_hits[i].name[n] = 0;
-            m_hits[i].named = true;
-            break;
+        HciRemoteName nm;
+        if (hciParseRemoteNameComplete(p, len, &nm)) {
+            for (uint8_t i = 0; i < m_nHits; i++) {
+                if (memcmp(m_hits[i].bd, nm.bd, 6) != 0) continue;
+                m_hits[i].nameStatus = nm.status;
+                memcpy(m_hits[i].name, nm.name, sizeof m_hits[i].name);
+                m_hits[i].named = true;     // per-hit flag -- see the Hit comment in BtLink.h
+                break;
+            }
         }
-        m_nameDone = true;
     } else if (code == EV_CONNECTION_COMPLETE && len >= 11) {
         // status(1) handle(2) bd(6) link_type(1) encryption_mode(1)
         m_connStatus = p[0];
         m_handle = (uint16_t)(p[1] | (p[2] << 8));
         m_connDone = true;
     } else if (code == EV_LINK_KEY_REQUEST && len >= 6) {
-        char bs[18]; bdstr(p, bs);
+        char bs[18]; hciFormatBd(p, bs);
         logf("link_key_req: bd=%s -> neg_reply (no stored key)", bs);
         m_hci.submit(OP_LINK_KEY_REQ_NEG, p, 6, nullptr, nullptr);
     } else if (code == EV_IO_CAP_REQUEST && len >= 6) {
@@ -271,12 +278,12 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         rp[6] = 0x03;    // IO capability = NoInputNoOutput -> Just Works
         rp[7] = 0x00;    // OOB data not present
         rp[8] = 0x04;    // General Bonding, MITM not required
-        char bs[18]; bdstr(p, bs);
+        char bs[18]; hciFormatBd(p, bs);
         logf("io_cap_req: bd=%s -> NoInputNoOutput auth_req=0x%02X", bs, rp[8]);
         m_hci.submit(OP_IO_CAP_REQ_REPLY, rp, 9, nullptr, nullptr);
     } else if (code == EV_USER_CONF_REQUEST && len >= 10) {
         uint32_t nv = (uint32_t)p[6] | ((uint32_t)p[7] << 8) | ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24);
-        char bs[18]; bdstr(p, bs);
+        char bs[18]; hciFormatBd(p, bs);
         logf("user_conf_req: bd=%s numeric=%lu -> accept (Just Works)", bs, (unsigned long)nv);
         m_hci.submit(OP_USER_CONF_REQ_REPLY, p, 6, nullptr, nullptr);
     } else if (code == EV_PIN_CODE_REQUEST && len >= 6) {
@@ -284,18 +291,18 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         uint8_t rp[23]; memset(rp, 0, sizeof rp);
         memcpy(rp, p, 6); rp[6] = 4;
         rp[7] = (uint8_t)m_pin[0]; rp[8] = (uint8_t)m_pin[1]; rp[9] = (uint8_t)m_pin[2]; rp[10] = (uint8_t)m_pin[3];
-        char bs[18]; bdstr(p, bs);
+        char bs[18]; hciFormatBd(p, bs);
         logf("pin_code_req: bd=%s -> %c%c%c%c", bs, m_pin[0], m_pin[1], m_pin[2], m_pin[3]);
         m_pairedBy = "pin";
         m_hci.submit(OP_PIN_CODE_REQ_REPLY, rp, 23, nullptr, nullptr);
     } else if (code == EV_LINK_KEY_NOTIFY && len >= 23) {
         m_haveLinkKey = true;
-        char bs[18]; bdstr(p, bs);
+        char bs[18]; hciFormatBd(p, bs);
         logf("link_key: bd=%s type=%u", bs, p[22]);
     } else if (code == EV_SIMPLE_PAIRING_DONE && len >= 7) {
         m_pairStatus = p[0];
         m_pairedBy = "ssp";
-        char bs[18]; bdstr(p + 1, bs);
+        char bs[18]; hciFormatBd(p + 1, bs);
         logf("pairing_complete: status=0x%02X bd=%s", p[0], bs);
         m_pairDone = true;
     } else if (code == EV_AUTH_COMPLETE && len >= 3) {
