@@ -17,10 +17,12 @@ public:
     explicit HciTransport(HardwareSerialIMXRT &port) : m_port(port) {}
     void begin(uint32_t baud);
     void end();
-    // Re-program the port at a new rate.  Call ONLY after the controller has
-    // acknowledged its own rate change and the line is idle: begin() resets
-    // the RX ring, so anything arriving during the switch is lost by design.
-    void rebaud(uint32_t baud) { begin(baud); }
+    // Re-program the port at a new rate.  Goes through end() so the core
+    // disables the transmitter/receiver and drains any in-flight TX before the
+    // BAUD divider is rewritten, then begin() re-attaches the RX extension.
+    // Call ONLY after the controller has acknowledged its own rate change and
+    // the line is idle: the ring's buffered bytes are discarded, by design.
+    void rebaud(uint32_t baud) { end(); begin(baud); }
     size_t   write(const uint8_t *p, size_t n) override;
     int      available() override;
     int      read() override;
