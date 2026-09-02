@@ -119,8 +119,8 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     if (m_target < 0) { logf("connect=fail reason=no_inquiry_hit"); return NO_INQUIRY_HIT; }
 
     Hit &d = m_hits[m_target];
-    memcpy((void *)m_bd, d.bd, 6); m_psrm = d.psrm; m_clk = d.clk;
-    char tbs[18]; hciFormatBd((const uint8_t *)m_bd, tbs);
+    memcpy(m_bd, d.bd, 6); m_psrm = d.psrm; m_clk = d.clk;
+    char tbs[18]; hciFormatBd(m_bd, tbs);
     logf("connect: target=%s name=\"%s\"", tbs, d.named ? d.name : "?");
 
     // Enable ALL HCI events, incl. the SSP request events (0x31-0x36) which sit
@@ -136,7 +136,7 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
 
     // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
     uint8_t p[13];
-    memcpy(p, (const void *)m_bd, 6);
+    memcpy(p, m_bd, 6);
     p[6] = 0x18; p[7] = 0xCC;
     p[8] = m_psrm; p[9] = 0x00;
     p[10] = (uint8_t)(m_clk & 0xFF);
@@ -259,7 +259,7 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
             for (uint8_t i = 0; i < m_nHits; i++) {
                 if (memcmp(m_hits[i].bd, nm.bd, 6) != 0) continue;
                 m_hits[i].nameStatus = nm.status;
-                memcpy(m_hits[i].name, nm.name, sizeof m_hits[i].name);
+                memcpy(m_hits[i].name, nm.name, strlen(nm.name) + 1);
                 m_hits[i].named = true;     // per-hit flag -- see the Hit comment in BtLink.h
                 break;
             }

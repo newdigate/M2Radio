@@ -17,12 +17,16 @@ public:
     Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection
     Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first; on failure Write_Simple_Pairing_Mode=0 and retry with PIN
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);   // forward from the app's Hci::EventFn
-    uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return (const uint8_t *)m_bd; }
+    uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return m_bd; }
     bool encrypted() const { return m_encrypted; } const char *pairedBy() const { return m_pairedBy; }
 private:
     void logf(const char *fmt, ...);                            // vsnprintf into m_lb; emit via m_log if set
     Hci &m_hci; LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[320];
-    volatile uint16_t m_handle = 0; volatile uint8_t m_bd[6] = {0}; volatile uint8_t m_psrm = 0; volatile uint16_t m_clk = 0;
+    volatile uint16_t m_handle = 0;
+    // non-volatile: published to readers under the same idle()-call memory barrier as the volatile scalars;
+    // volatile on an array copied via memcpy is inert anyway
+    uint8_t m_bd[6] = {0};
+    volatile uint8_t m_psrm = 0; volatile uint16_t m_clk = 0;
     char m_pin[4] = {'1','2','3','4'}; const char *m_pairedBy = "none";
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;
