@@ -36,6 +36,10 @@ struct Avdtp {
 private:
     L2cap *m_l2 = nullptr; L2cap::Channel *m_sig = nullptr, *m_media = nullptr; uint16_t m_sigCid = 0, m_mediaCid = 0;
     State m_state = IDLE; uint8_t m_tl = 1, m_acp = 0, m_err = 0; SbcConfig m_want; SbcCaps m_caps;
-    volatile bool m_rspSeen = false; uint8_t m_rsp[64]; uint16_t m_rspLen = 0; bool m_peerDiscover = false; uint8_t m_peerHdr = 0;
-    void send(const uint8_t *b, uint16_t n) { m_l2->send(m_sig->remoteCid, b, n); }
+    // 172: big enough for a GET_CAPABILITIES reply carrying every AVDTP service category, not just MEDIA_CODEC.
+    volatile bool m_rspSeen = false; uint8_t m_rsp[172]; uint16_t m_rspLen = 0; bool m_peerDiscover = false; uint8_t m_peerHdr = 0;
+    bool m_truncated = false;   // an incoming PDU exceeded sizeof m_rsp and was cut down; diagnosis only, not exposed
+    // Returns false if L2cap's TXQ was full and the command was NOT queued -- callers must not advance
+    // state on a false return (BT-1's stuck-credit disease: advancing while nothing reached the wire hangs forever).
+    bool send(const uint8_t *b, uint16_t n) { return m_l2->send(m_sig->remoteCid, b, n); }
 };

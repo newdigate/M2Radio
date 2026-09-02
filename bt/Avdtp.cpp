@@ -30,21 +30,35 @@ bool Avdtp::parseSbcCaps(const uint8_t *p, uint16_t len, SbcCaps &c) {
         if (cat == 0x07 && l >= 6 && i + 2 + 6 <= len && p[i + 2] == 0x00 && p[i + 3] == 0x00) { const uint8_t *e = p + i + 4;
             c.rates = (uint8_t)(e[0] >> 4); c.modes = (uint8_t)(e[0] & 0x0F); c.blocks = (uint8_t)(e[1] >> 4);
             c.subbands = (uint8_t)((e[1] >> 2) & 0x03); c.alloc = (uint8_t)(e[1] & 0x03); c.minBitpool = e[2]; c.maxBitpool = e[3]; return true; }
+        if ((uint32_t)i + 2 + l >= len) break;   // widen: a 16-bit i+2+l can wrap and re-enter the buffer, looping forever
         i = (uint16_t)(i + 2 + l); }
     return false;
 }
-void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) { m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1; }
+void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
+    m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1;
+    m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false;
+}
 bool Avdtp::start(const SbcConfig &want) { m_sig = m_l2->byLocal(m_sigCid); if (!m_sig || m_sig->state != L2cap::OPEN) return false;
     m_want = want; m_state = DISCOVERING; m_rspSeen = false; uint8_t b[4]; send(b, buildDiscover(b, m_tl)); return true; }
 void Avdtp::onSignalling(const uint8_t *p, uint16_t len) {
-    if (len < 2) return;
-    if (responseType(p[0]) == COMMAND) { if (p[1] == 0x01) { m_peerDiscover = true; m_peerHdr = p[0]; } return; }   // peer's own DISCOVER: answered in service()
-    if (len > sizeof m_rsp) len = sizeof m_rsp; memcpy(m_rsp, p, len); m_rspLen = len; m_rspSeen = true;
+    if (len < 1) return;
+    if (responseType(p[0]) == COMMAND) { if (len >= 2 && p[1] == 0x01) { m_peerDiscover = true; m_peerHdr = p[0]; } return; }   // peer's own DISCOVER: answered in service()
+    if ((p[0] >> 4) != (m_tl & 0x0F)) return;   // stray/duplicate/late PDU -- not a response to our outstanding command
+    if (len > sizeof m_rsp) { m_truncated = true; len = (uint16_t)sizeof m_rsp; }   // diagnosis only; still record what fits
+    memcpy(m_rsp, p, len); m_rspLen = len; m_rspSeen = true;
 }
 void Avdtp::service() {
-    if (m_peerDiscover) { m_peerDiscover = false; uint8_t b[4]; send(b, buildDiscoverAcceptOneSource(b, m_peerHdr)); }
-    if (m_state == MEDIA_CONNECTING) { if (m_media && m_media->state == L2cap::OPEN) { m_state = STARTING; m_rspSeen = false; uint8_t b[4]; send(b, buildStart(b, ++m_tl, m_acp)); }
-                                       return; }
+    if (m_peerDiscover) { uint8_t b[4]; if (send(b, buildDiscoverAcceptOneSource(b, m_peerHdr))) m_peerDiscover = false; }   // else: TXQ full, retry next tick
+    if (m_state == MEDIA_CONNECTING) {
+        if (m_media && m_media->state == L2cap::CLOSED) { m_err = 0xFC; m_state = FAILED; return; }
+        if (m_media && m_media->state == L2cap::OPEN) {
+            uint8_t b[4]; uint16_t n = buildStart(b, (uint8_t)(m_tl + 1), m_acp);
+            if (send(b, n)) { m_tl++; m_state = STARTING; m_rspSeen = false; }
+            // else: TXQ full, retry next tick -- m_media stays OPEN so the next service() call resends with the same tl
+        }
+        // "peer accepts the channel but never drives it to OPEN": Avdtp has no clock of its own; bounded by the caller's outer timeout.
+        return;
+    }
     if (!m_rspSeen) return; m_rspSeen = false;
     if (responseType(m_rsp[0]) != ACCEPT) { m_err = rejectError(m_rsp, m_rspLen); m_state = FAILED; return; }
     uint8_t b[16];
@@ -52,11 +66,16 @@ void Avdtp::service() {
     case DISCOVERING: { Sep s[4]; uint8_t n = parseDiscover(m_rsp, m_rspLen, s, 4); m_acp = 0;
         for (uint8_t i = 0; i < n; i++) if (s[i].audio && s[i].sink && !s[i].inUse) { m_acp = s[i].seid; break; }
         if (!m_acp) { m_err = 0xFF; m_state = FAILED; return; }
-        m_state = GETTING_CAPS; send(b, buildGetCapabilities(b, ++m_tl, m_acp)); } break;
-    case GETTING_CAPS: if (!parseSbcCaps(m_rsp, m_rspLen, m_caps)) { m_err = 0xFE; m_state = FAILED; return; }
-        m_state = CONFIGURING; send(b, buildSetConfiguration(b, ++m_tl, m_acp, 1, m_want)); break;
-    case CONFIGURING: m_state = OPENING; send(b, buildOpen(b, ++m_tl, m_acp)); break;
-    case OPENING: m_state = MEDIA_CONNECTING; m_media = m_l2->connect(PSM, m_mediaCid); break;   // second channel = media transport
+        uint16_t n2 = buildGetCapabilities(b, (uint8_t)(m_tl + 1), m_acp);
+        if (send(b, n2)) { m_tl++; m_state = GETTING_CAPS; } else m_rspSeen = true; } break;   // retry: re-parse m_rsp next tick (idempotent)
+    case GETTING_CAPS: { if (!parseSbcCaps(m_rsp, m_rspLen, m_caps)) { m_err = 0xFE; m_state = FAILED; return; }
+        uint16_t n2 = buildSetConfiguration(b, (uint8_t)(m_tl + 1), m_acp, 1, m_want);
+        if (send(b, n2)) { m_tl++; m_state = CONFIGURING; } else m_rspSeen = true; } break;
+    case CONFIGURING: { uint16_t n2 = buildOpen(b, (uint8_t)(m_tl + 1), m_acp);
+        if (send(b, n2)) { m_tl++; m_state = OPENING; } else m_rspSeen = true; } break;
+    case OPENING: m_media = m_l2->connect(PSM, m_mediaCid);                     // second channel = media transport
+        if (!m_media) { m_err = 0xFD; m_state = FAILED; break; }
+        m_state = MEDIA_CONNECTING; break;
     case STARTING: m_state = STREAMING; break;
     default: break;
     }
