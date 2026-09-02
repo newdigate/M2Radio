@@ -33,14 +33,19 @@ public:
     uint32_t dropped() const { return m_dropped; }
     void     acceptIncoming(bool yes) { m_accept = yes; }          // peer-initiated channels (answered with our next free CID)
 private:
-    struct Tx { uint16_t cid; uint16_t len; uint8_t buf[700]; bool used; };
+    static const uint16_t MAX_PAYLOAD = 700;
+    struct Tx { uint16_t cid; uint16_t len; uint8_t buf[MAX_PAYLOAD]; };
     static const uint8_t TXQ = 8;
-    void sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command
+    bool sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command; false if the txq is full
     void handleSig(const uint8_t *d, uint16_t len);
-    HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits; bool m_accept;
+    HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits, m_maxCredits; bool m_accept;
     Channel m_ch[MAX_CHANNELS]; uint8_t m_nextId; uint16_t m_nextCid;
     Tx m_txq[TXQ]; uint8_t m_txHead, m_txCount; uint32_t m_dropped;
+    // Only one request of each type is buffered between service() calls -- fine because service()
+    // runs every main-loop pass; a same-type burst within one pass would drop the earlier one.
     struct Pending { bool infoReq; uint8_t infoId; uint16_t infoType; bool echoReq; uint8_t echoId;
-                     bool connReq; uint8_t connId; uint16_t connPsm, connScid; } m_p;
+                     bool connReq; uint8_t connId; uint16_t connPsm, connScid;
+                     bool connRspReady; uint16_t connRspLocal, connRspRes;   // CONN_RSP computed once; sig() retried until it succeeds
+                     bool discReq; uint8_t discId; uint8_t discBytes[4]; } m_p;
     DataFn m_onData; void *m_dataCtx;
 };

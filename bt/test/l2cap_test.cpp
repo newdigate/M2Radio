@@ -52,5 +52,24 @@ int main() {
         l.onEvent(0x13, ncp, 5); l.service();
         CHECK(io.tx.size() == 3); CHECK(l.credits() == 0);
     }
+    {   // 4. Hostile CFG_REQ: cmdLen claims 65528 (optLen 65524) but only 1 option byte actually arrived (13-byte frame) --
+        // must clamp to what's present (avail), never read/echo past the end of the received buffer (review, over-read).
+        CapIo io; L2cap l(io); l.begin(0x0001, 7);
+        L2cap::Channel *ch = l.connect(0x0019, 0x0041);
+        std::vector<uint8_t> rsp = l2(0x0001, {0x03, 0x10, 8, 0, 0x40, 0x03, 0x41, 0x00, 0, 0, 0, 0});
+        l.onAcl(0x0001, rsp.data(), (uint16_t)rsp.size());
+        std::vector<uint8_t> req = l2(0x0001, {0x04, 1, 0xF8, 0xFF, 0x41, 0x00, 0, 0, 0xAA}); // cmdLen=65528, 1 opt byte present
+        CHECK(req.size() == 13);
+        io.tx.clear();
+        l.onAcl(0x0001, req.data(), (uint16_t)req.size());
+        CHECK(ch->optLen <= 1);                                                    // clamped to avail (1), not the claimed cmdLen
+        l.service();
+        bool found = false;
+        for (auto &t : io.tx) if (t.size() >= 9 + 4 && t[9] == 0x05) {             // Config Response
+            found = true;
+            CHECK(t.size() <= 9 + 10 + ch->optLen);                                // no longer than 10+optLen -- nothing over-read is echoed back
+        }
+        CHECK(found);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
