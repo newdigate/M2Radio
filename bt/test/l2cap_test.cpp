@@ -71,5 +71,31 @@ int main() {
         }
         CHECK(found);
     }
+    {   // 5. A retained CONN_RSP retry must stay faithful to the request it was computed for -- not a later one that
+        // overwrote the live pending fields while the retry was still stuck behind a full txq (review, cross-request mix-up).
+        CapIo io; L2cap l(io); l.begin(0x0001, 4);
+        l.acceptIncoming(true);
+        uint8_t filler[4] = { 9, 9, 9, 9 };
+        int filled = 0;
+        while (l.send(0x0340, filler, 4)) filled++;                            // saturate the txq
+        CHECK(filled > 0);
+        std::vector<uint8_t> req1 = l2(0x0001, {0x02, 0x21, 4, 0, 0x19, 0x00, 0x11, 0x01}); // CONN_REQ #1: id=0x21 psm=0x0019 scid=0x0111
+        l.onAcl(0x0001, req1.data(), (uint16_t)req1.size());
+        l.service();                                                           // allocates + snapshots #1's identity; txq still full -> send fails, stays pending
+        std::vector<uint8_t> req2 = l2(0x0001, {0x02, 0x22, 4, 0, 0x19, 0x00, 0x22, 0x02}); // DISTINCT CONN_REQ #2: id=0x22 scid=0x0222
+        l.onAcl(0x0001, req2.data(), (uint16_t)req2.size());                   // overwrites the LIVE m_p.connId/connScid; must not reach the snapshot
+        bool found = false; uint8_t connId = 0; uint16_t connScid = 0;
+        for (int i = 0; i < 20 && !found; i++) {                               // drip credits back in and retry until the retained CONN_RSP drains out
+            uint8_t ncp[5] = { 1, 0x01, 0x00, 4, 0 };                          // restore credits (capped at maxCredits) so the queue can empty
+            l.onEvent(0x13, ncp, 5);
+            l.service();
+            for (auto &t : io.tx) if (t.size() >= 9 + 12 && t[9] == 0x03) {    // CONN_RSP
+                found = true; connId = t[9 + 1]; connScid = (uint16_t)(t[9 + 6] | (t[9 + 7] << 8));
+            }
+        }
+        CHECK(found);
+        CHECK(connId == 0x21);                                                 // #1's id, never #2's 0x22
+        CHECK(connScid == 0x0111);                                             // #1's scid, never #2's 0x0222
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

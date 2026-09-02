@@ -85,20 +85,24 @@ void L2cap::service() {
         if (!m_p.connRspReady) {                                                          // compute the outcome ONCE; retries only resend it
             Channel *ch = nullptr;
             if (m_accept) for (auto &c : m_ch) if (c.state == FREE || c.state == CLOSED) { ch = &c; break; }
+            m_p.connRspId = m_p.connId; m_p.connRspScid = m_p.connScid;                   // snapshot NOW: a later CONN_REQ must not touch these
             m_p.connRspRes = ch ? 0x0000 : 0x0004; m_p.connRspLocal = 0;                  // 0x0004 = no resources
             if (ch) { memset(ch, 0, sizeof *ch); ch->state = CONFIG; ch->psm = m_p.connPsm; ch->remoteCid = m_p.connScid;
                       ch->localCid = m_p.connRspLocal = m_nextCid++; ch->mtuOut = 672; ch->mtuIn = 672; ch->peerInitiated = true; }
             m_p.connRspReady = true;
         }
-        uint8_t r[12] = { CONN_RSP, m_p.connId, 8, 0, (uint8_t)m_p.connRspLocal, (uint8_t)(m_p.connRspLocal >> 8),
-                          (uint8_t)m_p.connScid, (uint8_t)(m_p.connScid >> 8), (uint8_t)m_p.connRspRes, (uint8_t)(m_p.connRspRes >> 8), 0, 0 };
+        // Built ENTIRELY from the snapshot above -- never from live m_p.connId/connScid, which a second CONN_REQ
+        // arriving mid-retry has already overwritten (harmlessly: connRspReady stays gating out its allocation).
+        uint8_t r[12] = { CONN_RSP, m_p.connRspId, 8, 0, (uint8_t)m_p.connRspLocal, (uint8_t)(m_p.connRspLocal >> 8),
+                          (uint8_t)m_p.connRspScid, (uint8_t)(m_p.connRspScid >> 8), (uint8_t)m_p.connRspRes, (uint8_t)(m_p.connRspRes >> 8), 0, 0 };
         if (sig(r, 12)) { m_p.connReq = false; m_p.connRspReady = false; }
     }
     if (m_p.discReq) { uint8_t r[8] = { DISC_RSP, m_p.discId, 4, 0, m_p.discBytes[0], m_p.discBytes[1], m_p.discBytes[2], m_p.discBytes[3] };
         if (sig(r, 8)) m_p.discReq = false; }
     for (auto &ch : m_ch) {
         if (ch.state == CONFIG && !ch.cfgReqSent) {                                       // our Config Request: no options (defaults)
-            uint8_t c[8] = { CFG_REQ, m_nextId++, 4, 0, (uint8_t)ch.remoteCid, (uint8_t)(ch.remoteCid >> 8), 0, 0 }; sig(c, 8); ch.cfgReqSent = true; }
+            uint8_t c[8] = { CFG_REQ, m_nextId++, 4, 0, (uint8_t)ch.remoteCid, (uint8_t)(ch.remoteCid >> 8), 0, 0 };
+            if (sig(c, 8)) ch.cfgReqSent = true; }
         if (ch.state == CONFIG && ch.cfgReqSeen && !ch.cfgRspSent) {
             uint8_t r[10 + MAX_OPTS]; uint16_t n = (uint16_t)(6 + ch.optLen);
             r[0] = CFG_RSP; r[1] = ch.cfgReqId; r[2] = (uint8_t)n; r[3] = (uint8_t)(n >> 8);

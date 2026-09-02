@@ -45,7 +45,10 @@ private:
     // runs every main-loop pass; a same-type burst within one pass would drop the earlier one.
     struct Pending { bool infoReq; uint8_t infoId; uint16_t infoType; bool echoReq; uint8_t echoId;
                      bool connReq; uint8_t connId; uint16_t connPsm, connScid;
-                     bool connRspReady; uint16_t connRspLocal, connRspRes;   // CONN_RSP computed once; sig() retried until it succeeds
+                     // CONN_RSP is computed once and SNAPSHOTTED here; the retried transmit in service() builds the
+                     // frame entirely from these four fields, never from the live connId/connScid above -- a second
+                     // CONN_REQ overwriting those mid-retry must not splice its identity onto the pending response.
+                     bool connRspReady; uint8_t connRspId; uint16_t connRspLocal, connRspScid, connRspRes;
                      bool discReq; uint8_t discId; uint8_t discBytes[4]; } m_p;
     DataFn m_onData; void *m_dataCtx;
 };
