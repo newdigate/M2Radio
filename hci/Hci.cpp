@@ -92,6 +92,16 @@ void Hci::service() {
         if (m_resync) continue;                  // discard until the line has been idle
         m_parser.feed((uint8_t)b);
     }
+    // Re-read the clock AFTER the drain.  A packet delivered by the drain can
+    // run a callback that submit()s a command, and dispatch() stamps m_sentAt
+    // with a fresh clock -- later than the `now` captured above once the drain
+    // has spent a few milliseconds (printing inside a callback is enough).  The
+    // unsigned (now - m_sentAt) below then underflows and the command times out
+    // in the SAME pass it was sent: measured on silicon as SSP replies "timing
+    // out" 3-4 ms after submit and their prompt acks counted as late.  The
+    // stale `now` is still the right stamp for the bytes above (it is never
+    // later than they are), so only the checks move to the fresh clock.
+    now = m_io.nowMs();
     if (m_resync && (now - m_lastByteAt) >= IDLE_RESYNC_MS) { m_resync = false; m_parser.reset(); }
     if (m_inflight && (now - m_sentAt) >= m_timeoutMs) {
         m_timeouts++;

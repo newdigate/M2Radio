@@ -213,6 +213,48 @@ int main() {
         hci.service();
         CHECK(io.writes == 1);                  // resync released: the queued command is sent now
     }
+    {   // 15. A command submitted from an event callback DURING a drain must not
+        //     time out in the same pass.  dispatch() stamps m_sentAt with a
+        //     fresh clock, later than the `now` service() captured at the top
+        //     of the pass once the drain has spent a few milliseconds; the
+        //     timeout check used that stale `now`, so (now - m_sentAt)
+        //     underflowed and the command "timed out" immediately -- measured
+        //     on silicon as SSP replies failing 3-4 ms after submit with their
+        //     prompt acks counted as late.  The per-byte ticking clock is what
+        //     makes the drain take time here, as printing inside a callback
+        //     does on the board.
+        struct TickingIo : HciIo {
+            std::vector<uint8_t> tx;
+            std::deque<uint8_t>  rx;
+            uint32_t now = 0;
+            int writes = 0;
+            size_t write(const uint8_t *p, size_t n) override { tx.insert(tx.end(), p, p + n); writes++; return n; }
+            int available() override { return (int)rx.size(); }
+            int read() override { if (rx.empty()) return -1; uint8_t b = rx.front(); rx.pop_front(); now += 1; return b; }
+            uint32_t nowMs() override { return now; }
+            void deliver(std::initializer_list<uint8_t> b) { rx.insert(rx.end(), b); }
+        };
+        TickingIo io; Hci hci(io); hci.begin();
+        static int s_done = 0; static Hci::Error s_err = Hci::OK;
+        struct Ctx { Hci *hci; } ctx = { &hci };
+        hci.onEvent([](void *c, uint8_t code, const uint8_t *, uint8_t) {
+            if (code == 0x31)                   // IO_Capability_Request: reply from inside the drain
+                ((Ctx *)c)->hci->submit(0x042B, nullptr, 0,
+                    [](void *, Hci::Error e, const Hci::Reply *) { s_done++; s_err = e; }, nullptr);
+        }, &ctx);
+        // 20 bytes of unrelated events first so the drain's clock runs well
+        // past the top-of-pass `now` before the IO cap request arrives.
+        for (int i = 0; i < 5; i++) io.deliver({0x04, 0x1B, 0x02, 0x00, 0x00});   // Max Slots Change x5
+        io.deliver({0x04, 0x31, 0x06, 1, 2, 3, 4, 5, 6});                           // IO_Capability_Request
+        hci.service();
+        CHECK(io.writes == 1);                  // the reply was sent from the callback
+        CHECK(hci.timeouts() == 0);             // and NOT timed out in the same pass
+        CHECK(s_done == 0);                     // still in flight
+        io.deliver({0x04, 0x0E, 0x04, 0x01, 0x2B, 0x04, 0x00});                     // its Command Complete
+        hci.service();
+        CHECK(s_done == 1 && s_err == Hci::OK); // completes normally
+        CHECK(hci.late() == 0);                 // and is not mistaken for a late reply
+    }
     printf("hci_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
