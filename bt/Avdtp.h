@@ -33,12 +33,14 @@ struct Avdtp {
     State state() const { return m_state; } uint8_t error() const { return m_err; } const SbcCaps &caps() const { return m_caps; }
     uint8_t acpSeid() const { return m_acp; } uint16_t mediaRemoteCid() const { return m_media ? m_media->remoteCid : 0; }
     uint16_t mediaMtu() const { return m_media ? m_media->mtuOut : 0; }
+    bool truncated() const { return m_truncated; }   // an incoming PDU exceeded the m_rsp buffer and was cut down
 private:
     L2cap *m_l2 = nullptr; L2cap::Channel *m_sig = nullptr, *m_media = nullptr; uint16_t m_sigCid = 0, m_mediaCid = 0;
     State m_state = IDLE; uint8_t m_tl = 1, m_acp = 0, m_err = 0; SbcConfig m_want; SbcCaps m_caps;
     // 172: big enough for a GET_CAPABILITIES reply carrying every AVDTP service category, not just MEDIA_CODEC.
     volatile bool m_rspSeen = false; uint8_t m_rsp[172]; uint16_t m_rspLen = 0; bool m_peerDiscover = false; uint8_t m_peerHdr = 0;
-    bool m_truncated = false;   // an incoming PDU exceeded sizeof m_rsp and was cut down; diagnosis only, not exposed
+    bool m_truncated = false;   // an incoming PDU exceeded sizeof m_rsp and was cut down; diagnosis only
+    bool m_kickoff = false;     // start() sets this; service() retries the initial DISCOVER until it actually enqueues
     // Returns false if L2cap's TXQ was full and the command was NOT queued -- callers must not advance
     // state on a false return (BT-1's stuck-credit disease: advancing while nothing reached the wire hangs forever).
     bool send(const uint8_t *b, uint16_t n) { return m_l2->send(m_sig->remoteCid, b, n); }

@@ -36,10 +36,10 @@ bool Avdtp::parseSbcCaps(const uint8_t *p, uint16_t len, SbcCaps &c) {
 }
 void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
     m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1;
-    m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false;
+    m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false; m_kickoff = false;
 }
 bool Avdtp::start(const SbcConfig &want) { m_sig = m_l2->byLocal(m_sigCid); if (!m_sig || m_sig->state != L2cap::OPEN) return false;
-    m_want = want; m_state = DISCOVERING; m_rspSeen = false; uint8_t b[4]; send(b, buildDiscover(b, m_tl)); return true; }
+    m_want = want; m_state = DISCOVERING; m_rspSeen = false; m_kickoff = true; return true; }
 void Avdtp::onSignalling(const uint8_t *p, uint16_t len) {
     if (len < 1) return;
     if (responseType(p[0]) == COMMAND) { if (len >= 2 && p[1] == 0x01) { m_peerDiscover = true; m_peerHdr = p[0]; } return; }   // peer's own DISCOVER: answered in service()
@@ -49,6 +49,7 @@ void Avdtp::onSignalling(const uint8_t *p, uint16_t len) {
 }
 void Avdtp::service() {
     if (m_peerDiscover) { uint8_t b[4]; if (send(b, buildDiscoverAcceptOneSource(b, m_peerHdr))) m_peerDiscover = false; }   // else: TXQ full, retry next tick
+    if (m_kickoff) { uint8_t b[4]; if (send(b, buildDiscover(b, m_tl))) m_kickoff = false; return; }   // else: TXQ full, retry next tick; tl unchanged so it still matches the eventual response
     if (m_state == MEDIA_CONNECTING) {
         if (m_media && m_media->state == L2cap::CLOSED) { m_err = 0xFC; m_state = FAILED; return; }
         if (m_media && m_media->state == L2cap::OPEN) {
