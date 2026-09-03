@@ -69,6 +69,16 @@ int main() {
         CHECK(delivered == 64);
         CHECK(s.pkt[0][13 + 4] == 4);                         // first surviving frame's id byte is 4, not 0
     }
+    {   // 5. advanceRd: monotonic-forward commit that never clobbers a concurrent drop.
+        //    cur = m_rd now (maybe advanced by an ISR drop since gather); rd0 = index
+        //    drain gathered from; n = frames drain consumed.
+        CHECK(MediaPacketizer::advanceRd(10, 10, 3) == 13);   // no drop: land on rd0+n
+        CHECK(MediaPacketizer::advanceRd(12, 10, 3) == 13);   // ISR dropped 2 (<n): still rd0+n
+        CHECK(MediaPacketizer::advanceRd(13, 10, 3) == 13);   // ISR dropped exactly n: equal, keep
+        CHECK(MediaPacketizer::advanceRd(14, 10, 3) == 14);   // ISR dropped >n: keep ISR's further pos
+        CHECK(MediaPacketizer::advanceRd(64, 63, 3) == 1);    // wrap: (63+3)%65 == 1
+        CHECK(MediaPacketizer::advanceRd(1, 63, 3) == 1);     // ISR wrapped past rd0+n: keep cur
+    }
     printf("mediapacketizer_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

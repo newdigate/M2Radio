@@ -31,6 +31,12 @@ public:
     uint32_t packets()       const { return m_packets; }
     uint32_t drops()         const { return m_drops; }
     uint8_t  queueHighWater() const { return m_hw; }
+    // Monotonic-forward read-pointer advance used by drain()'s commit so a
+    // concurrent push()-drop never clobbers m_rd.  Exposed for unit test.
+    static uint8_t advanceRd(uint8_t cur, uint8_t rd0, uint8_t n);
+    // Whole SBC frames batched per RTP/L2CAP packet (from the negotiated MTU).
+    // Logged by bt_tone_test to verify batching (spec target: >= 5).
+    uint16_t framesPerPacket() const { return m_perPkt; }
 private:
     uint8_t  count() const;                 // frames currently queued
     uint8_t  m_buf[RING][FRAME_MAX]; uint16_t m_len[RING];
