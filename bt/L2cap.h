@@ -32,8 +32,17 @@ public:
     uint8_t  credits() const { return m_credits; }
     uint32_t dropped() const { return m_dropped; }
     void     acceptIncoming(bool yes) { m_accept = yes; }          // peer-initiated channels (answered with our next free CID)
-private:
+    // Largest L2CAP payload send() will accept (== one Tx buffer).  A larger
+    // payload is DROPPED, not fragmented -- this is basic mode with one ACL
+    // packet per SDU -- so a media producer MUST cap its packet at this value.
+    // ★ 700 is the WORKING size measured on silicon 2026-09-03: a 5-SBC-frame
+    // A2DP media packet (RTP 13 + 5*119 = 608 B, 612 B ACL) streams to the ESP32
+    // sink, while an 8-frame / 965 B packet (969 B ACL) is not carried by the
+    // BR/EDR link -- it stalls after the partial ramp-up packets.  The controller's
+    // ACL data limit sits between the two; do not raise this without confirming
+    // the link (and adding ACL fragmentation) or media will wedge.
     static const uint16_t MAX_PAYLOAD = 700;
+private:
     struct Tx { uint16_t cid; uint16_t len; uint8_t buf[MAX_PAYLOAD]; };
     static const uint8_t TXQ = 8;
     bool sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command; false if the txq is full
