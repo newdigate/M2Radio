@@ -14,6 +14,11 @@ static inline void     mp_irq_restore(uint32_t) {}
 // drain() wants m_rd = rd0 + n.  If push() (ISR) advanced m_rd past that while we
 // were sending (it dropped >= n oldest frames), keep the ISR's further position;
 // never move m_rd backward.  All arithmetic is mod RING, so it is wrap-safe.
+// Assumption: the mod-RING distance below cannot distinguish 0 ISR drops from
+// exactly RING (65) drops inside one drain() gather+send window -- a full lap
+// reads as "nothing moved".  This assumes drain() runs at least once per ~64
+// dropped frames (~188 ms at the nominal frame rate); only a drain() stall at
+// least that long (e.g. an L2CAP send already wedged) would violate it.
 uint8_t MediaPacketizer::advanceRd(uint8_t cur, uint8_t rd0, uint8_t n) {
     uint8_t moved = (uint8_t)(((int)cur - (int)rd0 + RING) % RING);
     if (moved >= n) return cur;
@@ -23,19 +28,34 @@ uint8_t MediaPacketizer::advanceRd(uint8_t cur, uint8_t rd0, uint8_t n) {
 // so RING=65 gives 64 usable frames.  push() (producer/audio ISR) writes m_wr, and
 // ALSO advances m_rd when it drops the oldest on a full ring; drain() (consumer/main
 // loop) advances m_rd on a successful send.  m_rd therefore has TWO writers.
-// CLOSED: drain()'s commit no longer clobbers a concurrent drop.  It captures rd0
-// (the index it started gathering from) before sending, then commits through
+// CLOSED (this fix), and only this: the m_rd POINTER BOOKKEEPING race.  drain()'s
+// commit no longer clobbers a concurrent drop.  It captures rd0 (the index it
+// started gathering from) before sending, then commits through
 // advanceRd(m_rd, rd0, n) inside a PRIMASK critical section (mp_irq_save/restore
 // above -- __disable_irq/__enable_irq on ARM, a no-op on host) so push()'s
 // drop-oldest write can't interleave with the read-modify-write.  advanceRd() only
 // ever moves m_rd forward: if the ISR has already advanced it past rd0+n (it
 // dropped >= n oldest frames while we were sending), the ISR's further position is
-// kept rather than being rebased backward.  So drops==0 (the phase-4 target) stays
-// sound rather than merely quiet, and the drops>0 backpressure regime -- previously
-// a benign race that could resurface a sacrificed slot or double-send a
-// drop-counted frame -- is race-free too.  Byte loads/stores of m_wr/m_rd are
+// kept rather than being rebased backward.  Byte loads/stores of m_wr/m_rd are
 // single-copy-atomic on Cortex-M7, so no torn reads and no barrier is needed beyond
-// the critical section.  count() below only reads m_wr/m_rd, never writes either.
+// the critical section.
+// NOT closed by this fix -- still a live, pre-existing concern whenever drops>0:
+// the FRAME-BUFFER CONTENTS (m_buf/m_len) that drain()'s gather loop below reads
+// are unprotected.  Under sustained backpressure, push() can overwrite a m_buf/
+// m_len slot that drain() is concurrently reading out of; fixing m_rd's pointer
+// arithmetic does nothing for that, and it was out of scope for this task. The
+// mitigation is architectural, not code here: hardware RXRTSE flow control (the
+// larger phase-5 sub-project) is meant to keep the ring from ever filling, i.e.
+// drops==0.  With drops==0, push() never overwrites a slot drain() is reading, so
+// the buffer-content race is simply not exercised -- it is mitigated, not fixed,
+// and remains open on the drops>0 path.  "Race-free" below refers only to the
+// m_rd pointer arithmetic, not to m_buf/m_len.
+// Accounting note: m_drops (drops(), declared in the header) can OVERCOUNT frames
+// actually lost to the peer.  If push() drops k frames that drain() had already
+// gathered/sent in the same window, those k frames are both counted in m_drops and
+// actually transmitted, so drops() is an upper bound in the drops>0 regime, not an
+// exact count.  This is an accounting note only; behavior is unchanged.
+// count() below only reads m_wr/m_rd, never writes either.
 uint8_t MediaPacketizer::count() const {
     return (uint8_t)(((int)m_wr - (int)m_rd + RING) % RING);
 }
