@@ -21,6 +21,11 @@ public:
     explicit L2cap(HciIo &io) : m_io(io) {}
     void begin(uint16_t aclHandle, uint8_t aclCredits, uint16_t aclMax = 1021);
     void onData(DataFn fn, void *ctx) { m_onData = fn; m_dataCtx = ctx; }
+    // Optional raw-ACL trace: fires for every inbound ACL (before demux) and every
+    // outbound ACL, handing over the L2CAP PDU (2-byte length, CID, payload) plus
+    // the handle.  Diagnostic only -- off unless set.  Arduino-free (callback).
+    typedef void (*TraceFn)(void *ctx, bool out, uint16_t handle, const uint8_t *l2capPdu, uint16_t len);
+    void onAclTrace(TraceFn fn, void *ctx) { m_trace = fn; m_traceCtx = ctx; }
     // --- RX (record only) ---
     void onAcl(uint16_t handle, const uint8_t *d, uint16_t len);   // Hci::AclFn payload
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);      // needs 0x13 only
@@ -60,4 +65,5 @@ private:
                      bool connRspReady; uint8_t connRspId; uint16_t connRspLocal, connRspScid, connRspRes;
                      bool discReq; uint8_t discId; uint8_t discBytes[4]; } m_p;
     DataFn m_onData; void *m_dataCtx;
+    TraceFn m_trace = nullptr; void *m_traceCtx = nullptr;
 };

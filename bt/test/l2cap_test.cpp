@@ -97,5 +97,26 @@ int main() {
         CHECK(connId == 0x21);                                                 // #1's id, never #2's 0x22
         CHECK(connScid == 0x0111);                                             // #1's scid, never #2's 0x0222
     }
+    {   // N. onAclTrace fires for inbound (a fed ACL) and outbound (a queued send), with the L2CAP PDU + handle.
+        struct Cap { struct Rec { bool out; uint16_t handle; std::vector<uint8_t> pdu; }; std::vector<Rec> recs; };
+        static Cap cap;   // static so the C-style callback can reach it
+        cap.recs.clear();
+        CapIo io; L2cap l(io); l.begin(0x0001, 7);
+        l.onAclTrace([](void *, bool out, uint16_t h, const uint8_t *p, uint16_t n) {
+            cap.recs.push_back({ out, h, std::vector<uint8_t>(p, p + n) }); }, nullptr);
+        // Inbound: feed an L2CAP Info Request on the signalling CID 0x0001.
+        std::vector<uint8_t> in = l2(0x0001, { 0x0A, 0x01, 0x02, 0x00, 0x02, 0x00 });  // INFO_REQ
+        l.onAcl(0x0001, in.data(), (uint16_t)in.size());
+        // Outbound: connect() queues a Connection Request; service() writes it.
+        l.connect(0x0019, 0x0041); l.service();
+        bool sawIn = false, sawOut = false;
+        for (auto &r : cap.recs) {
+            if (!r.out) { sawIn = true; CHECK(r.handle == 0x0001);
+                          CHECK(r.pdu.size() >= 4 && r.pdu[2] == 0x01 && r.pdu[3] == 0x00); }   // CID 0x0001
+            else        { sawOut = true; CHECK(r.handle == 0x0001);
+                          CHECK(r.pdu.size() >= 4 && r.pdu[0] == (uint8_t)(r.pdu.size() - 4)); } // L2CAP len field
+        }
+        CHECK(sawIn); CHECK(sawOut);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

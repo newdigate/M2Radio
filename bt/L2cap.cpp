@@ -34,6 +34,7 @@ void L2cap::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
 }
 void L2cap::onAcl(uint16_t handle, const uint8_t *d, uint16_t len) {
     if (handle != m_handle || len < 4) return;
+    if (m_trace) m_trace(m_traceCtx, false, handle, d, len);
     uint16_t cid = (uint16_t)(d[2] | (d[3] << 8));
     if (cid == 0x0001) { handleSig(d, len); return; }
     Channel *ch = byLocal(cid);
@@ -115,6 +116,7 @@ void L2cap::service() {
         Tx &t = m_txq[m_txHead]; uint16_t al = (uint16_t)(t.len + 4); uint16_t hf = (uint16_t)((m_handle & 0x0FFF) | (0x02u << 12));
         uint8_t h[9] = { 0x02, (uint8_t)hf, (uint8_t)(hf >> 8), (uint8_t)al, (uint8_t)(al >> 8), (uint8_t)t.len, (uint8_t)(t.len >> 8), (uint8_t)t.cid, (uint8_t)(t.cid >> 8) };
         uint8_t pkt[9 + MAX_PAYLOAD]; memcpy(pkt, h, 9); memcpy(pkt + 9, t.buf, t.len); m_io.write(pkt, (size_t)(9 + t.len));
+        if (m_trace) m_trace(m_traceCtx, true, m_handle, pkt + 5, (uint16_t)(t.len + 4));   // L2CAP PDU = len(2)+cid(2)+payload
         m_txHead = (uint8_t)((m_txHead + 1) % TXQ); m_txCount--; m_credits--;
     }
 }
