@@ -13,6 +13,7 @@ static const float PROTO8[80] = {
   1.29371806e-02f, 1.53184106e-02f, 1.62208471e-02f, 1.59045603e-02f, 1.46525263e-02f, 1.27472335e-02f, 1.04584443e-02f, 8.02941163e-03f,
  -5.65949473e-03f,-3.49717454e-03f,-1.64973098e-03f,-1.78805361e-04f, 9.02154502e-04f, 1.61656283e-03f, 1.99454554e-03f, 2.10371989e-03f,
   2.01182542e-03f, 1.78371725e-03f, 1.47640169e-03f, 1.13992507e-03f, 8.23919506e-04f, 5.54620202e-04f, 3.43256425e-04f, 1.56575398e-04f };
+static const float ANALYSIS_SCALE = 16384.0f;  // 32768 * 0.5 -- section 12.6.3 analysis normalization for unity round-trip through the section 12.6.4 synthesis
 // Loudness offsets, 8 subbands, rows = fs 16/32/44.1/48 kHz (spec Table 12.x)
 static const int8_t OFFSET8[4][8] = { {-2,0,0,0,0,0,0,1}, {-3,0,0,0,0,0,1,2}, {-4,0,0,0,0,0,1,2}, {-4,0,0,0,0,0,1,2} };
 uint16_t Sbc::frameLength(const Params &p) {
@@ -61,7 +62,7 @@ void Sbc::allocateBits(const Params &p, const uint8_t sf[2][8], uint8_t bits[2][
     };
     if (pair) alloc_group(0, 2, total); else for (int c = 0; c < ch; c++) alloc_group(c, c + 1, total);
 }
-void Sbc::begin(const Params &p) { m_p = p; memset(m_x, 0, sizeof m_x); }
+void Sbc::begin(const Params &p) { m_p = p; m_p.alloc = LOUDNESS; memset(m_x, 0, sizeof m_x); }   // only loudness allocation is implemented; force it so the header byte matches what allocateBits() actually does
 void Sbc::analyse(uint8_t ch, const int16_t *in, int32_t sub[16][8]) {          // section 12.6.3, 8-subband analysis, 16 blocks
     static float M[8][16]; static bool init = false;
     if (!init) { for (int k = 0; k < 8; k++) for (int i = 0; i < 16; i++) M[k][i] = cosf((i + 4) * (2 * k + 1) * (float)M_PI / 16.0f); init = true; }
@@ -75,7 +76,7 @@ void Sbc::analyse(uint8_t ch, const int16_t *in, int32_t sub[16][8]) {          
             // The un-normalised cos matrix + proto window carry a factor of 2 that the section 12.6.4
             // synthesis filterbank (which the decoder inverts) does not; scale the analysis output by 1/2
             // so an integer-PCM signal round-trips to unity (16384 -> 16384, not 32768) instead of +6 dB / clipping.
-            int32_t v = (int32_t)lrintf(s * 16384.0f); if (v > 32767) v = 32767; if (v < -32768) v = -32768; sub[blk][k] = v; }
+            int32_t v = (int32_t)lrintf(s * ANALYSIS_SCALE); if (v > 32767) v = 32767; if (v < -32768) v = -32768; sub[blk][k] = v; }
     }
 }
 uint16_t Sbc::encode(const int16_t *L, const int16_t *R, uint8_t *out) {
@@ -106,7 +107,7 @@ uint16_t Sbc::encode(const int16_t *L, const int16_t *R, uint8_t *out) {
     for (int c = 0; c < ch; c++) for (int s = 0; s < 8; s++) { put(sf[c][s], 4); sfN[k++] = sf[c][s]; }
     for (int b = 0; b < 16; b++) for (int c = 0; c < ch; c++) for (int s = 0; s < 8; s++) if (bits[c][s]) {
         int32_t levels = (1 << bits[c][s]) - 1;                   // quantise: q = floor(((x / 2^(sf+1)) + 1) * levels / 2)
-        int64_t x = sub[c][b][s]; int64_t q = (((x << 1) + (1LL << (sf[c][s] + 1))) * levels) >> (sf[c][s] + 2);   // = ((x/2^(sf+1)) + 1) * levels / 2, exact
+        int64_t x = sub[c][b][s]; int64_t q = (((x * 2) + (1LL << (sf[c][s] + 1))) * levels) >> (sf[c][s] + 2);   // = ((x/2^(sf+1)) + 1) * levels / 2, exact
         if (q < 0) q = 0; if (q > levels) q = levels; put((uint32_t)q, bits[c][s]); }
     if (nb) put(0, 8 - nb);                                       // pad the last byte
     out[crcPos] = crc8(out + 1, 2, sfN, (uint8_t)(ch * 8), join, p);
