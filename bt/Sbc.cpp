@@ -72,7 +72,10 @@ void Sbc::analyse(uint8_t ch, const int16_t *in, int32_t sub[16][8]) {          
         float Y[16];
         for (int i = 0; i < 16; i++) { float y = 0; for (int k = 0; k < 5; k++) y += PROTO8[i + 16 * k] * X[i + 16 * k]; Y[i] = y; }
         for (int k = 0; k < 8; k++) { float s = 0; for (int i = 0; i < 16; i++) s += M[k][i] * Y[i];
-            int32_t v = (int32_t)lrintf(s * 32768.0f); if (v > 32767) v = 32767; if (v < -32768) v = -32768; sub[blk][k] = v; }
+            // The un-normalised cos matrix + proto window carry a factor of 2 that the section 12.6.4
+            // synthesis filterbank (which the decoder inverts) does not; scale the analysis output by 1/2
+            // so an integer-PCM signal round-trips to unity (16384 -> 16384, not 32768) instead of +6 dB / clipping.
+            int32_t v = (int32_t)lrintf(s * 16384.0f); if (v > 32767) v = 32767; if (v < -32768) v = -32768; sub[blk][k] = v; }
     }
 }
 uint16_t Sbc::encode(const int16_t *L, const int16_t *R, uint8_t *out) {
