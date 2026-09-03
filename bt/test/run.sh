@@ -2,7 +2,7 @@
 set -e
 DIR=$(cd "$(dirname "$0")" && pwd); OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 CXX=${CXX:-c++}
-for t in l2cap_test avdtp_test sbc_test; do
+for t in l2cap_test avdtp_test sbc_test rtp_test mediapacketizer_test; do
     [ -f "$DIR/$t.cpp" ] || continue
     # bt/ units (BtLink, Sdp, Avdtp) call into Hci, so link the host-compilable hci sources too (as hci/test/run.sh does).
     $CXX -std=c++11 -Wall -Wextra -Werror -I"$DIR/.." -I"$DIR/../../hci" "$DIR/$t.cpp" "$DIR"/../*.cpp \
