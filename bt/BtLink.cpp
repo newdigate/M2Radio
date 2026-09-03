@@ -130,9 +130,12 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     Hci::Error me = m_hci.run(OP_SET_EVENT_MASK, evmask, sizeof evmask, &r, 1000, idle);
     logf("event_mask: st=%s status=0x%02X", me == Hci::OK ? "ok" : Hci::errorName(me), r.status);
 
-    uint8_t sspOn = 0x01;
-    Hci::Error we = m_hci.run(OP_WRITE_SSP_MODE, &sspOn, 1, &r, 1000, idle);
-    logf("ssp_mode: st=%s status=0x%02X", we == Hci::OK ? "ok" : Hci::errorName(we), r.status);
+    // SSP on by default; OFF when legacy PIN is forced, so the link is legacy from
+    // the start (pairAndEncrypt()'s first Authentication_Requested then takes the
+    // PIN_Code_Request path with no SSP attempt).  See setLegacyPin().
+    uint8_t sspMode = m_legacyPin ? 0x00 : 0x01;
+    Hci::Error we = m_hci.run(OP_WRITE_SSP_MODE, &sspMode, 1, &r, 1000, idle);
+    logf("ssp_mode: st=%s status=0x%02X mode=%u", we == Hci::OK ? "ok" : Hci::errorName(we), r.status, sspMode);
 
     // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
     uint8_t p[13];

@@ -13,9 +13,16 @@ public:
     explicit BtLink(Hci &hci) : m_hci(hci) {}
     void setLog(LogFn fn, void *ctx) { m_log = fn; m_logCtx = ctx; }
     void setPin(const char *pin4) { for (int i = 0; i < 4; i++) m_pin[i] = pin4[i]; }
+    // Force legacy PIN pairing: connect() writes Write_Simple_Pairing_Mode=0 up
+    // front so the link is legacy from the start and pairAndEncrypt()'s first (and
+    // only) Authentication_Requested takes the PIN_Code_Request path -- NO SSP
+    // attempt.  REQUIRED for the IW416<->ESP32 sink: their SSP stalls ~25 s at the
+    // LMP IO-cap exchange and then poisons the SSP-fail->PIN fallback on the same
+    // link (measured on silicon 2026-09-03: auth_complete=0x0C, secure=pairing_failed).
+    void setLegacyPin(bool v) { m_legacyPin = v; }
     // now() = a millisecond clock; idle() = pump the HCI + yield (the app passes millis and its idleMs).
     Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection
-    Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first; on failure Write_Simple_Pairing_Mode=0 and retry with PIN
+    Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first (or legacy PIN if setLegacyPin); on SSP failure Write_Simple_Pairing_Mode=0 and retry with PIN
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);   // forward from the app's Hci::EventFn
     uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return m_bd; }
     bool encrypted() const { return m_encrypted; } const char *pairedBy() const { return m_pairedBy; }
@@ -28,6 +35,7 @@ private:
     uint8_t m_bd[6] = {0};
     volatile uint8_t m_psrm = 0; volatile uint16_t m_clk = 0;
     char m_pin[4] = {'1','2','3','4'}; const char *m_pairedBy = "none";
+    bool m_legacyPin = false;
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;
     volatile bool m_encrypted = false; volatile bool m_haveLinkKey = false;
