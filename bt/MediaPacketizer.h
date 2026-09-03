@@ -12,6 +12,9 @@ public:
                                             // is sacrificed so wr==rd means EMPTY and nextWr==rd
                                             // means FULL -- a lock-free SPSC ring with no count field.
     static const uint16_t FRAME_MAX = 128;  // an SBC frame is 119 B at bitpool 53; round up
+    // One SBC frame at 44.1k/joint-stereo/16-block/8-subband/bitpool-53 (the fixed encoder
+    // config `begin()` assumes when computing frames-per-packet).
+    static const uint16_t FRAME_BYTES = 119;
     static const uint16_t PKT_MAX = Rtp::HEADER_LEN + 8 * FRAME_MAX;
     // send returns false when the sink is not ready (no L2CAP credit); the packetiser
     // keeps the frames for the next drain().

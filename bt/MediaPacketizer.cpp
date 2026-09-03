@@ -1,15 +1,29 @@
 #include "MediaPacketizer.h"
 #include <string.h>
-// SPSC ring, one slot sacrificed: wr==rd is EMPTY, (wr+1)%RING==rd is FULL, so RING=65
-// gives 64 usable frames.  Only push() writes m_wr (and, on overflow, advances m_rd to
-// drop the oldest); only drain() writes m_rd on a successful send.  count() is read-only.
+// SPSC-ish ring, one slot sacrificed: wr==rd is EMPTY, (wr+1)%RING==rd is FULL,
+// so RING=65 gives 64 usable frames.  push() (producer/audio ISR) writes m_wr, and
+// ALSO advances m_rd when it drops the oldest on a full ring; drain() (consumer/main
+// loop) advances m_rd on a successful send.  m_rd therefore has TWO writers.
+// This is safe ONLY while the ring never fills (drops==0, the phase-4 target): the
+// drop-oldest path in push() is the only producer write to m_rd, and it fires only
+// under sustained backpressure.  Under drops>0 there is a benign race -- the ISR can
+// advance m_rd inside drain()'s read-modify-write around send(), so drain()'s commit
+// can clobber a drop (a drop-counted frame gets sent, or a sacrificed slot resurfaces).
+// It corrupts audio + counters, never memory (all indices are %RING).  FIX PATH before
+// relying on the backpressure regime: guard drain()'s m_rd commit with an injected
+// IRQ critical section (no-op on host, __disable_irq/__enable_irq on ARM), rebasing
+// rather than clobbering; or restructure to a single m_rd writer.  Byte loads/stores of
+// m_wr/m_rd are single-copy-atomic on Cortex-M7, so no torn reads and no barrier needed.
+// count() below only reads m_wr/m_rd, never writes either.
 uint8_t MediaPacketizer::count() const {
     return (uint8_t)(((int)m_wr - (int)m_rd + RING) % RING);
 }
+// Assumes the fixed SBC config named at FRAME_BYTES's definition -- a different
+// bitpool/subband/block config would need a different frame size here.
 void MediaPacketizer::begin(uint16_t mtu) {
     m_mtu = mtu;
     uint16_t avail = mtu > Rtp::HEADER_LEN ? mtu - Rtp::HEADER_LEN : 0;
-    m_perPkt = avail / 119;                 // whole SBC frames (bitpool 53 = 119 B) per packet
+    m_perPkt = avail / FRAME_BYTES;          // whole SBC frames per packet
     if (m_perPkt == 0) m_perPkt = 1;
     if (m_perPkt > 8)  m_perPkt = 8;        // A2DP frame-count nibble cap; and PKT_MAX sizing
     m_wr = m_rd = 0; m_seq = 0; m_ts = 0;
