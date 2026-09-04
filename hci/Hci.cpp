@@ -35,7 +35,7 @@ void Hci::begin() {
     m_ncmd = 1;                       // Vol 4 Part E 4.4: one command before any reply
     m_timeoutMs = 1000;
     m_resync = false; m_lastByteAt = 0;
-    m_timeouts = m_framing = m_starved = m_queueFull = m_late = m_events = 0;
+    m_timeouts = m_framing = m_starved = m_queueFull = m_late = m_events = m_reclaimed = 0;
     m_lastError = OK;
 }
 

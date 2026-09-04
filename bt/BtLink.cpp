@@ -29,11 +29,15 @@ enum {
     OP_WRITE_SSP_MODE      = 0x0C56,
     OP_SET_EVENT_MASK      = 0x0C01,
     OP_PIN_CODE_REQ_REPLY  = 0x040D,
+    OP_CREATE_CONN_CANCEL  = 0x0408,
+    OP_DISCONNECT          = 0x0406,
+    OP_WRITE_PAGE_TIMEOUT  = 0x0C18,
 };
 enum {
     EV_INQUIRY_COMPLETE    = 0x01,
     EV_INQUIRY_RESULT      = 0x02,
     EV_CONNECTION_COMPLETE = 0x03,
+    EV_DISCONNECT_COMPLETE = 0x05,
     EV_AUTH_COMPLETE       = 0x06,
     EV_REMOTE_NAME_DONE    = 0x07,
     EV_ENCRYPTION_CHANGE   = 0x08,
@@ -137,26 +141,61 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     Hci::Error we = m_hci.run(OP_WRITE_SSP_MODE, &sspMode, 1, &r, 1000, idle);
     logf("ssp_mode: st=%s status=0x%02X mode=%u", we == Hci::OK ? "ok" : Hci::errorName(we), r.status, sspMode);
 
+    // Write_Page_Timeout 0x2000 slots (5.12 s -- the spec default, written EXPLICITLY so the
+    // page either completes or reports Page Timeout inside the wait below, whatever the
+    // firmware's own default).  Answered by Command Complete; a controller that lacks it is
+    // logged and tolerated.
+    uint8_t pt[2] = { 0x00, 0x20 };
+    Hci::Error pe = m_hci.run(OP_WRITE_PAGE_TIMEOUT, pt, 2, &r, 1000, idle);
+    logf("page_timeout: st=%s status=0x%02X slots=0x2000", pe == Hci::OK ? "ok" : Hci::errorName(pe), r.status);
+
     // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
-    uint8_t p[13];
-    memcpy(p, m_bd, 6);
-    p[6] = 0x18; p[7] = 0xCC;
-    p[8] = m_psrm; p[9] = 0x00;
-    p[10] = (uint8_t)(m_clk & 0xFF);
-    p[11] = (uint8_t)((m_clk >> 8) | 0x80);
-    p[12] = 0x01;    // allow role switch
-    m_connDone = false; m_connStatus = 0xFF;
-    Hci::Error ce = m_hci.run(OP_CREATE_CONNECTION, p, sizeof p, &r, 2000, idle);
-    if (ce != Hci::OK || !r.statusEvent) {
-        logf("connect=fail reason=%s status=0x%02X", ce == Hci::OK ? "not_command_status" : Hci::errorName(ce), r.status);
-        return TIMEOUT;
+    // role_switch=0x00 (NOT allowed): the Mac pages this headset that way (PacketLogger reference
+    // 2026-09-03: ... 18 CC 01 00 54 88 00) and an A2DP source wants to stay master anyway.
+    // Paged up to PAGE_ATTEMPTS times from here, WITHOUT a fresh inquiry: a headset that has just
+    // left pairing mode, or is asleep between page scans, misses a page and answers the next.
+    for (uint8_t attempt = 1; attempt <= PAGE_ATTEMPTS; attempt++) {
+        uint8_t p[13];
+        memcpy(p, m_bd, 6);
+        p[6] = 0x18; p[7] = 0xCC;
+        p[8] = m_psrm; p[9] = 0x00;
+        p[10] = (uint8_t)(m_clk & 0xFF);
+        p[11] = (uint8_t)((m_clk >> 8) | 0x80);
+        p[12] = 0x00;    // no role switch
+        m_connDone = false; m_connStatus = 0xFF;
+        Hci::Error ce = m_hci.run(OP_CREATE_CONNECTION, p, sizeof p, &r, 2000, idle);
+        if (ce != Hci::OK || !r.statusEvent) {
+            logf("connect=fail reason=%s status=0x%02X attempt=%u", ce == Hci::OK ? "not_command_status" : Hci::errorName(ce), r.status, attempt);
+            return TIMEOUT;
+        }
+        // Page Timeout is 5.12 s; a compliant controller has reported one way or the other well
+        // inside 10 s.  Silence past that is the bench's "connect=timeout (no Connection_Complete)".
+        t0 = now();
+        while (!m_connDone && now() - t0 < 10000) idle();
+        if (!m_connDone) {
+            // The controller is (as far as we can tell) still paging, and may have withheld its
+            // command credit for the duration (Num_HCI_Command_Packets=0 in the Command Status,
+            // no NOP since).  Reclaim the credit if so -- otherwise the cancel below can never
+            // leave and every later command starves by name, the wedge measured 2026-09-03 --
+            // then CANCEL the page: the controller stops paging, its Command Complete re-reports
+            // the true credit count, and it follows with a Connection_Complete (status 0x02).
+            logf("connect=timeout (no Connection_Complete) attempt=%u ncmd=%u -> Create_Connection_Cancel", attempt, m_hci.ncmd());
+            if (m_hci.ncmd() == 0) m_hci.reclaimCredit();
+            Hci::Reply rc;
+            Hci::Error xe = m_hci.run(OP_CREATE_CONN_CANCEL, m_bd, 6, &rc, 2000, idle);
+            uint32_t t1 = now();
+            while (xe == Hci::OK && !m_connDone && now() - t1 < 1000) idle();
+            logf("connect_cancel: st=%s status=0x%02X conn_complete=%s", xe == Hci::OK ? "ok" : Hci::errorName(xe), rc.status,
+                 m_connDone ? "seen" : "none");
+            if (attempt == PAGE_ATTEMPTS) return TIMEOUT;
+            continue;
+        }
+        if (m_connStatus == 0x04 && attempt < PAGE_ATTEMPTS) { logf("connect=page_timeout attempt=%u -> retry", attempt); continue; }
+        if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X attempt=%u", m_connStatus, attempt); return CONNECT_STATUS; }
+        logf("connect=ok handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
+        return OK;
     }
-    t0 = now();
-    while (!m_connDone && now() - t0 < 15000) idle();
-    if (!m_connDone)          { logf("connect=timeout (no Connection_Complete)"); return TIMEOUT; }
-    if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X", m_connStatus); return CONNECT_STATUS; }
-    logf("connect=ok handle=0x%04X", (unsigned)m_handle);
-    return OK;
+    return TIMEOUT;
 }
 
 // --- pairAndEncrypt(): Authentication_Requested (SSP path); on failure,
@@ -228,6 +267,25 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
     return ENCRYPTION_FAILED;
 }
 
+// --- disconnect(): HCI_Disconnect(handle, 0x13) -> Command Status -> Disconnection_Complete. ---
+BtLink::Result BtLink::disconnect(uint32_t (*now)(), void (*idle)()) {
+    if (!m_handle) return OK;
+    Hci::Reply r;
+    uint8_t p[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x13 };
+    m_discDone = false;
+    Hci::Error e = m_hci.run(OP_DISCONNECT, p, 3, &r, 2000, idle);
+    if (e != Hci::OK || !r.statusEvent) {
+        logf("disconnect=fail reason=%s status=0x%02X", e == Hci::OK ? "not_command_status" : Hci::errorName(e), r.status);
+        m_handle = 0; m_encrypted = false;          // the link is unusable either way; do not keep paging-blocking state
+        return TIMEOUT;
+    }
+    uint32_t t0 = now();
+    while (!m_discDone && now() - t0 < 3000) idle();
+    logf("disconnect=%s reason=0x%02X handle=0x%04X", m_discDone ? "ok" : "timeout", m_discReason, (unsigned)m_handle);
+    m_handle = 0; m_encrypted = false; m_haveLinkKey = false;
+    return m_discDone ? OK : TIMEOUT;
+}
+
 // --- onEvent(): the SSP/inquiry event handlers, ported from the probe's
 // onEvent().  Replies go out ONLY via m_hci.submit() (never run()) -- this is
 // called from the app's Hci::EventFn, i.e. from inside Hci::service(). ---
@@ -272,6 +330,11 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         m_connStatus = p[0];
         m_handle = (uint16_t)(p[1] | (p[2] << 8));
         m_connDone = true;
+    } else if (code == EV_DISCONNECT_COMPLETE && len >= 4) {
+        // status(1) handle(2) reason(1)
+        uint16_t h = (uint16_t)(p[1] | (p[2] << 8));
+        logf("disconnection_complete: status=0x%02X handle=0x%04X reason=0x%02X", p[0], (unsigned)h, p[3]);
+        if (h == m_handle) { m_discReason = p[3]; m_encrypted = false; m_discDone = true; }
     } else if (code == EV_LINK_KEY_REQUEST && len >= 6) {
         char bs[18]; hciFormatBd(p, bs);
         logf("link_key_req: bd=%s -> neg_reply (no stored key)", bs);

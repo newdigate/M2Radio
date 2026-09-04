@@ -21,8 +21,13 @@ public:
     // link (measured on silicon 2026-09-03: auth_complete=0x0C, secure=pairing_failed).
     void setLegacyPin(bool v) { m_legacyPin = v; }
     // now() = a millisecond clock; idle() = pump the HCI + yield (the app passes millis and its idleMs).
-    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection
+    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection (paged up to PAGE_ATTEMPTS times)
     Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first (or legacy PIN if setLegacyPin); on SSP failure Write_Simple_Pairing_Mode=0 and retry with PIN
+    // HCI_Disconnect (reason 0x13, remote user terminated) and wait for Disconnection_Complete.
+    // OK when there is no link.  A2dpSource calls it on every post-connect failure so a retry
+    // starts from a clean controller state instead of paging a device we are still linked to.
+    Result disconnect(uint32_t (*now)(), void (*idle)());
+    static const uint8_t PAGE_ATTEMPTS = 3;   // Create_Connection tries per connect(): a headset just out of pairing mode misses a page
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);   // forward from the app's Hci::EventFn
     uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return m_bd; }
     bool encrypted() const { return m_encrypted; } const char *pairedBy() const { return m_pairedBy; }
@@ -39,6 +44,7 @@ private:
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;
     volatile bool m_encrypted = false; volatile bool m_haveLinkKey = false;
+    volatile bool m_discDone = false; volatile uint8_t m_discReason = 0;
     volatile bool m_inqComplete = false;
     // A/V inquiry hits (major device class 0x04), enough for the bench.  `named` is
     // per-hit (not a single shared flag) so a late Remote_Name_Complete for hit i

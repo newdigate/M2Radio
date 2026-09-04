@@ -90,6 +90,17 @@ public:
     uint32_t late()      const { return m_late; }
     uint32_t events()    const { return m_events; }       // asynchronous events delivered
     Error    lastError() const { return m_lastError; }
+    // Grant ONE command credit locally, only when the count is 0.  For a controller
+    // that answered a long-running command's Command Status with
+    // Num_HCI_Command_Packets=0 and then never sent the NOP Command Complete that
+    // returns it: the host then cannot even send the CANCEL that would clear the
+    // controller's state, and every later command ages out as NCMD_STARVED --
+    // measured on the bench (2026-09-03) as a wedged link after a silent
+    // Create_Connection.  Bounded at one, counted in reclaimed(), and the next
+    // reply reassigns the true count.  For callers that have waited far longer
+    // than the outstanding command could legitimately take (BtLink's page wait).
+    void     reclaimCredit() { if (m_ncmd == 0) { m_ncmd = 1; m_reclaimed++; } }
+    uint32_t reclaimed() const { return m_reclaimed; }
 
 private:
     struct Cmd { uint16_t opcode; uint8_t plen; uint8_t params[255]; DoneFn done; void *ctx; uint32_t queuedAt; };
@@ -109,7 +120,7 @@ private:
     uint32_t m_timeoutMs;
     bool     m_resync; uint32_t m_lastByteAt;
     Reply    m_scratch;
-    uint32_t m_timeouts, m_framing, m_starved, m_queueFull, m_late, m_events;
+    uint32_t m_timeouts, m_framing, m_starved, m_queueFull, m_late, m_events, m_reclaimed;
     Error    m_lastError;
     EventFn  m_onEvent; void *m_eventCtx;
     AclFn    m_onAcl;   void *m_aclCtx;
