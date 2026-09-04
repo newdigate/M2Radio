@@ -27,6 +27,10 @@ public:
     // packets and sends each via SendFn until the ring is empty or SendFn refuses.
     void drain(SendFn send, void *ctx);
 
+    // Frames currently queued (producer minus consumer).  The caller batches on this:
+    // draining only once >= framesPerPacket() are ready sends fuller packets (one ACL
+    // credit each) instead of one-frame packets, cutting credit pressure ~perPkt-fold.
+    uint8_t  pending()       const { return count(); }
     uint32_t frames()        const { return m_frames; }
     uint32_t packets()       const { return m_packets; }
     uint32_t drops()         const { return m_drops; }
