@@ -9,7 +9,11 @@
 #include "HciIo.h"
 class L2cap {
 public:
-    static const uint8_t MAX_CHANNELS = 3;      // SDP, AVDTP signalling, AVDTP media
+    // Our SDP client, AVDTP signalling, AVDTP media -- PLUS room for peer-initiated
+    // channels: both headsets open a reverse SDP channel at us on AVDTP contact
+    // (BT-2 transcript 2026-08-29), and the Shokz opens two in the Mac reference.
+    // With three slots the media connect() found none and AVDTP failed 0xFD.
+    static const uint8_t MAX_CHANNELS = 5;
     static const uint8_t MAX_OPTS = 32;
     enum State : uint8_t { FREE, WAIT_CONN, CONFIG, OPEN, CLOSED };
     struct Channel {
@@ -47,6 +51,13 @@ public:
     // ACL data limit sits between the two; do not raise this without confirming
     // the link (and adding ACL fragmentation) or media will wedge.
     static const uint16_t MAX_PAYLOAD = 700;
+    // The MTU we advertise in OUR Config Request = the largest SDU the peer may send us.
+    // 1004 is the value the Mac's A2DP source negotiates with the Shokz (PacketLogger
+    // reference 2026-09-03: option 01 02 EC 03), and it fits this stack's RX path, which
+    // reassembles nothing: an SDU must arrive in ONE ACL packet, and the IW416 reports
+    // acl_len=1021.  The Shokz never answered our DISCOVER while our Config Request
+    // carried NO options; the compliant reference carries exactly this one.
+    static const uint16_t RX_MTU = 1004;
 private:
     struct Tx { uint16_t cid; uint16_t len; uint8_t buf[MAX_PAYLOAD]; };
     static const uint8_t TXQ = 8;

@@ -97,6 +97,40 @@ int main() {
         CHECK(connId == 0x21);                                                 // #1's id, never #2's 0x22
         CHECK(connScid == 0x0111);                                             // #1's scid, never #2's 0x0222
     }
+    {   // 7. Our CONFIG_REQ carries an MTU option (the Shokz headset needs one; the ESP32 tolerated its absence).
+        // Value = the L2CAP MTU the Mac's A2DP source negotiates with this headset (PacketLogger reference,
+        // 2026-09-03: 01 02 EC 03 = 1004), which also fits this stack's single-ACL RX path (IW416 acl_len 1021).
+        CapIo io; L2cap l(io); l.begin(0x0001, 7);
+        L2cap::Channel *ch = l.connect(0x0019, 0x0041);           // our SCID 0x0041
+        std::vector<uint8_t> rsp = l2(0x0001, { 0x03, 0x10, 0x08, 0x00, 0x80, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00 }); // CONN_RSP dcid=0x0080 scid=0x0041 ok
+        l.onAcl(0x0001, rsp.data(), (uint16_t)rsp.size());
+        io.tx.clear(); l.service();                                // emits our CONFIG_REQ
+        bool sawReq = false, sawMtu = false; uint16_t mtu = 0;
+        for (auto &p : io.tx) {                                    // full ACL packet: [02][hf][al][l2len][cid][code id len dcid flags opts...]
+            if (p.size() >= 9 + 8 && p[9] == 0x04) { sawReq = true;
+                CHECK(p[9 + 4] == 0x80 && p[9 + 5] == 0x00);       // DCID = the peer's CID
+                uint16_t cmdLen = (uint16_t)(p[9 + 2] | (p[9 + 3] << 8));
+                CHECK(cmdLen == p.size() - 9 - 4);                 // length field covers dcid+flags+options
+                for (size_t i = 9 + 8; i + 3 < p.size(); ) { uint8_t t = p[i], ln = p[i + 1];
+                    if (t == 0x01 && ln == 2) { sawMtu = true; mtu = (uint16_t)(p[i + 2] | (p[i + 3] << 8)); } i += 2 + ln; } }
+        }
+        CHECK(sawReq); CHECK(sawMtu); CHECK(mtu == L2cap::RX_MTU); CHECK(L2cap::RX_MTU == 1004);
+        CHECK(ch->mtuIn == L2cap::RX_MTU);                         // what we told the peer it may send us
+    }
+    {   // 8. Five channels coexist: our SDP client, AVDTP signalling, AVDTP media, PLUS two peer-initiated channels
+        // (both headsets open reverse SDP channels at us on AVDTP contact -- BT-2 transcript 2026-08-29; the Shokz
+        // opens two in the Mac reference).  With only three slots the media connect() failed with no slot (0xFD).
+        CapIo io; L2cap l(io); l.begin(0x0001, 7); l.acceptIncoming(true);
+        CHECK(l.connect(0x0001, 0x0040) != nullptr);
+        CHECK(l.connect(0x0019, 0x0041) != nullptr);
+        std::vector<uint8_t> r1 = l2(0x0001, { 0x02, 0x21, 4, 0, 0x01, 0x00, 0x11, 0x01 });   // peer CONN_REQ psm=SDP scid=0x0111
+        l.onAcl(0x0001, r1.data(), (uint16_t)r1.size()); l.service();
+        std::vector<uint8_t> r2 = l2(0x0001, { 0x02, 0x22, 4, 0, 0x01, 0x00, 0x22, 0x02 });   // a second peer CONN_REQ scid=0x0222
+        l.onAcl(0x0001, r2.data(), (uint16_t)r2.size()); l.service();
+        CHECK(l.byRemote(0x0111) != nullptr); CHECK(l.byRemote(0x0222) != nullptr);
+        CHECK(l.connect(0x0019, 0x0042) != nullptr);               // the media channel still gets a slot
+        CHECK(L2cap::MAX_CHANNELS >= 5);
+    }
     {   // N. onAclTrace fires for inbound (a fed ACL) and outbound (a queued send), with the L2CAP PDU + handle.
         struct Cap { struct Rec { bool out; uint16_t handle; std::vector<uint8_t> pdu; }; std::vector<Rec> recs; };
         static Cap cap;   // static so the C-style callback can reach it

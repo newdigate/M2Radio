@@ -14,7 +14,7 @@ L2cap::Channel *L2cap::byPsm(uint16_t p)    { for (auto &ch : m_ch) if (ch.state
 L2cap::Channel *L2cap::connect(uint16_t psm, uint16_t localCid) {
     if (byLocal(localCid)) return nullptr;                          // caller CID must not collide with an in-use one
     for (auto &ch : m_ch) if (ch.state == FREE || ch.state == CLOSED) {
-        memset(&ch, 0, sizeof ch); ch.state = WAIT_CONN; ch.psm = psm; ch.localCid = localCid; ch.mtuOut = 672; ch.mtuIn = 672;
+        memset(&ch, 0, sizeof ch); ch.state = WAIT_CONN; ch.psm = psm; ch.localCid = localCid; ch.mtuOut = 672; ch.mtuIn = RX_MTU;
         uint8_t c[8] = { CONN_REQ, m_nextId++, 4, 0, (uint8_t)psm, (uint8_t)(psm >> 8), (uint8_t)localCid, (uint8_t)(localCid >> 8) };
         sig(c, 8); return &ch; }
     return nullptr;
@@ -89,7 +89,7 @@ void L2cap::service() {
             m_p.connRspId = m_p.connId; m_p.connRspScid = m_p.connScid;                   // snapshot NOW: a later CONN_REQ must not touch these
             m_p.connRspRes = ch ? 0x0000 : 0x0004; m_p.connRspLocal = 0;                  // 0x0004 = no resources
             if (ch) { memset(ch, 0, sizeof *ch); ch->state = CONFIG; ch->psm = m_p.connPsm; ch->remoteCid = m_p.connScid;
-                      ch->localCid = m_p.connRspLocal = m_nextCid++; ch->mtuOut = 672; ch->mtuIn = 672; ch->peerInitiated = true; }
+                      ch->localCid = m_p.connRspLocal = m_nextCid++; ch->mtuOut = 672; ch->mtuIn = RX_MTU; ch->peerInitiated = true; }
             m_p.connRspReady = true;
         }
         // Built ENTIRELY from the snapshot above -- never from live m_p.connId/connScid, which a second CONN_REQ
@@ -101,9 +101,13 @@ void L2cap::service() {
     if (m_p.discReq) { uint8_t r[8] = { DISC_RSP, m_p.discId, 4, 0, m_p.discBytes[0], m_p.discBytes[1], m_p.discBytes[2], m_p.discBytes[3] };
         if (sig(r, 8)) m_p.discReq = false; }
     for (auto &ch : m_ch) {
-        if (ch.state == CONFIG && !ch.cfgReqSent) {                                       // our Config Request: no options (defaults)
-            uint8_t c[8] = { CFG_REQ, m_nextId++, 4, 0, (uint8_t)ch.remoteCid, (uint8_t)(ch.remoteCid >> 8), 0, 0 };
-            if (sig(c, 8)) ch.cfgReqSent = true; }
+        if (ch.state == CONFIG && !ch.cfgReqSent) {                                       // our Config Request: MTU option (RX_MTU)
+            // Option type 0x01 (MTU), length 2, value LE.  An option-less request is what
+            // this stack sent until 2026-09-04 and what the Shokz never answered DISCOVER
+            // after; the Mac reference carries exactly this option and nothing else.
+            uint8_t c[12] = { CFG_REQ, m_nextId++, 8, 0, (uint8_t)ch.remoteCid, (uint8_t)(ch.remoteCid >> 8), 0, 0,
+                              0x01, 0x02, (uint8_t)RX_MTU, (uint8_t)(RX_MTU >> 8) };
+            if (sig(c, 12)) ch.cfgReqSent = true; }
         if (ch.state == CONFIG && ch.cfgReqSeen && !ch.cfgRspSent) {
             uint8_t r[10 + MAX_OPTS]; uint16_t n = (uint16_t)(6 + ch.optLen);
             r[0] = CFG_RSP; r[1] = ch.cfgReqId; r[2] = (uint8_t)n; r[3] = (uint8_t)(n >> 8);
