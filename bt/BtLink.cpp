@@ -41,6 +41,7 @@ enum {
     EV_AUTH_COMPLETE       = 0x06,
     EV_REMOTE_NAME_DONE    = 0x07,
     EV_ENCRYPTION_CHANGE   = 0x08,
+    EV_NUM_COMPLETED_PACKETS = 0x13,   // high-rate during streaming; consumed by Hci for ACL credits
     EV_PIN_CODE_REQUEST    = 0x16,
     EV_LINK_KEY_REQUEST    = 0x17,
     EV_LINK_KEY_NOTIFY     = 0x18,
@@ -380,7 +381,14 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         m_encrypted = (p[3] != 0);
         logf("encryption_change: status=0x%02X handle=0x%04X enabled=%u", p[0], (unsigned)(p[1] | (p[2] << 8)), p[3]);
         m_encDone = true;
-    } else {
+    } else if (code != EV_NUM_COMPLETED_PACKETS) {
+        // Catch-all trace of UNRECOGNISED events.  Number_Of_Completed_Packets (0x13) is
+        // NOT unrecognised -- Hci consumes it to return ACL credits -- and it arrives once
+        // per completed ACL packet, i.e. at media rate during A2DP streaming.  Logging it
+        // here floods the injected console: at 115200 baud each line blocks the caller's
+        // main loop for ~2.4 ms, and on a busy consumer (acid_box: synth + GC355 compositor
+        // + SBC encode) the flood dropped the loop to a few Hz and starved the encoder
+        // (silicon 2026-09-04).  Suppress it; still trace every other unhandled code.
         logf("hci_event: code=0x%02X len=%u", code, len);
     }
 }

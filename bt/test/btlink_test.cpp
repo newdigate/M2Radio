@@ -129,5 +129,21 @@ int main() {
         CHECK(link.connect("Shokz", fakeNow, idle10) == BtLink::TIMEOUT);
         CHECK(io.count(0x0405) == 1 && io.count(0x0408) == 0);
     }
+    {   // 6. The catch-all event trace suppresses Number_Of_Completed_Packets (0x13) -- it arrives
+        //    at media rate during streaming and floods the injected console, throttling the caller's
+        //    main loop (silicon 2026-09-04, acid_box) -- while STILL tracing any other unhandled code.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x05, 0x00 };   // 1 handle 0x0001, 5 packets completed
+        link.onEvent(0x13, ncp, sizeof(ncp));
+        uint8_t other[] = { 0xAA, 0xBB };
+        link.onEvent(0x2F, other, sizeof(other));           // an unhandled code that is NOT 0x13
+        bool sawNcp = false, sawOther = false;
+        for (auto &l : g_log) {
+            if (l.find("hci_event: code=0x13") != std::string::npos) sawNcp = true;
+            if (l.find("hci_event: code=0x2F") != std::string::npos) sawOther = true;
+        }
+        CHECK(!sawNcp);                                     // the flood is suppressed
+        CHECK(sawOther);                                    // genuine unknowns are still traced
+    }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
