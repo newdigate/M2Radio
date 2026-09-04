@@ -2,6 +2,7 @@
 // will talk AVDTP to us.  Every request here is a real sink's bytes; the first response is
 // the Mac's, byte for byte (Mac->Shokz PacketLogger reference, 2026-09-03).
 #include "Sdp.h"
+#include "SdpServer.h"
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -76,6 +77,45 @@ int main() {
         CHECK(eq(r, { 0x01, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x05 }));
         r = serve({ 0x06, 0x00, 0x0B, 0x00, 0x0F, 0x35, 0x03, 0x19, 0x11, 0x0A, 0xFF, 0xFF, 0x35, 0x05, 0x0A, 0x00, 0x00, 0xFF, 0xFF, 0x00 }, 48);   // Shokz SDP MTU 48
         CHECK(r.size() <= 48 && r[0] == 0x07 && r[r.size() - 3] == 2);      // chunked to fit, continuation pending
+    }
+    {   // 8. SdpServer on a PEER-INITIATED SDP channel: the request is only RECORDED from the RX path (nothing written --
+        // the bus-fault rule), and service() writes the reply on the peer's CID.  Our own client channel's traffic is
+        // not consumed (it is a response, not a request).  A truncated request still gets an ErrorResponse.
+        struct CapIo : HciIo {
+            std::vector<std::vector<uint8_t> > tx;
+            size_t write(const uint8_t *p, size_t n) override { tx.push_back(std::vector<uint8_t>(p, p + n)); return n; }
+            int available() override { return 0; } int read() override { return -1; } uint32_t nowMs() override { return 0; }
+        } io;
+        L2cap l(io); l.begin(0x0001, 100); l.acceptIncoming(true);
+        static SdpServer srv; static bool consumed[2];
+        l.onData([](void *, L2cap::Channel &ch, const uint8_t *p, uint16_t len) { consumed[ch.peerInitiated ? 1 : 0] = srv.onData(ch, p, len); }, nullptr);
+        auto feed = [&](uint16_t cid, std::vector<uint8_t> pl) {
+            std::vector<uint8_t> v = { (uint8_t)pl.size(), 0, (uint8_t)cid, (uint8_t)(cid >> 8) }; v.insert(v.end(), pl.begin(), pl.end());
+            l.onAcl(0x0001, v.data(), (uint16_t)v.size()); };
+        // the peer opens PSM 0x0001 at us: CONN_REQ scid=0x0E85 -> we allocate 0x0080; it configures MTU 48 (the Shokz's)
+        feed(0x0001, { 0x02, 0x05, 0x04, 0x00, 0x01, 0x00, 0x85, 0x0E }); l.service();
+        L2cap::Channel *ch = l.byRemote(0x0E85); CHECK(ch != nullptr && ch->peerInitiated && ch->localCid == 0x0080);
+        feed(0x0001, { 0x04, 0x06, 0x08, 0x00, 0x80, 0x00, 0x00, 0x00, 0x01, 0x02, 0x30, 0x00 });
+        feed(0x0001, { 0x05, 0x11, 0x06, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00 }); l.service();
+        CHECK(ch->state == L2cap::OPEN && ch->mtuOut == 48);
+        io.tx.clear();
+        feed(0x0080, { 0x06, 0x00, 0x01, 0x00, 0x0D, 0x35, 0x03, 0x19, 0x11, 0x0A, 0x00, 0x20, 0x35, 0x03, 0x09, 0x00, 0x09, 0x00 });
+        CHECK(consumed[1]); CHECK(io.tx.empty()); CHECK(srv.pending());
+        srv.service(l); l.service();
+        CHECK(io.tx.size() == 1 && io.tx[0].size() == 9 + 25);
+        CHECK(io.tx[0][7] == 0x85 && io.tx[0][8] == 0x0E);                                              // on the peer's CID
+        CHECK(memcmp(&io.tx[0][9], "\x07\x00\x01\x00\x14\x00\x11\x35\x0F\x35\x0D\x09\x00\x09\x35\x08\x35\x06\x19\x11\x0D\x09\x01\x03\x00", 25) == 0);
+        CHECK(!srv.pending() && srv.answered() == 1);
+        // our own SDP CLIENT channel (we initiated it): a response arriving there is NOT a request for the server
+        CHECK(l.connect(Sdp::PSM, 0x0040) != nullptr); l.service();
+        feed(0x0001, { 0x03, 0x10, 0x08, 0x00, 0x02, 0x0D, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        feed(0x0001, { 0x04, 0x07, 0x08, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x02, 0x30, 0x00 });
+        feed(0x0001, { 0x05, 0x12, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 }); l.service();
+        consumed[0] = true; feed(0x0040, { 0x07, 0x00, 0x01, 0x00, 0x05, 0x00, 0x02, 0x35, 0x00, 0x00 });
+        CHECK(!consumed[0]);
+        // a truncated request on the peer channel -> ErrorResponse 0x0003, not silence
+        io.tx.clear(); feed(0x0080, { 0x06, 0x00, 0x02, 0x00, 0x0D, 0x35 }); srv.service(l); l.service();
+        CHECK(io.tx.size() == 1 && io.tx[0].size() == 9 + 7 && io.tx[0][9] == 0x01 && io.tx[0][9 + 6] == 0x03);
     }
     printf("sdp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
