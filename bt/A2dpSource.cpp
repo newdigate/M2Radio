@@ -1,9 +1,16 @@
 #include "A2dpSource.h"
+#include "HciEvents.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 const char *A2dpSource::resultName(Result r) {
     switch (r) { case OK: return "ok"; case CONNECT_FAILED: return "connect_failed";
         case PAIR_FAILED: return "pair_failed"; case L2CAP_FAILED: return "l2cap_failed";
         case AVDTP_FAILED: return "avdtp_failed"; } return "?";
+}
+void A2dpSource::logf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); vsnprintf(m_lb, sizeof m_lb, fmt, ap); va_end(ap);
+    if (m_log) m_log(m_logCtx, m_lb);
 }
 void A2dpSource::onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len) {
     A2dpSource *s = (A2dpSource *)ctx;
@@ -12,7 +19,26 @@ void A2dpSource::onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_
     else if (ch.psm == Sdp::PSM) { s->m_sdpVer = Sdp::parseAvdtpVersion(p, len); s->m_sdpDone = true; }   // OUR client channel
 }
 A2dpSource::Result A2dpSource::connect(const char *name, uint8_t aclNum, uint32_t (*now)(), void (*idle)()) {
-    if (m_link.connect(name, now, idle) != BtLink::OK) return CONNECT_FAILED;
+    // NEW-34: bonded candidates first -- most recent first, filtered by the target name when one
+    // is given (an EMPTY stored name is a wildcard: a nameless bond costs one page, never a dead
+    // slot), the first candidate paged PAGE_ATTEMPTS times and each later one once -- then today's
+    // inquiry path as the fallback on every attempt (brainstorm decision 3).  Passing b.name to
+    // page() is load-bearing: after a rejection the bond is erased before the new key is notified,
+    // so the name page() was given is the only surviving source for the re-created bond.
+    bool linked = false;
+    if (m_bonds && m_bonds->count()) {
+        bool first = true;
+        for (uint8_t i = 0; i < m_bonds->count() && !linked; i++) {
+            Bond b = m_bonds->at(i);                                     // a COPY: the ladder may reorder the table later
+            if (name && name[0] && b.name[0] && !strstr(b.name, name)) continue;
+            char bs[18]; hciFormatBd(b.bd, bs);
+            uint8_t attempts = first ? BtLink::PAGE_ATTEMPTS : 1; first = false;
+            logf("bond_try: bd=%s name=\"%s\" attempts=%u", bs, b.name, attempts);
+            if (m_link.page(b.bd, b.psrm, 0, false, b.name, attempts, now, idle) == BtLink::OK) linked = true;
+        }
+        if (!linked) logf("bond_page=none -> inquiry");
+    }
+    if (!linked && m_link.connect(name, now, idle) != BtLink::OK) return CONNECT_FAILED;
     if (m_link.pairAndEncrypt(now, idle) != BtLink::OK) { m_link.disconnect(now, idle); return PAIR_FAILED; }
     m_l2.begin(m_link.handle(), aclNum);
     m_l2.acceptIncoming(true);

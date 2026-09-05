@@ -12,12 +12,20 @@
 #include "SdpServer.h"
 #include "Avdtp.h"
 #include "Sbc.h"
+#include "BondTable.h"
 class A2dpSource {
 public:
     enum Result : uint8_t { OK = 0, CONNECT_FAILED, PAIR_FAILED, L2CAP_FAILED, AVDTP_FAILED };
     static const char *resultName(Result r);
     A2dpSource(Hci &hci, HciIo &io) : m_hci(hci), m_l2(io), m_link(hci) {}
-    void setLog(BtLink::LogFn fn, void *ctx) { m_link.setLog(fn, ctx); }
+    void setLog(BtLink::LogFn fn, void *ctx) { m_link.setLog(fn, ctx); m_log = fn; m_logCtx = ctx; }
+    // NEW-34: bonded devices.  connect() pages them first (most recent first, filtered by the target
+    // name when one is given -- a bond with NO stored name is a wildcard, never a dead slot -- the
+    // first candidate PAGE_ATTEMPTS times and each later one once) and falls back to the inquiry
+    // path on every attempt.  Null = today's behaviour.  The host persists the table after EVERY
+    // connect() return (an erased stale bond must persist too): BondStoreEeprom::save().
+    void setBonds(BondTable *t) { m_bonds = t; m_link.setBonds(t); }
+    BondTable *bonds() { return m_bonds; }
     void setPin(const char *pin4) { m_link.setPin(pin4); }
     void setLegacyPin(bool v)     { m_link.setLegacyPin(v); }
     // Full bring-up.  now()=millis, idle()=pump+yield.  aclNum from Read_Buffer_Size.
@@ -45,6 +53,9 @@ public:
     const Sbc::Params &sbcParams() const { return m_params; }
 private:
     static void onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len);
+    void logf(const char *fmt, ...);
+    BtLink::LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[96];
+    BondTable *m_bonds = nullptr;
     Hci   &m_hci;
     L2cap  m_l2;
     BtLink m_link;
