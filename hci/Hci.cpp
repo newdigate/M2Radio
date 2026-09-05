@@ -232,8 +232,10 @@ void runDone(void *ctx, Hci::Error e, const Hci::Reply *r) {
 
 Hci::Error Hci::run(uint16_t opcode, const uint8_t *params, uint8_t plen, Reply *reply,
                     uint32_t timeoutMs, void (*idle)()) {
-    if (busy()) { m_lastError = BUSY; return BUSY; }
+    // Initialise *reply BEFORE the BUSY early return: a caller that logs r.status after a
+    // BUSY would otherwise read uninitialised stack.
     if (reply) { reply->status = 0xFF; reply->statusEvent = false; reply->len = 0; }
+    if (busy()) { m_lastError = BUSY; return BUSY; }
     RunCtx c = { reply, false, OK };
     uint32_t saved = m_timeoutMs; m_timeoutMs = timeoutMs;
     Error e = submit(opcode, params, plen, runDone, &c);
