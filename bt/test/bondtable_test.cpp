@@ -143,5 +143,25 @@ int main() {
         uint8_t ff[BondTable::IMAGE_SIZE]; memset(ff, 0xFF, sizeof ff);
         t.upsert(a); CHECK(!t.load(ff, sizeof ff) && !t.dirty() && t.count() == 0);
     }
+    {   // 11. Found in re-review: a VALID image whose name field has no terminator must not let a
+        //     name run past its entry (measured: 33 chars, into m_count/m_dirty); a name with junk
+        //     after its NUL loads canonically (re-saves byte-identical to a fresh table); and an
+        //     update carrying only an address and a name (an ALL-ZERO key) keeps the stored key,
+        //     keyType and psrm -- the table decides which key goes on the wire, so a name refresh
+        //     can never wipe one.
+        BondTable t; t.upsert(mk(1, 0x40, "OpenMove by Shokz", 4, 1));
+        uint8_t img[BondTable::IMAGE_SIZE]; t.save(img, sizeof img);
+        uint8_t un[BondTable::IMAGE_SIZE]; memcpy(un, img, sizeof un); memset(un + 6 + 24, 'A', 32); fixCrc(un);   // entry 0's name: 32 x 'A', no NUL
+        BondTable u; CHECK(u.load(un, sizeof un) && u.count() == 1 && strlen(u.at(0).name) == 31);
+        uint8_t jk[BondTable::IMAGE_SIZE]; memcpy(jk, img, sizeof jk); memset(jk + 6 + 24 + 4, 'J', 28); memcpy(jk + 6 + 24, "abc", 4); fixCrc(jk);   // "abc\0" then junk
+        BondTable v; CHECK(v.load(jk, sizeof jk) && strcmp(v.at(0).name, "abc") == 0);
+        BondTable w; w.upsert(mk(1, 0x40, "abc", 4, 1));
+        uint8_t a[BondTable::IMAGE_SIZE], b[BondTable::IMAGE_SIZE]; v.save(a, sizeof a); w.save(b, sizeof b);
+        CHECK(memcmp(a, b, sizeof a) == 0);
+        Bond r; memset(&r, 0, sizeof r); memcpy(r.bd, t.at(0).bd, 6); BondTable::copyName(r.name, "Renamed");   // address + name only
+        t.upsert(mk(2, 0x50, "other")); t.upsert(r);
+        const Bond *f = t.find(r.bd);
+        CHECK(f && f->key[0] == 0x40 && f->keyType == 4 && f->psrm == 1 && strcmp(f->name, "Renamed") == 0 && t.at(0).bd[0] == 1);
+    }
     printf("bondtable_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

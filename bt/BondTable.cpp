@@ -49,7 +49,9 @@ void BondTable::upsert(const Bond &b) {
         memmove(&m_b[1], &m_b[0], sizeof(Bond) * (size_t)(m_count - 1));
         m_b[0] = nb;
     } else {
-        if (nb.name[0] == 0) memcpy(nb.name, m_b[i].name, 32);   // an update without a name keeps the old one
+        if (nb.name[0] == 0) memcpy(nb.name, m_b[i].name, 32);   // an update without a name keeps the old one ...
+        bool zeroKey = true; for (int k = 0; k < 16; k++) if (nb.key[k]) { zeroKey = false; break; }
+        if (zeroKey) { memcpy(nb.key, m_b[i].key, 16); nb.keyType = m_b[i].keyType; nb.psrm = m_b[i].psrm; }   // ... and one without a key keeps the key
         m_b[i] = nb; moveToFront(i);
     }
     m_dirty = true;
@@ -88,7 +90,7 @@ bool BondTable::load(const uint8_t *in, uint16_t len) {
     memcpy(m_b, in + 6, sizeof m_b); m_count = in[5];
     memset(&m_b[m_count], 0, sizeof(Bond) * (size_t)(MAX - m_count));      // canonical: nothing beyond count survives
     for (uint8_t i = 0; i < m_count; i++) {
-        m_b[i].name[NAME_MAX] = 0;                                          // never trust an image's terminator
+        copyName(m_b[i].name, m_b[i].name);                                 // never trust an image's terminator or tail (in == out is safe: each byte is read, then written)
         for (uint8_t j = 0; j < i; j++)
             if (memcmp(m_b[i].bd, m_b[j].bd, 6) == 0) { clear(); m_dirty = false; return false; }   // a duplicated address is corruption
     }

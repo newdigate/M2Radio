@@ -24,17 +24,20 @@ public:
     BondTable();
     void clear();                                        // empty the table; sets dirty like every other mutator
     const Bond *find(const uint8_t bd[6]) const;
-    // Insert at the front; an existing entry is updated (an empty new name keeps the old one)
-    // and moved to the front; the LAST entry is evicted when full.  Sets dirty.
+    // Insert at the front; an existing entry is updated and moved to the front; the LAST entry is
+    // evicted when full.  On an update, an EMPTY name keeps the old name and an ALL-ZERO key keeps
+    // the old key, keyType and psrm -- so a caller that knows only the address and the name (a
+    // remote-name refresh) can never wipe the link key that decides what goes on the wire.  Sets dirty.
     void upsert(const Bond &b);
     void touch(const uint8_t bd[6]);                     // move to the front; dirty only if it moved; no-op when absent
     bool erase(const uint8_t bd[6]);                     // sets dirty when it removed something
     uint8_t count() const { return m_count; }
     const Bond &at(uint8_t i) const { return m_b[i]; }   // 0 = most recent; i < count()
-    uint16_t save(uint8_t *out, uint16_t cap) const;     // serialise; IMAGE_SIZE, or 0 when cap < IMAGE_SIZE
+    uint16_t save(uint8_t *out, uint16_t cap) const;     // serialise; IMAGE_SIZE, or 0 when cap < IMAGE_SIZE.  Leaves dirty as is: the store clears it after a successful write
     // Deserialise.  False AND an EMPTY table on any bad magic/version/count/length/CRC or a
     // duplicated address -- a caller can never keep stale RAM entries by mistake.  Loads
-    // CANONICALLY: entries beyond `count` are zeroed, so equal tables give equal images.
+    // CANONICALLY: entries beyond `count` are zeroed and every name is re-terminated and zero-tailed,
+    // so equal tables give equal images.
     // Clears dirty either way (RAM now == store; a corrupt image is left in place until the
     // next real change, which is a decision, not an accident).
     bool load(const uint8_t *in, uint16_t len);
