@@ -68,17 +68,28 @@ int main() {
         BondTable u; CHECK(u.load(img, sizeof img) && u.count() == 2 && !u.dirty());
         CHECK(u.at(0).bd[0] == 2 && u.at(0).keyType == 0 && u.at(0).psrm == 2 && strcmp(u.at(0).name, "EVKB-SINK") == 0);
         CHECK(u.at(1).bd[0] == 1 && memcmp(u.at(1).key, t.at(1).key, 16) == 0);
+        // Every bad image below is loaded into a table that HOLDS a stale bond: the contract is
+        // false AND empty AND clean, so a rejected image can never leave a key behind for
+        // Link_Key_Request.  (Before this, six of these arms asserted emptiness against an
+        // already-empty table and passed against a load() that kept stale entries on bad
+        // magic/version/count -- found by mutation in review.)
+        Bond stale = mk(7, 7, "stale");
         uint8_t bad[BondTable::IMAGE_SIZE];
-        BondTable v;
-        memcpy(bad, img, sizeof bad); bad[6 + 20] ^= 0x01;                      // one key byte flipped, CRC now wrong
-        v.upsert(mk(7, 7, "stale")); CHECK(!v.load(bad, sizeof bad) && v.count() == 0);
-        memcpy(bad, img, sizeof bad); v.upsert(mk(7, 7, "stale")); CHECK(!v.load(bad, BondTable::IMAGE_SIZE - 1) && v.count() == 0);   // truncated
-        memcpy(bad, img, sizeof bad); bad[0] = 'X'; fixCrc(bad);              CHECK(!v.load(bad, sizeof bad) && v.count() == 0);     // magic
-        memcpy(bad, img, sizeof bad); bad[4] = 2;   fixCrc(bad);              CHECK(!v.load(bad, sizeof bad) && v.count() == 0);     // version
-        memcpy(bad, img, sizeof bad); bad[5] = 5;   fixCrc(bad);              CHECK(!v.load(bad, sizeof bad) && v.count() == 0);     // count > MAX
-        uint8_t ff[BondTable::IMAGE_SIZE]; memset(ff, 0xFF, sizeof ff);      CHECK(!v.load(ff, sizeof ff) && v.count() == 0);       // a fresh part
-        memset(ff, 0x00, sizeof ff);                                          CHECK(!v.load(ff, sizeof ff) && v.count() == 0);       // a QEMU run
-        CHECK(!v.load(nullptr, 0) && v.count() == 0);
+        { BondTable v; v.upsert(stale); memcpy(bad, img, sizeof bad); bad[6 + 20] ^= 0x01;
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // one key byte flipped, CRC wrong
+        { BondTable v; v.upsert(stale); memcpy(bad, img, sizeof bad);
+          CHECK(!v.load(bad, BondTable::IMAGE_SIZE - 1) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // truncated
+        { BondTable v; v.upsert(stale); memcpy(bad, img, sizeof bad); bad[0] = 'X'; fixCrc(bad);
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // magic
+        { BondTable v; v.upsert(stale); memcpy(bad, img, sizeof bad); bad[4] = 2; fixCrc(bad);
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // version
+        { BondTable v; v.upsert(stale); memcpy(bad, img, sizeof bad); bad[5] = 5; fixCrc(bad);
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // count > MAX
+        { BondTable v; v.upsert(stale); memset(bad, 0xFF, sizeof bad);
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // a fresh part
+        { BondTable v; v.upsert(stale); memset(bad, 0x00, sizeof bad);
+          CHECK(!v.load(bad, sizeof bad) && v.count() == 0 && !v.dirty() && v.find(stale.bd) == nullptr); }   // a QEMU run
+        { BondTable v; v.upsert(stale); CHECK(!v.load(nullptr, 0) && v.count() == 0 && !v.dirty()); }
     }
     {   // 8. Names: truncated to 31 characters, always terminated; an EMPTY name on update keeps the old one
         //    (the notification handler may not know the name of a device it did not inquire this boot).
@@ -88,6 +99,49 @@ int main() {
         t.upsert(b);
         t.upsert(mk(1, 2, ""));
         CHECK(strlen(t.at(0).name) == 31 && t.at(0).key[0] == 2);
+    }
+    {   // 9. Boundaries found by mutation in review: a FULL table round-trips (count == MAX is the
+        //    in[5] > MAX edge); save() refuses a buffer one byte short; refreshing the LEAST-recent
+        //    entry of a full table moves it to the front; erase() at index 0 shifts the survivors
+        //    down and zeroes the vacated slot (no stale key material; equal tables give equal
+        //    images); an image whose count says 0 over a populated body loads canonically; an
+        //    image with a duplicated address is refused as corrupt.
+        BondTable t;
+        for (uint8_t i = 1; i <= 4; i++) t.upsert(mk(i, i, "n"));
+        uint8_t img[BondTable::IMAGE_SIZE];
+        CHECK(t.save(img, BondTable::IMAGE_SIZE - 1) == 0);
+        CHECK(t.save(img, sizeof img) == BondTable::IMAGE_SIZE && img[5] == 4);
+        BondTable u; CHECK(u.load(img, sizeof img) && u.count() == 4 && u.at(0).bd[0] == 4 && u.at(3).bd[0] == 1);
+        u.upsert(mk(1, 0x11, "n"));                                                          // refresh the least recent
+        CHECK(u.count() == 4 && u.at(0).bd[0] == 1 && u.at(0).key[0] == 0x11 && u.at(1).bd[0] == 4 && u.at(3).bd[0] == 2);
+        CHECK(u.erase(mk(1, 0, "").bd) && u.count() == 3 && u.at(0).bd[0] == 4 && u.at(1).bd[0] == 3 && u.at(2).bd[0] == 2);   // erase at index 0
+        uint8_t a[BondTable::IMAGE_SIZE], b[BondTable::IMAGE_SIZE];
+        u.save(a, sizeof a);
+        BondTable w; w.upsert(mk(2, 2, "n")); w.upsert(mk(3, 3, "n")); w.upsert(mk(4, 4, "n"));   // the same three, built fresh
+        w.save(b, sizeof b);
+        CHECK(memcmp(a, b, sizeof a) == 0);                                                  // the vacated slot was zeroed
+        memcpy(img, b, sizeof img); img[5] = 0; fixCrc(img);                                 // count 0 over a populated body
+        BondTable x; CHECK(x.load(img, sizeof img) && x.count() == 0);
+        uint8_t z[BondTable::IMAGE_SIZE]; BondTable e; e.save(z, sizeof z);
+        x.save(img, sizeof img); CHECK(memcmp(img, z, sizeof z) == 0);                      // loaded canonically: body zeroed
+        memcpy(img, b, sizeof img); memcpy(img + 6 + 56, img + 6, 6); fixCrc(img);           // entry 1 takes entry 0's address
+        BondTable d; d.upsert(mk(7, 7, "stale")); CHECK(!d.load(img, sizeof img) && d.count() == 0 && !d.dirty());
+    }
+    {   // 10. Six-byte address identity (two bonds differing only in the LAST byte are distinct),
+        //     copyName's zero tail and null input, touch() on an ABSENT address leaves dirty alone,
+        //     clear() sets dirty, load() clears dirty even on failure.
+        BondTable t;
+        Bond a = mk(1, 0x10, "A"), b = mk(1, 0x20, "B"); b.bd[5] = 0xAB;
+        t.upsert(a); t.upsert(b);
+        CHECK(t.count() == 2 && t.find(a.bd) && t.find(a.bd)->key[0] == 0x10 && t.find(b.bd) && t.find(b.bd)->key[0] == 0x20);
+        char nm[32]; memset(nm, 0xAA, sizeof nm); BondTable::copyName(nm, "abc");
+        bool tailZero = true; for (int i = 3; i < 32; i++) if (nm[i] != 0) tailZero = false;
+        CHECK(strcmp(nm, "abc") == 0 && tailZero);
+        memset(nm, 0xAA, sizeof nm); BondTable::copyName(nm, nullptr); CHECK(nm[0] == 0 && nm[31] == 0);
+        t.clearDirty(); t.touch(mk(9, 0, "").bd); CHECK(!t.dirty());
+        t.clear(); CHECK(t.dirty() && t.count() == 0);
+        uint8_t ff[BondTable::IMAGE_SIZE]; memset(ff, 0xFF, sizeof ff);
+        t.upsert(a); CHECK(!t.load(ff, sizeof ff) && !t.dirty() && t.count() == 0);
     }
     printf("bondtable_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

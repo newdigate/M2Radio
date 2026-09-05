@@ -3,6 +3,10 @@
 
 static_assert(sizeof(Bond) == 56, "Bond must be 56 bytes with no padding: the image layout depends on it");
 static const uint8_t MAGIC[4] = { 'B', 'T', 'B', 'D' };
+const uint8_t  BondTable::MAX;
+const uint8_t  BondTable::NAME_MAX;
+const uint8_t  BondTable::VERSION;
+const uint16_t BondTable::IMAGE_SIZE;
 
 BondTable::BondTable() : m_count(0), m_dirty(false) { memset(m_b, 0, sizeof m_b); }
 
@@ -21,7 +25,7 @@ void BondTable::copyName(char out[32], const char *in) {
     for (size_t i = n; i < 32; i++) out[i] = 0;          // terminator + a zero tail, so equal tables give equal images
 }
 
-void BondTable::clear() { memset(m_b, 0, sizeof m_b); m_count = 0; }
+void BondTable::clear() { memset(m_b, 0, sizeof m_b); m_count = 0; m_dirty = true; }
 
 int BondTable::indexOf(const uint8_t bd[6]) const {
     for (uint8_t i = 0; i < m_count; i++) if (memcmp(m_b[i].bd, bd, 6) == 0) return (int)i;
@@ -82,6 +86,11 @@ bool BondTable::load(const uint8_t *in, uint16_t len) {
                   | ((uint32_t)in[IMAGE_SIZE - 2] << 16) | ((uint32_t)in[IMAGE_SIZE - 1] << 24);
     if (crc32(in, IMAGE_SIZE - 4) != want) return false;
     memcpy(m_b, in + 6, sizeof m_b); m_count = in[5];
-    for (uint8_t i = 0; i < MAX; i++) m_b[i].name[NAME_MAX] = 0;   // never trust an image's terminator
+    memset(&m_b[m_count], 0, sizeof(Bond) * (size_t)(MAX - m_count));      // canonical: nothing beyond count survives
+    for (uint8_t i = 0; i < m_count; i++) {
+        m_b[i].name[NAME_MAX] = 0;                                          // never trust an image's terminator
+        for (uint8_t j = 0; j < i; j++)
+            if (memcmp(m_b[i].bd, m_b[j].bd, 6) == 0) { clear(); m_dirty = false; return false; }   // a duplicated address is corruption
+    }
     return true;
 }

@@ -19,10 +19,10 @@ public:
     static const uint8_t  MAX = 4;
     static const uint8_t  NAME_MAX = 31;
     static const uint8_t  VERSION = 1;
-    static const uint16_t IMAGE_SIZE = 4 + 1 + 1 + MAX * 56 + 4;   // "BTBD" ver count entries crc32 = 234
+    static const uint16_t IMAGE_SIZE = 4 + 1 + 1 + MAX * sizeof(Bond) + 4;   // "BTBD" ver count entries crc32 = 234
 
     BondTable();
-    void clear();                                        // empty the table; leaves dirty alone
+    void clear();                                        // empty the table; sets dirty like every other mutator
     const Bond *find(const uint8_t bd[6]) const;
     // Insert at the front; an existing entry is updated (an empty new name keeps the old one)
     // and moved to the front; the LAST entry is evicted when full.  Sets dirty.
@@ -32,13 +32,21 @@ public:
     uint8_t count() const { return m_count; }
     const Bond &at(uint8_t i) const { return m_b[i]; }   // 0 = most recent; i < count()
     uint16_t save(uint8_t *out, uint16_t cap) const;     // serialise; IMAGE_SIZE, or 0 when cap < IMAGE_SIZE
-    // Deserialise.  False AND an EMPTY table on any bad magic/version/count/length/CRC -- a caller
-    // can never keep stale RAM entries by mistake.  Clears dirty either way (RAM now == store).
+    // Deserialise.  False AND an EMPTY table on any bad magic/version/count/length/CRC or a
+    // duplicated address -- a caller can never keep stale RAM entries by mistake.  Loads
+    // CANONICALLY: entries beyond `count` are zeroed, so equal tables give equal images.
+    // Clears dirty either way (RAM now == store; a corrupt image is left in place until the
+    // next real change, which is a decision, not an accident).
     bool load(const uint8_t *in, uint16_t len);
     bool dirty() const { return m_dirty; }
     void clearDirty() { m_dirty = false; }
     static uint32_t crc32(const uint8_t *p, size_t n);   // IEEE 802.3, reflected, init/xorout 0xFFFFFFFF ("123456789" -> 0xCBF43926)
     static void copyName(char out[32], const char *in);  // truncating copy, NUL-terminated, zero-padded tail
+    // ★ Pointers from find() and references from at() are INVALIDATED by upsert()/touch()/erase()
+    // (every mutator memmoves the entries): copy a Bond out before mutating or paging.  Not
+    // reentrant and not ISR-safe -- call from one context (BtLink's handlers run from the
+    // idle()-pumped HCI dispatch and only ever submit(), so they never nest).  Bump VERSION
+    // whenever Bond or MAX changes: an old image then fails on VERSION, not merely on CRC.
 private:
     int  indexOf(const uint8_t bd[6]) const;
     void moveToFront(int i);
