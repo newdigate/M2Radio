@@ -162,6 +162,9 @@ int main() {
         Hci::Reply r;
         CHECK(hci.submit(0x0C03, nullptr, 0, nullptr, nullptr) == Hci::OK);
         CHECK(hci.run(0x1001, nullptr, 0, &r, 100, idle10) == Hci::BUSY);
+        // ... and *reply is INITIALISED despite the refusal: run() writes it before the busy check,
+        // so a caller that logs r.status after a BUSY reads 0xFF rather than uninitialised stack.
+        CHECK(r.status == 0xFF && !r.statusEvent && r.len == 0);
     }
     {   // 13. begin() preserves callbacks registered before it -- a re-init
         //     after a bad fault must not silently unhook events/ACL (the

@@ -265,14 +265,15 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
                  m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
                  m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
                  m_haveLinkKey ? "stored" : "none");
-        } else if (!(m_authDone && m_authStatus == 0x00)) {
+        } else if (m_authDone && m_authStatus == 0x00) {
+            // Success with a key offered AND a new key notified: the peer chose to re-pair.  The
+            // notification handler already saved the new key and pairedBy() reads ssp/pin.
+        } else {
             // Any other outcome with a key offered (timeout, LMP response timeout, ...) is
             // transient: keep the bond, fail the attempt.  No PIN fallback -- nothing was pairing.
             logf("auth(stored)=fail status=0x%02X -> bond kept", m_authDone ? m_authStatus : 0xFF);
             return PAIRING_FAILED;
         }
-        // (success with a key offered AND a new key notified: the peer chose to re-pair; the
-        // notification handler already saved the new key and pairedBy() reads ssp/pin.)
     }
 
     if (!m_authDone || m_authStatus != 0x00) {
@@ -391,7 +392,7 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         if (b) {
             // NEW-34: Link_Key_Request_Reply with the stored key -- no pairing follows if the peer agrees.
             uint8_t rp[22]; memcpy(rp, p, 6); memcpy(rp + 6, b->key, 16);
-            m_keyOffered = true;
+            if (memcmp(p, m_bd, 6) == 0) m_keyOffered = true;    // the rung acts on m_bd: only a key offered for THIS link counts (a request for another bonded peer is still answered)
             logf("link_key_req: bd=%s -> reply(stored type=%u)", bs, b->keyType);
             m_hci.submit(OP_LINK_KEY_REQ_REPLY, rp, 22, nullptr, nullptr);
         } else {

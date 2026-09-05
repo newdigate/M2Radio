@@ -188,7 +188,10 @@ int main() {
         //    Link_Key_Request is answered with Link_Key_Request_Reply carrying the EXACT stored key; no
         //    negative reply and no IO-capability dance follow; pairedBy() reads "stored"; encryption comes up.
         FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
-        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz");
+        { Bond o; memset(&o, 0, sizeof o); const uint8_t obd[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }; memcpy(o.bd, obd, 6); memset(o.key, 0x99, 16); o.keyType = 4; o.psrm = 1;
+          BondTable::copyName(o.name, "OtherHeadset"); bonds.upsert(o); bonds.clearDirty(); }      // the target is now index 1: a stored-key success must move it to the front
+        link.setBonds(&bonds);
         io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
             if (preamble(f, op, prm)) return;
             if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
@@ -207,7 +210,7 @@ int main() {
         CHECK(kr && kr->size() == 22 && memcmp(kr->data(), BD, 6) == 0 && memcmp(kr->data() + 6, KEY1, 16) == 0);
         CHECK(io.count(0x040B) == 1 && io.count(0x040C) == 0 && io.count(0x042B) == 0 && io.count(0x040D) == 0 && io.count(0x0411) == 1);
         CHECK(strcmp(link.pairedBy(), "stored") == 0 && link.encrypted());
-        CHECK(bonds.count() == 1 && !bonds.dirty());                                      // touched, but already at the front
+        CHECK(bonds.count() == 2 && memcmp(bonds.at(0).bd, BD, 6) == 0 && bonds.dirty());   // touch(): the reconnected peer is most recent again, and the host will persist it
     }
     {   // 9. NEW-34: the peer REJECTS the stored key (Authentication_Complete 0x06, PIN or Key Missing): the bond
         //    is erased, ONE more Authentication_Requested runs with SSP still on, its Link_Key_Request now gets the
@@ -223,12 +226,12 @@ int main() {
             if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
             f.cc(op, { 0x01 });
         };
-        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.page(BD, 2, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);   // psrm R2: the re-paired bond must store the mode we paged with
         CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
         CHECK(io.count(0x0411) == 2 && io.count(0x040B) == 1 && io.count(0x040C) == 1 && io.count(0x042B) == 1);
         CHECK(io.count(0x0C56) == 1);                                                     // SSP mode written ONCE (by page): the SSP-off fallback did not run
         const Bond *b = bonds.find(BD);
-        CHECK(b && memcmp(b->key, KEY2, 16) == 0 && b->keyType == 4 && b->psrm == 1 && strcmp(b->name, "OpenMove by Shokz") == 0 && bonds.dirty());
+        CHECK(b && memcmp(b->key, KEY2, 16) == 0 && b->keyType == 4 && b->psrm == 2 && strcmp(b->name, "OpenMove by Shokz") == 0 && bonds.dirty());
         CHECK(strcmp(link.pairedBy(), "ssp") == 0 && link.encrypted());
         bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected: status=0x06 -> erased") != std::string::npos) sawReject = true;
         CHECK(sawReject);
@@ -277,6 +280,61 @@ int main() {
         CHECK(bonds.count() == 1 && bonds.dirty());
         bool sawSaved = false; for (auto &l : g_log) if (l.find("bond=saved") != std::string::npos) sawSaved = true;
         CHECK(sawSaved);
+    }
+    {   // 13. NEW-34: the peer rejects with 0x05 (Authentication Failure -- it holds a DIFFERENT key for us): the
+        //     same erase-and-re-pair rung as 0x06.  (Mutation-found: with only 0x06 in the condition the suite stayed green.)
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x05, 0x01, 0x00 }); return; }   // Authentication Failure
+            if (sspDance(f, op, prm, KEY2)) return;
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
+        const Bond *b = bonds.find(BD);
+        CHECK(b && memcmp(b->key, KEY2, 16) == 0 && strcmp(link.pairedBy(), "ssp") == 0);
+        bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected: status=0x05 -> erased") != std::string::npos) sawReject = true;
+        CHECK(sawReject);
+    }
+    {   // 14. NEW-34: a Link_Key_Request for a bonded address that is NOT the one we paged is answered from the
+        //     table (a controller is entitled to ask), but must NOT mark a key as offered for THIS link: the rung
+        //     acts on m_bd, so otherwise a rejection would erase the WRONG bond and re-offer the rejected one.
+        //     (Demonstrated in review before this arm existed: peer A's bond erased for peer B's rejection.)
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        static const uint8_t OBD[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz");
+        { Bond o; memset(&o, 0, sizeof o); memcpy(o.bd, OBD, 6); memcpy(o.key, KEY2, 16); o.keyType = 4; o.psrm = 1; BondTable::copyName(o.name, "OtherHeadset"); bonds.upsert(o); bonds.clearDirty(); }
+        link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(OBD, OBD + 6)); return; }          // the controller asks for the OTHER peer's key
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x06, 0x01, 0x00 }); return; }   // ... and that authentication fails
+            if (op == 0x0C56) { f.cc(op, { 0x00 }); return; }
+            f.cc(op, { 0x01 });                                                                            // nothing else succeeds: the attempt fails
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) != BtLink::OK);
+        const std::vector<uint8_t> *kr = io.last(0x040B);
+        CHECK(kr && kr->size() == 22 && memcmp(kr->data(), OBD, 6) == 0 && memcmp(kr->data() + 6, KEY2, 16) == 0);   // answered from the table
+        CHECK(bonds.count() == 2 && bonds.find(BD) && bonds.find(OBD) && !bonds.dirty());                 // NEITHER bond erased, nothing to persist
+        bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected") != std::string::npos) sawReject = true;
+        CHECK(!sawReject);
+    }
+    {   // 15. page() with attempts == 0 is clamped to one page (a zero would send the setup commands and report
+        //     TIMEOUT having paged nothing).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, nullptr, 0, fakeNow, idle10) == BtLink::OK && io.count(0x0405) == 1);
     }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
