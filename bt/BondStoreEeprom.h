@@ -42,11 +42,12 @@
 #include "BondTable.h"
 
 struct BondStoreEeprom {
-    static const uint16_t OFFSET = 4000;
-    static const uint16_t END = OFFSET + BondTable::IMAGE_SIZE;         // 4234, one past the image
+    enum : uint16_t { OFFSET = 4000, END = OFFSET + BondTable::IMAGE_SIZE };   // 4234 = one past the image.  An enum, not static consts: odr-usable with no .cpp behind this header
     static_assert(END <= E2END + 1u, "bond image does not fit the emulated EEPROM");
     // Read the image and load the table.  False (and an EMPTY table) on a fresh part (0xFF),
     // a QEMU run (0x00), or anything another firmware scribbled over -- never a stale bond.
+    // TRUE means the image was VALID, not that any bond exists: read count().  A wiped
+    // store loads true with count() == 0.
     static bool load(BondTable &t) {
         uint8_t img[BondTable::IMAGE_SIZE];
         eeprom_read_block(img, (const void *)(uintptr_t)OFFSET, sizeof img);
@@ -63,8 +64,8 @@ struct BondStoreEeprom {
         t.clearDirty();
         return true;
     }
-    // Bench knob (M2_BT_FORGET_BONDS): store the canonical EMPTY image, so a later load()
+    // Bench knob (M2_BT_FORGET_BONDS): store the canonical EMPTY image (true when written), so a later load()
     // reads true with no bonds -- a deliberate forget stays distinguishable from damage.
     // (clear() dirties the table, which is what lets save() write.)
-    static void wipe(BondTable &t) { t.clear(); save(t); }
+    static bool wipe(BondTable &t) { t.clear(); return save(t); }
 };
