@@ -30,7 +30,7 @@ public:
     void setBonds(BondTable *t) { m_bonds = t; }
     BondTable *bonds() { return m_bonds; }
     // now() = a millisecond clock; idle() = pump the HCI + yield (the app passes millis and its idleMs).
-    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> page(hit, PAGE_ATTEMPTS)
+    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (12.8 s + a name request per hit) -> page(hit, PAGE_ATTEMPTS)
     // Page ONE address directly -- no inquiry: Set_Event_Mask, Write_Simple_Pairing_Mode,
     // Write_Page_Timeout, then Create_Connection up to `attempts` times (cancel-a-silent-page,
     // retry on Page Timeout).  connect() calls it for its inquiry hit (clk from the hit, valid);
@@ -59,7 +59,7 @@ private:
     char m_pin[4] = {'1','2','3','4'}; const char *m_pairedBy = "none";
     bool m_legacyPin = false;
     BondTable *m_bonds = nullptr;
-    [[maybe_unused]] volatile bool m_keyOffered = false;      // this authentication was answered with a STORED key
+    volatile bool m_keyOffered = false;      // this authentication was answered with a STORED key
     char m_pageName[32] = {0};               // the name page() was given, for the bond a notification creates
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;

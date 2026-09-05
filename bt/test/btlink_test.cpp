@@ -51,6 +51,27 @@ static bool preamble(FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
 }
 static std::vector<uint8_t> connComplete(uint8_t status, uint16_t h = 0x0001) {
     std::vector<uint8_t> r = { status, (uint8_t)h, (uint8_t)(h >> 8) }; r.insert(r.end(), BD, BD + 6); r.push_back(0x01); r.push_back(0x00); return r; }
+static const uint8_t KEY1[16] = { 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F };
+static const uint8_t KEY2[16] = { 0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2A,0x2B,0x2C,0x2D,0x2E,0x2F };
+static void seedBond(BondTable &t, const uint8_t *key, const char *name) {
+    Bond b; memset(&b, 0, sizeof b); memcpy(b.bd, BD, 6); memcpy(b.key, key, 16); b.keyType = 4; b.psrm = 1;
+    BondTable::copyName(b.name, name); t.upsert(b); t.clearDirty();
+}
+static std::vector<uint8_t> withBd(std::vector<uint8_t> head, const std::vector<uint8_t> &prm) { head.insert(head.end(), prm.begin(), prm.begin() + 6); return head; }
+// The SSP Just-Works dance a controller runs after a NEGATIVE link-key reply, ending in a
+// Link_Key_Notification carrying `key` and a successful Authentication_Complete.
+static bool sspDance(FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm, const uint8_t *key) {
+    std::vector<uint8_t> bd(BD, BD + 6);
+    if (op == 0x040C) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x31, bd); return true; }                        // -> IO_Capability_Request
+    if (op == 0x042B) { f.cc(op, withBd({ 0x00 }, prm));
+                        std::vector<uint8_t> rsp = bd; rsp.push_back(0x03); rsp.push_back(0x00); rsp.push_back(0x04); f.ev(0x32, rsp);
+                        std::vector<uint8_t> uc = bd; uc.push_back(0x40); uc.push_back(0xE2); uc.push_back(0x01); uc.push_back(0x00); f.ev(0x33, uc); return true; }
+    if (op == 0x042C) { f.cc(op, withBd({ 0x00 }, prm));
+                        std::vector<uint8_t> spc = { 0x00 }; spc.insert(spc.end(), BD, BD + 6); f.ev(0x36, spc);
+                        std::vector<uint8_t> lk = bd; lk.insert(lk.end(), key, key + 16); lk.push_back(0x04); f.ev(0x18, lk);
+                        f.ev(0x06, { 0x00, 0x01, 0x00 }); return true; }
+    return false;
+}
 int main() {
     {   // 1. The controller answers Create_Connection with Command Status and then NOTHING (the bench's
         //    "connect=timeout (no Connection_Complete)"): BtLink must (a) have written Write_Page_Timeout 0x2000
@@ -71,6 +92,8 @@ int main() {
         CHECK(io.indexOf(0x0C18) >= 0 && io.indexOf(0x0C18) < io.indexOf(0x0405));   // written BEFORE the first page
         const std::vector<uint8_t> *cc = io.last(0x0405);
         CHECK(cc && cc->size() == 13 && memcmp(cc->data(), BD, 6) == 0 && (*cc)[6] == 0x18 && (*cc)[7] == 0xCC && (*cc)[12] == 0x00);
+        CHECK((*cc)[8] == 0x01 && (*cc)[9] == 0x00);        // psrm from the hit (R1), reserved 0 -- pins the argument order of page()
+        CHECK((*cc)[10] == 0x54 && (*cc)[11] == 0x88);      // clk 0x0854 with bit 15 VALID: connect() passes clkValid=true
         CHECK(io.count(0x0408) >= 1);
         const std::vector<uint8_t> *cx = io.last(0x0408);
         CHECK(cx && cx->size() == 6 && memcmp(cx->data(), BD, 6) == 0);
@@ -144,6 +167,116 @@ int main() {
         }
         CHECK(!sawNcp);                                     // the flood is suppressed
         CHECK(sawOther);                                    // genuine unknowns are still traced
+    }
+    {   // 7. EVERY page reports Page Timeout (Connection_Complete status 0x04): the loop exhausts
+        //    `attempts` and reports the controller's status -- CONNECT_STATUS, as connect() has
+        //    always done (the 0x04 line's `attempt < attempts` guard falls through to the generic
+        //    non-zero-status line).  Pins the result code the Task 3 pure-refactor correction
+        //    restored: a version returning TIMEOUT here passes every other arm (measured).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x04)); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.connect("Shokz", fakeNow, idle10) == BtLink::CONNECT_STATUS);
+        CHECK(io.count(0x0405) == BtLink::PAGE_ATTEMPTS);   // all attempts used
+        CHECK(io.count(0x0408) == 0);                        // a REPORTED Page Timeout needs no cancel
+        CHECK(io.count(0x0401) == 1);                        // no fresh inquiry between pages
+    }
+    {   // 8. NEW-34: a bonded page (no inquiry, clock offset invalid) + a stored-key authentication:
+        //    Link_Key_Request is answered with Link_Key_Request_Reply carrying the EXACT stored key; no
+        //    negative reply and no IO-capability dance follow; pairedBy() reads "stored"; encryption comes up.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }          // Link_Key_Request
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x00, 0x01, 0x00 }); return; }   // key matched -> Auth Complete ok
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(io.count(0x0401) == 0);                                                     // no inquiry
+        const std::vector<uint8_t> *cc = io.last(0x0405);
+        CHECK(cc && cc->size() == 13 && memcmp(cc->data(), BD, 6) == 0 && (*cc)[8] == 1 && (*cc)[10] == 0x00 && (*cc)[11] == 0x00);   // psrm R1, clock offset 0 / INVALID
+        CHECK(io.count(0x0405) == 1);                                                     // `attempts` honoured
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
+        const std::vector<uint8_t> *kr = io.last(0x040B);
+        CHECK(kr && kr->size() == 22 && memcmp(kr->data(), BD, 6) == 0 && memcmp(kr->data() + 6, KEY1, 16) == 0);
+        CHECK(io.count(0x040B) == 1 && io.count(0x040C) == 0 && io.count(0x042B) == 0 && io.count(0x040D) == 0 && io.count(0x0411) == 1);
+        CHECK(strcmp(link.pairedBy(), "stored") == 0 && link.encrypted());
+        CHECK(bonds.count() == 1 && !bonds.dirty());                                      // touched, but already at the front
+    }
+    {   // 9. NEW-34: the peer REJECTS the stored key (Authentication_Complete 0x06, PIN or Key Missing): the bond
+        //    is erased, ONE more Authentication_Requested runs with SSP still on, its Link_Key_Request now gets the
+        //    negative reply, the SSP dance yields a NEW key, and the table holds that key under the paged name.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x06, 0x01, 0x00 }); return; }   // PIN or Key Missing
+            if (sspDance(f, op, prm, KEY2)) return;
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
+        CHECK(io.count(0x0411) == 2 && io.count(0x040B) == 1 && io.count(0x040C) == 1 && io.count(0x042B) == 1);
+        CHECK(io.count(0x0C56) == 1);                                                     // SSP mode written ONCE (by page): the SSP-off fallback did not run
+        const Bond *b = bonds.find(BD);
+        CHECK(b && memcmp(b->key, KEY2, 16) == 0 && b->keyType == 4 && b->psrm == 1 && strcmp(b->name, "OpenMove by Shokz") == 0 && bonds.dirty());
+        CHECK(strcmp(link.pairedBy(), "ssp") == 0 && link.encrypted());
+        bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected: status=0x06 -> erased") != std::string::npos) sawReject = true;
+        CHECK(sawReject);
+    }
+    {   // 10. NEW-34: a stored-key authentication that fails for a TRANSIENT reason (0x08 Connection Timeout) keeps
+        //     the bond, runs no second Authentication_Requested and no PIN fallback, and fails by name.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x08, 0x01, 0x00 }); return; }   // Connection Timeout
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::PAIRING_FAILED);
+        CHECK(io.count(0x0411) == 1 && io.count(0x040C) == 0 && io.count(0x0C56) == 1 && io.count(0x0413) == 0);
+        CHECK(bonds.find(BD) != nullptr && !bonds.dirty());
+    }
+    {   // 11. No table set (the default): Link_Key_Request still gets the negative reply -- byte-identical to
+        //     before NEW-34, which is what keeps every existing gate's wire sequence unchanged.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) { f.cc(op, withBd({ 0x00 }, prm)); };
+        std::vector<uint8_t> bd(BD, BD + 6);
+        link.onEvent(0x17, bd.data(), 6); idle10(); idle10();
+        CHECK(io.count(0x040C) == 1 && io.count(0x040B) == 0);
+    }
+    {   // 12. NEW-34: a FRESH pairing through connect() (inquiry -> page -> SSP) saves the bond with the key from
+        //     the notification, the psrm we paged with and the name from the INQUIRY HIT.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (sspDance(f, op, prm, KEY1)) return;
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.connect("Shokz", fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
+        CHECK(io.count(0x040B) == 0 && io.count(0x040C) == 1 && strcmp(link.pairedBy(), "ssp") == 0);
+        const Bond *b = bonds.find(BD);
+        CHECK(b && memcmp(b->key, KEY1, 16) == 0 && b->keyType == 4 && b->psrm == 1 && strcmp(b->name, "OpenMove by Shokz") == 0);
+        CHECK(bonds.count() == 1 && bonds.dirty());
+        bool sawSaved = false; for (auto &l : g_log) if (l.find("bond=saved") != std::string::npos) sawSaved = true;
+        CHECK(sawSaved);
     }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

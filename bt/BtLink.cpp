@@ -24,6 +24,7 @@ enum {
     OP_AUTH_REQUESTED      = 0x0411,
     OP_SET_CONN_ENCRYPTION = 0x0413,
     OP_LINK_KEY_REQ_NEG    = 0x040C,
+    OP_LINK_KEY_REQ_REPLY  = 0x040B,   // bd(6) key(16) -> Command Complete status+bd (NEW-34)
     OP_IO_CAP_REQ_REPLY    = 0x042B,
     OP_USER_CONF_REQ_REPLY = 0x042C,
     OP_WRITE_SSP_MODE      = 0x0C56,
@@ -134,6 +135,8 @@ BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, boo
                             uint8_t attempts, uint32_t (*now)(), void (*idle)()) {
     memcpy(m_bd, bd, 6); m_psrm = psrm; m_clk = clk;
     BondTable::copyName(m_pageName, name);
+    m_keyOffered = false;                                      // a new candidate: the stored-key flag belongs to this link only
+    if (attempts == 0) attempts = 1;                           // zero would send the setup commands and report TIMEOUT with no page
     Hci::Reply r;
     uint32_t t0;
 
@@ -208,21 +211,22 @@ BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, boo
     return TIMEOUT;
 }
 
-// --- pairAndEncrypt(): Authentication_Requested (SSP path); on failure,
-// Write_Simple_Pairing_Mode=0 and retry (the PIN_Code_Request path);
-// Set_Connection_Encryption on success.  Ported from the second half of
-// probeConnect().  Every command that answers via Command Status is guarded
-// the way connect() guards Create_Connection: a rejected/unaccepted command
-// returns immediately instead of busy-waiting out the full event timeout. ---
+// --- pairAndEncrypt(): Authentication_Requested; if a STORED key was offered (NEW-34)
+// the outcome decides the first rung -- success = a stored-key authentication, a
+// 0x05/0x06 rejection = erase the bond and pair afresh on this link, anything else =
+// transient, keep the bond and fail; then the pre-existing SSP path with its
+// Write_Simple_Pairing_Mode=0 + PIN retry; Set_Connection_Encryption on success.
+// Every command that answers via Command Status is guarded the way page() guards
+// Create_Connection: a rejected/unaccepted command returns immediately. ---
 BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
     Hci::Reply r;
     uint8_t hp[2] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8) };
 
-    // Authentication_Requested -> Link_Key_Request(neg) -> SSP -> Link_Key_Notification
+    // Authentication_Requested -> Link_Key_Request(stored key or neg) -> [SSP] -> [Link_Key_Notification]
     //   -> Authentication_Complete.  Encryption needs the link AUTHENTICATED, so
     //   wait for Auth_Complete (not just Simple_Pairing_Complete) -- else
     //   Set_Connection_Encryption races ahead and fails with 0x2F.
-    m_pairDone = false; m_authDone = false; m_haveLinkKey = false;
+    m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
     Hci::Error ae = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
     if (ae != Hci::OK || !r.statusEvent) {
         logf("auth_requested=fail reason=%s status=0x%02X", ae == Hci::OK ? "not_command_status" : Hci::errorName(ae), r.status);
@@ -235,6 +239,42 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
          m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
          m_haveLinkKey ? "stored" : "none");
 
+    if (m_keyOffered) {
+        if (m_authDone && m_authStatus == 0x00 && !m_haveLinkKey) {
+            // The peer accepted the stored key: authenticated with no pairing at all.
+            m_pairedBy = "stored";
+            if (m_bonds) m_bonds->touch(m_bd);
+        } else if (m_authDone && (m_authStatus == 0x05 || m_authStatus == 0x06)) {
+            // The peer holds no matching key for us (it forgot us, or was re-paired elsewhere):
+            // the bond is stale.  Erase it and pair afresh on THIS link -- the next
+            // Link_Key_Request gets the negative reply and the SSP dance (or the PIN path when
+            // SSP is off) follows.  If the peer tears the ACL down first, the command below fails
+            // with No Connection and the next attempt pairs fresh: the bond is already gone.
+            if (m_bonds) m_bonds->erase(m_bd);
+            logf("bond_rejected: status=0x%02X -> erased", m_authStatus);
+            m_pairedBy = "none";
+            m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
+            Hci::Error ae2 = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
+            if (ae2 != Hci::OK || !r.statusEvent) {
+                logf("auth_requested(fresh)=fail reason=%s status=0x%02X", ae2 == Hci::OK ? "not_command_status" : Hci::errorName(ae2), r.status);
+                return PAIRING_FAILED;
+            }
+            t0 = now();
+            while (!m_authDone && now() - t0 < 25000) idle();
+            logf("pairing(fresh)=%s auth=%s link_key=%s",
+                 m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
+                 m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
+                 m_haveLinkKey ? "stored" : "none");
+        } else if (!(m_authDone && m_authStatus == 0x00)) {
+            // Any other outcome with a key offered (timeout, LMP response timeout, ...) is
+            // transient: keep the bond, fail the attempt.  No PIN fallback -- nothing was pairing.
+            logf("auth(stored)=fail status=0x%02X -> bond kept", m_authDone ? m_authStatus : 0xFF);
+            return PAIRING_FAILED;
+        }
+        // (success with a key offered AND a new key notified: the peer chose to re-pair; the
+        // notification handler already saved the new key and pairedBy() reads ssp/pin.)
+    }
+
     if (!m_authDone || m_authStatus != 0x00) {
         // SSP failed (or the peer never finished it) -- drop to legacy PIN and
         // retry once.  onEvent()'s PIN_Code_Request handler sets m_pairedBy
@@ -242,7 +282,7 @@ BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
         m_pairedBy = "none";
         uint8_t sspOff = 0x00; Hci::Reply r2;
         m_hci.run(OP_WRITE_SSP_MODE, &sspOff, 1, &r2, 1000, idle);
-        m_pairDone = false; m_authDone = false; m_haveLinkKey = false;
+        m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
         Hci::Error ae2 = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r2, 2000, idle);
         if (ae2 != Hci::OK || !r2.statusEvent) {
             logf("auth_requested(pin)=fail reason=%s status=0x%02X", ae2 == Hci::OK ? "not_command_status" : Hci::errorName(ae2), r2.status);
@@ -347,8 +387,17 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         if (h == m_handle) { m_discReason = p[3]; m_encrypted = false; m_discDone = true; }
     } else if (code == EV_LINK_KEY_REQUEST && len >= 6) {
         char bs[18]; hciFormatBd(p, bs);
-        logf("link_key_req: bd=%s -> neg_reply (no stored key)", bs);
-        m_hci.submit(OP_LINK_KEY_REQ_NEG, p, 6, nullptr, nullptr);
+        const Bond *b = m_bonds ? m_bonds->find(p) : nullptr;
+        if (b) {
+            // NEW-34: Link_Key_Request_Reply with the stored key -- no pairing follows if the peer agrees.
+            uint8_t rp[22]; memcpy(rp, p, 6); memcpy(rp + 6, b->key, 16);
+            m_keyOffered = true;
+            logf("link_key_req: bd=%s -> reply(stored type=%u)", bs, b->keyType);
+            m_hci.submit(OP_LINK_KEY_REQ_REPLY, rp, 22, nullptr, nullptr);
+        } else {
+            logf("link_key_req: bd=%s -> neg_reply (no stored key)", bs);
+            m_hci.submit(OP_LINK_KEY_REQ_NEG, p, 6, nullptr, nullptr);
+        }
     } else if (code == EV_IO_CAP_REQUEST && len >= 6) {
         uint8_t rp[9]; memcpy(rp, p, 6);
         rp[6] = 0x03;    // IO capability = NoInputNoOutput -> Just Works
@@ -374,7 +423,26 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     } else if (code == EV_LINK_KEY_NOTIFY && len >= 23) {
         m_haveLinkKey = true;
         char bs[18]; hciFormatBd(p, bs);
-        logf("link_key: bd=%s type=%u", bs, p[22]);
+        if (m_bonds) {
+            // NEW-34: remember the peer.  Start from the existing bond when there is one (its psrm and
+            // name survive unless we know better), then the key from the event; psrm = the mode we paged
+            // with when this is the link we paged; name = the inquiry hit's, else the name page() was
+            // given (a re-pair after a rejection runs no inquiry).  The pointer from find() is COPIED
+            // before upsert() invalidates it.
+            const Bond *old = m_bonds->find(p);
+            Bond b; if (old) b = *old; else { memset(&b, 0, sizeof b); b.psrm = 0x01; }
+            memcpy(b.bd, p, 6); memcpy(b.key, p + 6, 16); b.keyType = p[22];
+            if (memcmp(p, m_bd, 6) == 0) b.psrm = (uint8_t)m_psrm;
+            const char *nm = "";
+            for (uint8_t i = 0; i < m_nHits; i++) if (m_hits[i].named && memcmp(m_hits[i].bd, p, 6) == 0) { nm = m_hits[i].name; break; }
+            if (!nm[0] && memcmp(p, m_bd, 6) == 0) nm = m_pageName;
+            if (nm[0]) BondTable::copyName(b.name, nm);
+            bool existed = old != nullptr;
+            m_bonds->upsert(b);
+            logf("link_key: bd=%s type=%u bond=%s", bs, p[22], existed ? "updated" : "saved");
+        } else {
+            logf("link_key: bd=%s type=%u", bs, p[22]);
+        }
     } else if (code == EV_SIMPLE_PAIRING_DONE && len >= 7) {
         m_pairStatus = p[0];
         m_pairedBy = "ssp";
