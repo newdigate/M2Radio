@@ -1,5 +1,6 @@
 // Host tests for BondTable (NEW-34 piece 1): the image codec, the recency order and the
 // bond semantics BtLink relies on.  Pure; no Hci.
+#include <limits.h>   // FIRST: defines NAME_MAX (POSIX); BondTable.h must survive it, as it must survive Audio.h's arm_math.h on the target
 #include "BondTable.h"
 #include <stdio.h>
 #include <string.h>

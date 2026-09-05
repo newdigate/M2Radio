@@ -4,7 +4,7 @@
 static_assert(sizeof(Bond) == 56, "Bond must be 56 bytes with no padding: the image layout depends on it");
 static const uint8_t MAGIC[4] = { 'B', 'T', 'B', 'D' };
 const uint8_t  BondTable::MAX;
-const uint8_t  BondTable::NAME_MAX;
+const uint8_t  BondTable::NAME_LEN;
 const uint8_t  BondTable::VERSION;
 const uint16_t BondTable::IMAGE_SIZE;
 
@@ -21,7 +21,7 @@ uint32_t BondTable::crc32(const uint8_t *p, size_t n) {
 
 void BondTable::copyName(char out[32], const char *in) {
     size_t n = 0;
-    if (in) while (n < NAME_MAX && in[n]) { out[n] = in[n]; n++; }
+    if (in) while (n < NAME_LEN && in[n]) { out[n] = in[n]; n++; }
     for (size_t i = n; i < 32; i++) out[i] = 0;          // terminator + a zero tail, so equal tables give equal images
 }
 

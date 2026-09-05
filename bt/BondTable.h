@@ -17,7 +17,7 @@ struct Bond {
 class BondTable {
 public:
     static const uint8_t  MAX = 4;
-    static const uint8_t  NAME_MAX = 31;
+    static const uint8_t  NAME_LEN = 31;   // chars, excluding the NUL.  Not NAME_MAX: that is a POSIX macro in <limits.h>, which Audio.h pulls in via arm_math.h
     static const uint8_t  VERSION = 1;
     static const uint16_t IMAGE_SIZE = 4 + 1 + 1 + MAX * sizeof(Bond) + 4;   // "BTBD" ver count entries crc32 = 234
 
