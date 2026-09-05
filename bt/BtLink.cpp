@@ -73,9 +73,8 @@ void BtLink::logf(const char *fmt, ...) {
 }
 
 // --- connect(): OP_INQUIRY -> field-major Inquiry Result parse -> per-hit
-// Remote_Name_Request -> Set_Event_Mask/Write_Simple_Pairing_Mode ->
-// Create_Connection.  Ported from probeInquiry() + the first half of
-// probeConnect(). ---
+// Remote_Name_Request -> choose the target -> page().  Ported from probeInquiry()
+// + the first half of probeConnect(). ---
 BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)()) {
     m_nHits = 0; m_target = -1;
     m_inqComplete = false;
@@ -124,9 +123,19 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     if (m_target < 0) { logf("connect=fail reason=no_inquiry_hit"); return NO_INQUIRY_HIT; }
 
     Hit &d = m_hits[m_target];
-    memcpy(m_bd, d.bd, 6); m_psrm = d.psrm; m_clk = d.clk;
-    char tbs[18]; hciFormatBd(m_bd, tbs);
+    char tbs[18]; hciFormatBd(d.bd, tbs);
     logf("connect: target=%s name=\"%s\"", tbs, d.named ? d.name : "?");
+    return page(d.bd, d.psrm, d.clk, true, d.named ? d.name : nullptr, PAGE_ATTEMPTS, now, idle);
+}
+
+// --- page(): the second half of the old connect(), with the target and the attempt
+// count as parameters (NEW-34: A2dpSource pages bonded candidates through here). ---
+BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name,
+                            uint8_t attempts, uint32_t (*now)(), void (*idle)()) {
+    memcpy(m_bd, bd, 6); m_psrm = psrm; m_clk = clk;
+    BondTable::copyName(m_pageName, name);
+    Hci::Reply r;
+    uint32_t t0;
 
     // Enable ALL HCI events, incl. the SSP request events (0x31-0x36) which sit
     // ABOVE the post-Reset default mask -- without this the controller cannot
@@ -153,15 +162,15 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
     // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
     // role_switch=0x00 (NOT allowed): the Mac pages this headset that way (PacketLogger reference
     // 2026-09-03: ... 18 CC 01 00 54 88 00) and an A2DP source wants to stay master anyway.
-    // Paged up to PAGE_ATTEMPTS times from here, WITHOUT a fresh inquiry: a headset that has just
+    // Paged up to `attempts` times from here, WITHOUT a fresh inquiry: a headset that has just
     // left pairing mode, or is asleep between page scans, misses a page and answers the next.
-    for (uint8_t attempt = 1; attempt <= PAGE_ATTEMPTS; attempt++) {
+    for (uint8_t attempt = 1; attempt <= attempts; attempt++) {
         uint8_t p[13];
         memcpy(p, m_bd, 6);
         p[6] = 0x18; p[7] = 0xCC;
         p[8] = m_psrm; p[9] = 0x00;
         p[10] = (uint8_t)(m_clk & 0xFF);
-        p[11] = (uint8_t)((m_clk >> 8) | 0x80);
+        p[11] = (uint8_t)((m_clk >> 8) | (clkValid ? 0x80 : 0x00));
         p[12] = 0x00;    // no role switch
         m_connDone = false; m_connStatus = 0xFF;
         Hci::Error ce = m_hci.run(OP_CREATE_CONNECTION, p, sizeof p, &r, 2000, idle);
@@ -188,10 +197,10 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
             while (xe == Hci::OK && !m_connDone && now() - t1 < 1000) idle();
             logf("connect_cancel: st=%s status=0x%02X conn_complete=%s", xe == Hci::OK ? "ok" : Hci::errorName(xe), rc.status,
                  m_connDone ? "seen" : "none");
-            if (attempt == PAGE_ATTEMPTS) return TIMEOUT;
+            if (attempt == attempts) return TIMEOUT;
             continue;
         }
-        if (m_connStatus == 0x04 && attempt < PAGE_ATTEMPTS) { logf("connect=page_timeout attempt=%u -> retry", attempt); continue; }
+        if (m_connStatus == 0x04) { logf("connect=page_timeout attempt=%u%s", attempt, attempt < attempts ? " -> retry" : ""); if (attempt == attempts) return TIMEOUT; continue; }
         if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X attempt=%u", m_connStatus, attempt); return CONNECT_STATUS; }
         logf("connect=ok handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
         return OK;

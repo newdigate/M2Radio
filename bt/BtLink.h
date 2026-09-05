@@ -1,10 +1,12 @@
 // BtLink -- one BR/EDR ACL link: inquiry by name, Create_Connection, SSP
-// pairing with legacy-PIN fallback, encryption.  Blocking helpers for setup();
-// the SSP/PIN events are answered by onEvent() (submit only, no run()).
+// pairing with legacy-PIN fallback, encryption -- and, with a BondTable set,
+// a stored-key reconnect (NEW-34 piece 1).  Blocking helpers for setup();
+// the SSP/PIN/link-key events are answered by onEvent() (submit only, no run()).
 // Arduino-free: the clock (now/idle) and the console (LogFn) are injected.
 #pragma once
 #include <stdint.h>
 #include "Hci.h"
+#include "BondTable.h"
 class BtLink {
 public:
     enum Result : uint8_t { OK = 0, NO_INQUIRY_HIT, CONNECT_STATUS, PAIRING_FAILED, PIN_FAILED, ENCRYPTION_FAILED, TIMEOUT };
@@ -20,9 +22,23 @@ public:
     // LMP IO-cap exchange and then poisons the SSP-fail->PIN fallback on the same
     // link (measured on silicon 2026-09-03: auth_complete=0x0C, secure=pairing_failed).
     void setLegacyPin(bool v) { m_legacyPin = v; }
+    // Bonded devices (NEW-34 piece 1).  Null (the default) = today's behaviour exactly:
+    // negative link-key replies, nothing stored.  With a table: Link_Key_Request is
+    // answered from it, Link_Key_Notification upserts into it, and a key the peer rejects
+    // (Authentication_Complete 0x05/0x06) is erased before pairing afresh on the same link.
+    // The table's dirty flag is the host's cue to persist (BondStoreEeprom::save).
+    void setBonds(BondTable *t) { m_bonds = t; }
+    BondTable *bonds() { return m_bonds; }
     // now() = a millisecond clock; idle() = pump the HCI + yield (the app passes millis and its idleMs).
-    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> Create_Connection (paged up to PAGE_ATTEMPTS times)
-    Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // SSP first (or legacy PIN if setLegacyPin); on SSP failure Write_Simple_Pairing_Mode=0 and retry with PIN
+    Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry (~10 s) -> page(hit, PAGE_ATTEMPTS)
+    // Page ONE address directly -- no inquiry: Set_Event_Mask, Write_Simple_Pairing_Mode,
+    // Write_Page_Timeout, then Create_Connection up to `attempts` times (cancel-a-silent-page,
+    // retry on Page Timeout).  connect() calls it for its inquiry hit (clk from the hit, valid);
+    // A2dpSource calls it for each bonded candidate (clk 0, invalid: a stored offset is stale).
+    // `name` (nullable) is remembered for the bond a later Link_Key_Notification creates.
+    Result page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name,
+                uint8_t attempts, uint32_t (*now)(), void (*idle)());
+    Result pairAndEncrypt(uint32_t (*now)(), void (*idle)());                     // stored key first (if offered), then SSP, then legacy PIN
     // HCI_Disconnect (reason 0x13, remote user terminated) and wait for Disconnection_Complete.
     // OK when there is no link.  A2dpSource calls it on every post-connect failure so a retry
     // starts from a clean controller state instead of paging a device we are still linked to.
@@ -30,7 +46,8 @@ public:
     static const uint8_t PAGE_ATTEMPTS = 3;   // Create_Connection tries per connect(): a headset just out of pairing mode misses a page
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);   // forward from the app's Hci::EventFn
     uint16_t handle() const { return m_handle; } const uint8_t *peer() const { return m_bd; }
-    bool encrypted() const { return m_encrypted; } const char *pairedBy() const { return m_pairedBy; }
+    bool encrypted() const { return m_encrypted; }
+    const char *pairedBy() const { return m_pairedBy; }          // "none" | "ssp" | "pin" | "stored"
 private:
     void logf(const char *fmt, ...);                            // vsnprintf into m_lb; emit via m_log if set
     Hci &m_hci; LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[320];
@@ -41,6 +58,9 @@ private:
     volatile uint8_t m_psrm = 0; volatile uint16_t m_clk = 0;
     char m_pin[4] = {'1','2','3','4'}; const char *m_pairedBy = "none";
     bool m_legacyPin = false;
+    BondTable *m_bonds = nullptr;
+    [[maybe_unused]] volatile bool m_keyOffered = false;      // this authentication was answered with a STORED key
+    char m_pageName[32] = {0};               // the name page() was given, for the bond a notification creates
     volatile bool m_connDone = false, m_authDone = false, m_pairDone = false, m_encDone = false;
     volatile uint8_t m_connStatus = 0xFF, m_authStatus = 0xFF, m_pairStatus = 0xFF, m_encStatus = 0xFF;
     volatile bool m_encrypted = false; volatile bool m_haveLinkKey = false;
