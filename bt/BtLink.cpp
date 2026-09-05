@@ -200,7 +200,7 @@ BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, boo
             if (attempt == attempts) return TIMEOUT;
             continue;
         }
-        if (m_connStatus == 0x04) { logf("connect=page_timeout attempt=%u%s", attempt, attempt < attempts ? " -> retry" : ""); if (attempt == attempts) return TIMEOUT; continue; }
+        if (m_connStatus == 0x04 && attempt < attempts) { logf("connect=page_timeout attempt=%u -> retry", attempt); continue; }
         if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X attempt=%u", m_connStatus, attempt); return CONNECT_STATUS; }
         logf("connect=ok handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
         return OK;
