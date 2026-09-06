@@ -55,6 +55,15 @@ public:
     Target target() const;
     void wantPageScan(bool on) { m_wantScan = on; }  // reconciled in tick() via Write_Scan_Enable
 
+    // ---- Incoming page, link state, supervision knob (NEW-34 piece 2, Task 4) -------------------
+    enum LinkState : uint8_t { LINK_NONE, LINK_UP, LINK_SECURE, LINK_LOST };
+    LinkState linkState() const { return m_link; }
+    bool     incoming()  const { return m_incoming; }
+    uint8_t  role()      const { return m_role; }          // 0 = master (we paged), 1 = slave (we accepted)
+    bool     inboundUp() const { return m_inboundUp; } void ackInboundUp() { m_inboundUp = false; }
+    bool     lost()      const { return m_link == LINK_LOST; } uint8_t lostReason() const { return m_discReason; } void ackLost() { if (m_link == LINK_LOST) m_link = LINK_NONE; }
+    void     setSupervisionSlots(uint16_t slots) { m_supSlots = slots; }
+
     // ---- Blocking wrappers (kept for callers not yet on the tick model; drive the engine) ------
     // now() = a millisecond clock; idle() = pump the HCI + yield (the app passes millis and its idleMs).
     Result connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)());   // inquiry -> page(hit, PAGE_ATTEMPTS)
@@ -108,6 +117,9 @@ private:
     // disabled (Scan_Enable default 0x00) and the host already knows it, so reconcileScan() is a
     // no-op until wantPageScan() creates a delta -- never an unsolicited Write_Scan_Enable.
     bool m_wantScan = false; bool m_haveScan = false; bool m_scanKnown = true;
+    // incoming page / link state / supervision knob (NEW-34 piece 2, Task 4)
+    LinkState m_link = LINK_NONE; bool m_incoming = false; uint8_t m_role = 0; bool m_inboundUp = false;
+    uint16_t m_supSlots = 0; bool m_supDone = false;
     uint32_t m_encWaitMs = 2000;
     // A/V inquiry hits (major device class 0x04), enough for the bench.  `named` is
     // per-hit (not a single shared flag) so a late Remote_Name_Complete for hit i

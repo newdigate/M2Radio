@@ -435,5 +435,82 @@ int main() {
         CHECK(io.count(0x0405) == BtLink::PAGE_ATTEMPTS && io.count(0x0408) == 0 && link.handle() == 0);
         g_link = nullptr;
     }
+    {   // 20. Incoming page while idle with a bond: accept (role 0x01 remain slave), link comes up as incoming.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear(); link.begin(io.now);
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (op == 0x0409) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x03, connComplete(0x00)); return; }   // Accept -> Connection_Complete
+            f.cc(op, { 0x00 });
+        };
+        // Connection_Request: bd(6) cod(3) link_type(1 = ACL 0x01)
+        std::vector<uint8_t> cr(BD, BD + 6); cr.push_back(0x04); cr.push_back(0x04); cr.push_back(0x24); cr.push_back(0x01);
+        link.onEvent(0x04, cr.data(), (uint8_t)cr.size());
+        CHECK(runUntil([&]{ return link.linkState() == BtLink::LINK_UP; }, 2000));
+        const std::vector<uint8_t> *acc = io.last(0x0409);
+        CHECK(acc && acc->size() == 7 && memcmp(acc->data(), BD, 6) == 0 && (*acc)[6] == 0x01);   // role 0x01 remain slave
+        CHECK(link.incoming() && memcmp(link.peer(), BD, 6) == 0 && link.inboundUp());
+        CHECK(io.count(0x040A) == 0);
+    }
+    {   // 21. Incoming page from an UNKNOWN address is rejected 0x0F (host rejected: unacceptable BD_ADDR); no link.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear(); link.begin(io.now);
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) { f.cc(op, withBd({ 0x00 }, prm)); };
+        static const uint8_t UNK[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 };
+        std::vector<uint8_t> cr(UNK, UNK + 6); cr.push_back(0); cr.push_back(0); cr.push_back(0); cr.push_back(0x01);
+        link.onEvent(0x04, cr.data(), (uint8_t)cr.size());
+        CHECK(runUntil([&]{ return io.count(0x040A) >= 1; }, 500));
+        const std::vector<uint8_t> *rej = io.last(0x040A);
+        CHECK(rej && rej->size() == 7 && memcmp(rej->data(), UNK, 6) == 0 && (*rej)[6] == 0x0F);
+        CHECK(link.linkState() == BtLink::LINK_NONE && io.count(0x0409) == 0);
+    }
+    {   // 22. Incoming page while a link is UP is rejected 0x0D (limited resources).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear(); link.begin(io.now);
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); seedBond(bonds, KEY2, "Other"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (op == 0x0409) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x03, connComplete(0x00)); return; }
+            f.cc(op, { 0x00 }); };
+        std::vector<uint8_t> a(BD, BD + 6); a.push_back(0); a.push_back(0); a.push_back(0); a.push_back(0x01);
+        link.onEvent(0x04, a.data(), (uint8_t)a.size());
+        CHECK(runUntil([&]{ return link.linkState() == BtLink::LINK_UP; }, 2000));
+        // a SECOND request while up: reject busy
+        static const uint8_t B2[6] = { 0x22, 0x22, 0x22, 0x22, 0x22, 0x22 };
+        std::vector<uint8_t> b(B2, B2 + 6); b.push_back(0); b.push_back(0); b.push_back(0); b.push_back(0x01);
+        link.onEvent(0x04, b.data(), (uint8_t)b.size());
+        CHECK(runUntil([&]{ return io.count(0x040A) >= 1; }, 500));
+        const std::vector<uint8_t> *rej = io.last(0x040A); CHECK(rej && (*rej)[6] == 0x0D);
+    }
+    {   // 23. Connection_Complete for a DIFFERENT address than the one we paged is IGNORED (not latched).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear(); link.begin(io.now);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op);
+                std::vector<uint8_t> other = connComplete(0x00, 0x0009);
+                static const uint8_t OTH[6] = { 0x77, 0x66, 0x55, 0x44, 0x33, 0x22 };
+                memcpy(other.data() + 3, OTH, 6);                 // Connection_Complete for someone else
+                f.ev(0x03, other); return; }
+            f.cc(op, { 0x01 }); };
+        link.startPrepare(); CHECK(runUntil([&]{ return !link.busy(); }, 4000));
+        link.startPage(BD, 1, 0, false, "X", 1);
+        CHECK(!runUntil([&]{ return !link.busy(); }, 3000));      // the foreign Connection_Complete does NOT complete our page
+        CHECK(link.handle() == 0);
+    }
+    {   // 24. Link supervision timeout write, when master, after a link comes up (a bench knob for range-loss detection).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear(); link.begin(io.now); link.setSupervisionSlots(0x1F40);   // 5 s
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            f.cc(op, { 0x00 }); };
+        link.startPrepare(); CHECK(runUntil([&]{ return !link.busy(); }, 4000));
+        link.startPage(BD, 1, 0, false, "X", 1);
+        CHECK(runUntil([&]{ return link.linkState() == BtLink::LINK_UP; }, 12000));
+        CHECK(runUntil([&]{ return io.count(0x0C37) >= 1; }, 500));
+        const std::vector<uint8_t> *w = io.last(0x0C37);
+        CHECK(w && w->size() == 4 && (*w)[2] == 0x40 && (*w)[3] == 0x1F);   // handle + 0x1F40 slots
+    }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

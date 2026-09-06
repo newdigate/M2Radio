@@ -34,15 +34,20 @@ enum {
     OP_DISCONNECT          = 0x0406,
     OP_WRITE_PAGE_TIMEOUT  = 0x0C18,
     OP_WRITE_SCAN_ENABLE   = 0x0C1A,   // page-scan side channel (NEW-34 piece 2)
+    OP_ACCEPT_CONN         = 0x0409,   // Accept_Connection_Request (NEW-34 piece 2, Task 4)
+    OP_REJECT_CONN         = 0x040A,   // Reject_Connection_Request
+    OP_WRITE_LINK_SUP_TO   = 0x0C37,   // Write_Link_Supervision_Timeout (the range-loss-detection knob)
 };
 enum {
     EV_INQUIRY_COMPLETE    = 0x01,
     EV_INQUIRY_RESULT      = 0x02,
     EV_CONNECTION_COMPLETE = 0x03,
+    EV_CONNECTION_REQUEST  = 0x04,     // incoming page (NEW-34 piece 2, Task 4)
     EV_DISCONNECT_COMPLETE = 0x05,
     EV_AUTH_COMPLETE       = 0x06,
     EV_REMOTE_NAME_DONE    = 0x07,
     EV_ENCRYPTION_CHANGE   = 0x08,
+    EV_ROLE_CHANGE         = 0x12,
     EV_NUM_COMPLETED_PACKETS = 0x13,   // high-rate during streaming; consumed by Hci for ACL credits
     EV_PIN_CODE_REQUEST    = 0x16,
     EV_LINK_KEY_REQUEST    = 0x17,
@@ -156,9 +161,17 @@ void BtLink::finish(Result r) { m_result = r; m_op = NONE; m_sub = 0; }
 // scan only) / 0x00 (none) only on a real delta.
 void BtLink::reconcileScan() {
     if (m_cmdBusy) return;
-    if (m_scanKnown && m_haveScan == m_wantScan) return;
-    uint8_t s = m_wantScan ? 0x02 : 0x00;    // page scan only (not inquiry scan)
-    if (issue(OP_WRITE_SCAN_ENABLE, &s, 1)) { m_haveScan = m_wantScan; m_scanKnown = true; logf("page_scan=%s", m_wantScan ? "on" : "off"); }
+    if (!(m_scanKnown && m_haveScan == m_wantScan)) {
+        uint8_t s = m_wantScan ? 0x02 : 0x00;    // page scan only (not inquiry scan)
+        if (issue(OP_WRITE_SCAN_ENABLE, &s, 1)) { m_haveScan = m_wantScan; m_scanKnown = true; logf("page_scan=%s", m_wantScan ? "on" : "off"); }
+        return;
+    }
+    // NEW-34 piece 2 Task 4: the supervision-timeout write.  Falls through to here only once the scan
+    // side channel has no delta to reconcile -- the common steady-state case -- so it actually runs.
+    if (!m_supDone && m_supSlots && (m_link == LINK_UP || m_link == LINK_SECURE) && m_role == 0 && !m_cmdBusy) {
+        uint8_t w[4] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), (uint8_t)(m_supSlots & 0xFF), (uint8_t)(m_supSlots >> 8) };
+        if (issue(OP_WRITE_LINK_SUP_TO, w, 4)) { m_supDone = true; logf("supervision=0x%04X st=submitted", m_supSlots); }
+    }
 }
 
 void BtLink::tick(uint32_t now) {
@@ -550,15 +563,47 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
             }
         }
     } else if (code == EV_CONNECTION_COMPLETE && len >= 11) {
-        // status(1) handle(2) bd(6) link_type(1) encryption_mode(1)
+        // status(1) handle(2) bd(6) link_type(1) encryption_mode(1) -- address-checked (NEW-34 piece 2):
+        // a Connection_Complete for a DIFFERENT peer than the one we paged (or accepted) must not be
+        // latched, or a crossed/racing completion for someone else would complete OUR attempt.
+        if (memcmp(p + 3, m_bd, 6) != 0) { char bs[18]; hciFormatBd(p + 3, bs); logf("connection_complete: bd=%s ignored", bs); return; }
         m_connStatus = p[0];
-        if (p[0] == 0x00) m_handle = (uint16_t)(p[1] | (p[2] << 8));   // only a SUCCESSFUL completion carries a handle
+        if (p[0] == 0x00) {
+            m_handle = (uint16_t)(p[1] | (p[2] << 8));   // only a SUCCESSFUL completion carries a handle
+            m_link = LINK_UP; m_supDone = false;
+            m_role = m_incoming ? 1 : 0;
+            if (m_op != PAGE) m_inboundUp = true;        // an accepted incoming link (no page in flight)
+        }
         m_connDone = true;
+    } else if (code == EV_CONNECTION_REQUEST && len >= 10) {
+        // bd(6) cod(3) link_type(1).  Decided synchronously -- the link-key reply already submits from
+        // here, so this is safe.  Order matters: BUSY (an existing link) is checked before "paging
+        // someone else" so a second inbound request while UP is refused busy regardless of address.
+        char bs[18]; hciFormatBd(p, bs);
+        uint8_t linkType = p[9];
+        bool paging = (m_op == PAGE);
+        bool bonded = m_bonds && m_bonds->find(p);
+        if (linkType != 0x01) {                                  // not ACL (SCO/eSCO): refuse
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0F; logf("conn_req: bd=%s -> reject(0x0F non-ACL)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
+        } else if (m_link == LINK_UP || m_link == LINK_SECURE) {
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0D; logf("conn_req: bd=%s -> reject(0x0D busy)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
+        } else if (paging && memcmp(p, m_bd, 6) != 0) {          // paging someone else: refuse this crossed page
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0D; logf("conn_req: bd=%s -> reject(0x0D paging other)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
+        } else if (!bonded) {                                    // idle, unknown address: never pair a stranger from an incoming page
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0F; logf("conn_req: bd=%s -> reject(0x0F unknown)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
+        } else {                                                 // accept: remain slave (role 0x01)
+            if (!paging) { memcpy(m_bd, p, 6); m_incoming = true; m_keyOffered = false;
+                const Bond *b = m_bonds->find(p); if (b) BondTable::copyName(m_pageName, b->name); }
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x01; logf("conn_req: bd=%s -> accept(slave)", bs);
+            m_hci.submit(OP_ACCEPT_CONN, r, 7, nullptr, nullptr);
+        }
+    } else if (code == EV_ROLE_CHANGE && len >= 8) {
+        if (p[0] == 0x00 && memcmp(p + 1, m_bd, 6) == 0) { m_role = p[7]; logf("role=%s", m_role ? "slave" : "master"); }
     } else if (code == EV_DISCONNECT_COMPLETE && len >= 4) {
         // status(1) handle(2) reason(1)
         uint16_t h = (uint16_t)(p[1] | (p[2] << 8));
         logf("disconnection_complete: status=0x%02X handle=0x%04X reason=0x%02X", p[0], (unsigned)h, p[3]);
-        if (h == m_handle) { m_discReason = p[3]; m_encrypted = false; m_discDone = true; }
+        if (h == m_handle) { m_discReason = p[3]; m_encrypted = false; m_link = LINK_LOST; m_handle = 0; m_discDone = true; }
     } else if (code == EV_LINK_KEY_REQUEST && len >= 6) {
         char bs[18]; hciFormatBd(p, bs);
         const Bond *b = m_bonds ? m_bonds->find(p) : nullptr;
@@ -595,7 +640,8 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         m_pairedBy = "pin";
         m_hci.submit(OP_PIN_CODE_REQ_REPLY, rp, 23, nullptr, nullptr);
     } else if (code == EV_LINK_KEY_NOTIFY && len >= 23) {
-        m_haveLinkKey = true;
+        if (memcmp(p, m_bd, 6) == 0) m_haveLinkKey = true;   // address-scoped (NEW-34 piece 2): a notification for
+                                                              // another bonded peer must not look like OUR link secured
         char bs[18]; hciFormatBd(p, bs);
         if (m_bonds) {
             // NEW-34: remember the peer.  Start from the existing bond when there is one (its psrm and
@@ -630,6 +676,7 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     } else if (code == EV_ENCRYPTION_CHANGE && len >= 4) {
         m_encStatus = p[0];
         m_encrypted = (p[3] != 0);
+        if (m_encrypted) m_link = LINK_SECURE;
         logf("encryption_change: status=0x%02X handle=0x%04X enabled=%u", p[0], (unsigned)(p[1] | (p[2] << 8)), p[3]);
         m_encDone = true;
     } else if (code != EV_NUM_COMPLETED_PACKETS) {
