@@ -179,5 +179,19 @@ int main() {
         CHECK(runUntil([&]{ return !r.src.busy(); }, 40000));
         CHECK(r.src.result() == A2dpSource::PAIR_FAILED);                                                   // NOT LOST: start() acked the stale loss and the attempt paged
     }
+    {   // An OUTBOUND attempt must NOT inherit a prior INBOUND attempt's adopted bitpool.  m_params is written
+        //   only by adoptConfig() (inbound); without a reset in start(), an outbound reconnect after an inbound
+        //   stream (lifecycle leg 3) encodes the adopted bitpool (35) instead of the initiator default (53).
+        //   (Found by the [lifecycle] gate; the other host scenarios only ever run a single attempt.)
+        Rig r; uint16_t sc = inboundToMediaOpen(r);
+        feedAcl(r.src, sc, { 0x70, 0x07, 1 << 2 }); step();
+        CHECK(runUntil([&]{ return r.src.state() == A2dpSource::STREAMING; }, 3000));
+        CHECK(r.src.sbcParams().bitpool == 35);                                   // inbound adopted the peer's config
+        r.src.stop();
+        CHECK(runUntil([&]{ return !r.src.busy(); }, 3000));                      // torn down
+        A2dpSource::Target t{}; t.kind = A2dpSource::Target::PAGE; memcpy(t.bd, SHOKZ, 6); t.psrm = 1; t.attempts = 1;
+        CHECK(r.src.start(t));
+        CHECK(r.src.sbcParams().bitpool == 53);                                   // OUTBOUND resets to the initiator default, NOT 35
+    }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

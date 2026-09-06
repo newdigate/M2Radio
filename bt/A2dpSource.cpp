@@ -47,6 +47,10 @@ bool A2dpSource::start(const Target &t) {
     // ackLost() only clears LINK_LOST->LINK_NONE, so it is a no-op for an INBOUND target (link already UP).
     m_link.ackLost();
     m_t = t; m_inbound = (t.kind == Target::INBOUND);
+    // An OUTBOUND attempt negotiates the initiator's own config (bitpool 53); reset m_params so it does NOT
+    // inherit a prior INBOUND attempt's ADOPTED config (adoptConfig() is the only other writer).  Without
+    // this, an outbound reconnect after an inbound stream (lifecycle leg 3) encodes the adopted bitpool.
+    if (!m_inbound) m_params = { Sbc::RATE_44100, Sbc::JOINT_STEREO, 16, 8, Sbc::LOUDNESS, 53 };
     m_pagedFromInquiry = false; m_opIssued = false; m_startWaitAt = 0;
     m_sdpChan = m_sigChan = nullptr; m_result = PENDING;
     switch (t.kind) {
