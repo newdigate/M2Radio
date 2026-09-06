@@ -54,7 +54,9 @@ public:
     const Channel *nextInbound(uint16_t psm, const Channel *after) const;
     // Reusable channel slots (FREE or CLOSED -- what connect() and the inbound accept scan for).  NEW-34 piece 5's
     // slot-leak baseline: sampled at every STREAMING entry it must return to the same value cycle after cycle; a
-    // channel never freed makes it decline.  reset() restores MAX_CHANNELS.
+    // channel never freed makes it decline.  reset() restores MAX_CHANNELS.  Slot availability only -- connect()
+    // additionally rejects a localCid still held by a non-FREE slot (byLocal), so a CLOSED slot keeping that CID
+    // blocks a re-connect on the SAME CID until reset().
     uint8_t  freeSlots() const { uint8_t n = 0; for (const auto &ch : m_ch) if (ch.state == FREE || ch.state == CLOSED) n++; return n; }
     // Running minimum ACL credit seen since resetCreditsMin() (piece 4's air-link-starvation floor).
     uint8_t  creditsMin() const { return m_creditsMin; }

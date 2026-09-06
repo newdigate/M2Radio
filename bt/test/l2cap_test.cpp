@@ -253,14 +253,29 @@ int main() {
         CHECK(l.credits() == 3 && l.clampHits() >= 1);                     // capped at maxCredits=3, clamp recorded
     }
     {   // A4 (NEW-34 piece 5). freeSlots(): reusable (FREE or CLOSED) slots -- the soak's slot-leak baseline.
-        // 5 at begin(); a connect() takes one; a CLOSED channel is reusable again; reset() restores all 5.
+        // 5 at begin(); a connect() takes one and rides it all the way to CONFIG then a HONEST OPEN (review: a
+        // mutant counting OPEN as reusable must fail here, not just at WAIT_CONN/CONFIG); a peer DISC_REQ closes
+        // it (review: no direct state poke); the CLOSED slot is reused by a second connect(); reset() restores all 5.
         CapIo io; L2cap l(io); l.begin(0x0001, 7);
         CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
-        L2cap::Channel *ch = l.connect(0x0019, 0x0041);
+        L2cap::Channel *ch = l.connect(0x0019, 0x0041);                          // our SCID 0x0041
         CHECK(ch != nullptr && l.freeSlots() == L2cap::MAX_CHANNELS - 1);
-        ch->state = L2cap::CLOSED;                                              // a torn-down channel is reusable
-        CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
-        CHECK(l.connect(0x0019, 0x0042) != nullptr && l.freeSlots() == L2cap::MAX_CHANNELS - 1);
+        std::vector<uint8_t> rsp = l2(0x0001, {0x03, 0x10, 8, 0, 0x40, 0x03, 0x41, 0x00, 0, 0, 0, 0}); // Conn Rsp: dcid=0x0340 scid=0x0041 ok
+        l.onAcl(0x0001, rsp.data(), (uint16_t)rsp.size());
+        CHECK(ch->state == L2cap::CONFIG && l.freeSlots() == L2cap::MAX_CHANNELS - 1);
+        std::vector<uint8_t> req = l2(0x0001, {0x04, 1, 8, 0, 0x41, 0x00, 0, 0, 0x01, 0x02, 0x7F, 0x03}); // peer Cfg Req: dcid=ours, MTU 895
+        l.onAcl(0x0001, req.data(), (uint16_t)req.size());
+        l.service();                                                            // sends OUR Cfg Req + the Cfg Rsp to the peer's
+        CHECK(ch->state == L2cap::CONFIG);                                      // still CONFIG: our own Cfg Req is unanswered
+        std::vector<uint8_t> crsp = l2(0x0001, {0x05, 0x20, 6, 0, 0x41, 0x00, 0, 0, 0, 0}); // peer Cfg Rsp to ours: scid=ours 0x0041, ok
+        l.onAcl(0x0001, crsp.data(), (uint16_t)crsp.size());
+        l.service();
+        CHECK(ch->state == L2cap::OPEN && l.freeSlots() == L2cap::MAX_CHANNELS - 1);   // the mutant this line kills: OPEN counted as reusable
+        std::vector<uint8_t> disc = l2(0x0001, {0x06, 0x20, 4, 0, 0x41, 0x00, 0x40, 0x03}); // peer Disc Req: dcid=ours 0x0041, scid=peer's 0x0340
+        l.onAcl(0x0001, disc.data(), (uint16_t)disc.size());                    // handleSig flips it to CLOSED directly -- no poke needed
+        CHECK(ch->state == L2cap::CLOSED && l.freeSlots() == L2cap::MAX_CHANNELS);
+        L2cap::Channel *ch2 = l.connect(0x0019, 0x0042);                        // DIFFERENT local CID -- connect()'s scan takes the
+        CHECK(ch2 == ch && l.freeSlots() == L2cap::MAX_CHANNELS - 1);           // first FREE-or-CLOSED slot in array order, which is ch's
         l.reset();
         CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
     }
