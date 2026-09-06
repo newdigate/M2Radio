@@ -31,7 +31,17 @@ struct FakeIo : HciIo {
     int indexOf(uint16_t op) { for (size_t i = 0; i < cmds.size(); i++) if (cmds[i].first == op) return (int)i; return -1; }
 };
 static FakeIo *g_io = nullptr; static Hci *g_hci = nullptr;
-static void idle10() { g_io->now += 10; g_hci->service(); }
+// NEW-34 piece 2: the engine is driven by tick(now).  idle10() also ticks the link under test when
+// one is registered (g_link), so runUntil() below can drive an op directly; the blocking wrappers the
+// scenarios below call drive their OWN tick() loop and leave g_link null, so there is no double-tick.
+static BtLink *g_link = nullptr;
+static void idle10() { g_io->now += 10; g_hci->service(); if (g_link) g_link->tick(g_io->now); }
+// Drive time+service+tick until pred() or a fake-time budget elapses; returns pred()'s final value.
+static bool runUntil(std::function<bool()> pred, uint32_t ms) {
+    uint32_t end = g_io->now + ms;
+    while (g_io->now < end) { if (pred()) return true; idle10(); }
+    return pred();
+}
 static uint32_t fakeNow() { return g_io->now; }
 static void evThunk(void *ctx, uint8_t code, const uint8_t *p, uint8_t len) { ((BtLink *)ctx)->onEvent(code, p, len); }
 static std::vector<std::string> g_log;
@@ -353,6 +363,77 @@ int main() {
         CHECK(io.count(0x0405) == 1 && io.count(0x0408) == 1 && link.handle() == 0x0007);
         bool sawRace = false; for (auto &l : g_log) if (l.find("raced the cancel") != std::string::npos) sawRace = true;
         CHECK(sawRace);
+    }
+    {   // 17. NEW-34 piece 2: the page-scan side channel, driven directly on the tick engine (g_link set).
+        //     wantPageScan(true) writes Write_Scan_Enable 0x02 (page scan ONLY, not inquiry scan) and logs
+        //     page_scan=on; wantPageScan(false) writes 0x00 and logs page_scan=off.  begin() alone (no
+        //     wantPageScan) writes nothing -- the post-Reset scan state is known-off.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &) { f.cc(op, { 0x00 }); };
+        link.begin(io.now);
+        CHECK(!runUntil([&]{ return io.count(0x0C1A) >= 1; }, 200));   // no delta yet -> no unsolicited write
+        link.wantPageScan(true);
+        CHECK(runUntil([&]{ return io.count(0x0C1A) >= 1; }, 500));
+        const std::vector<uint8_t> *w = io.last(0x0C1A);
+        CHECK(w && w->size() == 1 && (*w)[0] == 0x02);                  // page scan only
+        bool sawOn = false; for (auto &l : g_log) if (l.find("page_scan=on") != std::string::npos) sawOn = true;
+        CHECK(sawOn);
+        link.wantPageScan(false);
+        CHECK(runUntil([&]{ return io.count(0x0C1A) >= 2; }, 500));
+        const std::vector<uint8_t> *w2 = io.last(0x0C1A);
+        CHECK(w2 && w2->size() == 1 && (*w2)[0] == 0x00);              // scan off
+        bool sawOff = false; for (auto &l : g_log) if (l.find("page_scan=off") != std::string::npos) sawOff = true;
+        CHECK(sawOff);
+        g_link = nullptr;
+    }
+    {   // 18. NEW-34 piece 2: the engine driven DIRECTLY (as A2dpSource will in Task 5): startPrepare ->
+        //     startPage (bonded, stored key, clock offset invalid) -> startPair, each advanced by runUntil,
+        //     reaches OK with the same wire bytes and result as the blocking path (cf. scenario 8).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x00, 0x01, 0x00 }); return; }
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        link.begin(io.now);
+        CHECK(link.startPrepare()); CHECK(runUntil([&]{ return !link.busy(); }, 4000) && link.result() == BtLink::OK);
+        CHECK(link.startPage(BD, 1, 0, false, "OpenMove by Shokz", 1));
+        CHECK(runUntil([&]{ return !link.busy(); }, 20000) && link.result() == BtLink::OK);
+        const std::vector<uint8_t> *cc = io.last(0x0405);
+        CHECK(cc && cc->size() == 13 && (*cc)[8] == 1 && (*cc)[10] == 0x00 && (*cc)[11] == 0x00);   // psrm R1, clock offset 0/INVALID
+        CHECK(link.handle() == 0x0001 && io.count(0x0405) == 1 && io.count(0x0401) == 0);
+        CHECK(link.startPair(false));
+        CHECK(runUntil([&]{ return !link.busy(); }, 40000) && link.result() == BtLink::OK);
+        const std::vector<uint8_t> *kr = io.last(0x040B);
+        CHECK(kr && kr->size() == 22 && memcmp(kr->data(), BD, 6) == 0 && memcmp(kr->data() + 6, KEY1, 16) == 0);
+        CHECK(io.count(0x040B) == 1 && io.count(0x040C) == 0 && io.count(0x0411) == 1);
+        CHECK(strcmp(link.pairedBy(), "stored") == 0 && link.encrypted());
+        // startX refuses while an op runs
+        CHECK(link.startPage(BD, 1, 0, false, "X", 1));                 // engine idle now -> accepted
+        CHECK(!link.startInquiry("Y"));                                 // an op is running -> refused
+        g_link = nullptr;
+    }
+    {   // 19. NEW-34 piece 2: driven directly, EVERY page reports Page Timeout (status 0x04) -> the engine
+        //     exhausts attempts and finishes CONNECT_STATUS (the result code sub 4 restores; a finish(OK)
+        //     there is the mutation this pins directly, beside scenario 7's wrapper form).
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); g_link = &link; hci.onEvent(evThunk, &link);
+        link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x04)); return; }
+            f.cc(op, { 0x01 });
+        };
+        link.begin(io.now);
+        CHECK(link.startPage(BD, 1, 0, false, "X", BtLink::PAGE_ATTEMPTS));
+        CHECK(runUntil([&]{ return !link.busy(); }, 20000) && link.result() == BtLink::CONNECT_STATUS);
+        CHECK(io.count(0x0405) == BtLink::PAGE_ATTEMPTS && io.count(0x0408) == 0 && link.handle() == 0);
+        g_link = nullptr;
     }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

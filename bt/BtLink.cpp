@@ -1,13 +1,13 @@
-// BtLink -- ported line-for-line from examples/networking/m2_hci_probe.cpp's
-// probeInquiry()/probeConnect()/onEvent() (proven on three real peers: two
-// headsets and an ESP32).  The only changes are the two injected seams: the
-// clock (now()/idle(), replacing millis()/delay()) and the console (logf(),
-// replacing CONSOLE.print), which are what make this file Arduino-free and
-// host-compilable.  Opcodes, event codes and every byte layout below are
-// copied from the probe, not re-derived; the Inquiry Result / Remote Name
-// Complete parses and the BD formatter are the hci/HciEvents.{h,cpp} helpers
-// (already host-tested for truncated/out-of-range input) rather than
-// duplicated inline.  MIT, clean-room.
+// BtLink -- the operation engine (NEW-34 piece 2), converted from the blocking
+// probeInquiry()/probeConnect()/pairAndEncrypt()/disconnect() bodies of NEW-34 piece 1.
+// Every blocking `while (!flag && now-t0 < T) idle()` became a sub-state advanced by one
+// tick(now) per loop pass with an absolute deadline; NOTHING on the wire changed and no
+// logf() string changed -- opcodes, byte layouts and log lines are copied verbatim from the
+// old bodies, only the control flow moved.  The old connect()/page()/pairAndEncrypt()/
+// disconnect() remain as thin blocking wrappers that drive startX()+tick() to completion, so
+// callers not yet on the tick model (A2dpSource, until Task 5) build and behave unchanged.
+// The Inquiry Result / Remote Name Complete parses and the BD formatter are the
+// hci/HciEvents.{h,cpp} helpers.  MIT, clean-room.
 #include "BtLink.h"
 #include "HciEvents.h"
 #include <cstdio>
@@ -33,6 +33,7 @@ enum {
     OP_CREATE_CONN_CANCEL  = 0x0408,
     OP_DISCONNECT          = 0x0406,
     OP_WRITE_PAGE_TIMEOUT  = 0x0C18,
+    OP_WRITE_SCAN_ENABLE   = 0x0C1A,   // page-scan side channel (NEW-34 piece 2)
 };
 enum {
     EV_INQUIRY_COMPLETE    = 0x01,
@@ -49,6 +50,26 @@ enum {
     EV_IO_CAP_REQUEST      = 0x31,
     EV_USER_CONF_REQUEST   = 0x33,
     EV_SIMPLE_PAIRING_DONE = 0x36,
+};
+// PAIR sub-states (translated from pairAndEncrypt()'s linear flow; each blocking wait is a
+// state, each command issue is followed by a *_STATUS state that reads m_cmdReply next tick).
+enum {
+    PR_ENTER = 0,          // reset flags; inbound? -> WAIT_PEER_SECURE : -> AUTH1_ISSUE
+    PR_WAIT_PEER_SECURE,   // inbound only: wait m_encDone && m_encrypted, else fall to the ladder
+    PR_AUTH1_ISSUE,        // Authentication_Requested (first)
+    PR_AUTH1_STATUS,       // its Command Status
+    PR_AUTH1_WAIT,         // wait m_authDone (25 s); the stored-key ladder branches here
+    PR_FRESH_ISSUE,        // after a 0x05/0x06 erase: a fresh Authentication_Requested
+    PR_FRESH_STATUS,
+    PR_FRESH_WAIT,
+    PR_POST_AUTH,          // the post-keyOffered check: SSP-off+PIN path or straight to encryption
+    PR_PIN_SSP_ISSUE,      // Write_Simple_Pairing_Mode = 0
+    PR_PIN_SSP_WAIT,       // (its Command Complete) then a PIN-path Authentication_Requested
+    PR_PIN_AUTH_STATUS,
+    PR_PIN_AUTH_WAIT,
+    PR_ENC_ISSUE,          // Set_Connection_Encryption
+    PR_ENC_STATUS,
+    PR_ENC_WAIT,           // wait m_encDone (10 s)
 };
 }  // namespace
 
@@ -73,27 +94,140 @@ void BtLink::logf(const char *fmt, ...) {
     if (m_log) m_log(m_logCtx, m_lb);
 }
 
-// --- connect(): OP_INQUIRY -> field-major Inquiry Result parse -> per-hit
-// Remote_Name_Request -> choose the target -> page().  Ported from probeInquiry()
-// + the first half of probeConnect(). ---
-BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)()) {
-    m_nHits = 0; m_target = -1;
-    m_inqComplete = false;
-    // LAP = GIAC 0x9E8B33 little-endian, Inquiry_Length 0x0A = 12.8 s, Num_Responses 0 = unlimited
-    const uint8_t params[5] = { 0x33, 0x8B, 0x9E, 0x0A, 0x00 };
-    Hci::Reply r;
-    Hci::Error e = m_hci.run(OP_INQUIRY, params, sizeof params, &r, 1000, idle);
-    if (e != Hci::OK || !r.statusEvent) {
-        logf("inquiry=fail reason=%s status=0x%02X", e == Hci::OK ? "not_command_status" : Hci::errorName(e), r.status);
-        return TIMEOUT;
-    }
-    logf("inquiry=started");
-    uint32_t t0 = now();
-    while (!m_inqComplete && now() - t0 < 15000) idle();     // events arrive via onEvent()
-    logf("inquiry_complete: n=%u%s", m_nHits, m_inqComplete ? "" : " timeout=1");
+// --- The command-issue slot: commands whose Command Status/Complete the engine must inspect
+// (Create_Connection, its Cancel, Authentication_Requested, Set_Connection_Encryption,
+// Disconnect) and the PREPARE setup commands all go through issue(); the done-callback records
+// the reply and clears the busy flag.  The event-driven replies in onEvent() (Link_Key_*, IO_Cap,
+// PIN, ...) still submit() fire-and-forget as before. ---
+void BtLink::cmdDone(void *ctx, Hci::Error e, const Hci::Reply *r) {
+    BtLink *self = (BtLink *)ctx;
+    self->m_cmdErr = e;
+    if (r) self->m_cmdReply = *r; else { self->m_cmdReply.status = 0xFF; self->m_cmdReply.statusEvent = false; self->m_cmdReply.len = 0; }
+    self->m_cmdBusy = false;
+}
+bool BtLink::issue(uint16_t op, const uint8_t *p, uint8_t plen) {
+    m_cmdBusy = true; m_cmdErr = Hci::OK;
+    Hci::Error e = m_hci.submit(op, p, plen, &BtLink::cmdDone, this);
+    if (e != Hci::OK) { m_cmdBusy = false; m_cmdErr = e; return false; }   // QUEUE_FULL/BUSY: retry next tick
+    return true;
+}
 
-    for (uint8_t i = 0; i < m_nHits; i++) {
-        Hit &h = m_hits[i];
+void BtLink::begin(uint32_t now) {
+    m_op = NONE; m_result = OK; m_sub = 0; m_deadline = now; m_cmdBusy = false;
+    // scan is known-off after HCI_Reset (Scan_Enable default 0x00), so reconcileScan() stays a
+    // no-op until wantPageScan() creates a delta -- never an unsolicited Write_Scan_Enable.
+    m_wantScan = false; m_haveScan = false; m_scanKnown = true;
+    // NOTE: does NOT clear m_bd/m_handle/link state -- begin() may be re-called mid-session.
+}
+
+bool BtLink::startPrepare() {
+    if (m_op != NONE) return false;
+    m_op = PREPARE; m_sub = 0; return true;
+}
+bool BtLink::startInquiry(const char *nameSubstr) {
+    if (m_op != NONE) return false;
+    m_inqFilter = nameSubstr;
+    m_op = INQUIRY; m_sub = 0; return true;
+}
+bool BtLink::startPage(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name, uint8_t attempts) {
+    if (m_op != NONE) return false;
+    memcpy(m_bd, bd, 6); m_psrm = psrm; m_clk = clk; m_clkValid = clkValid;
+    BondTable::copyName(m_pageName, name);
+    m_keyOffered = false;                                      // a new candidate: the stored-key flag belongs to this link only
+    m_handle = 0;                                             // a new link attempt: no handle until Connection_Complete says status 0
+    m_attempts = attempts ? attempts : 1;                     // zero would send the setup commands and report TIMEOUT with no page
+    m_attempt = 1;
+    m_op = PAGE; m_sub = 0; return true;
+}
+bool BtLink::startPair(bool inbound) {
+    if (m_op != NONE) return false;
+    m_pairInbound = inbound;
+    m_op = PAIR; m_sub = PR_ENTER; return true;
+}
+bool BtLink::startDisconnect() {
+    if (m_op != NONE) return false;
+    m_op = DISCONNECT; m_sub = 0; return true;
+}
+
+void BtLink::finish(Result r) { m_result = r; m_op = NONE; m_sub = 0; }
+
+// The page-scan side channel: reconciled every tick (even with no op running -- it is how the
+// idle policy turns page scan on/off between attempts).  Writes Write_Scan_Enable 0x02 (page
+// scan only) / 0x00 (none) only on a real delta.
+void BtLink::reconcileScan() {
+    if (m_cmdBusy) return;
+    if (m_scanKnown && m_haveScan == m_wantScan) return;
+    uint8_t s = m_wantScan ? 0x02 : 0x00;    // page scan only (not inquiry scan)
+    if (issue(OP_WRITE_SCAN_ENABLE, &s, 1)) { m_haveScan = m_wantScan; m_scanKnown = true; logf("page_scan=%s", m_wantScan ? "on" : "off"); }
+}
+
+void BtLink::tick(uint32_t now) {
+    reconcileScan();                         // the page-scan side channel
+    if (m_op == NONE) return;
+    if (m_cmdBusy) return;                    // wait for the outstanding command's done-callback
+    switch (m_op) {
+        case PREPARE:    tickPrepare(now);    break;
+        case INQUIRY:    tickInquiry(now);    break;
+        case PAGE:       tickPage(now);       break;
+        case PAIR:       tickPair(now);       break;
+        case DISCONNECT: tickDisconnect(now); break;
+        default:         m_op = NONE;         break;
+    }
+}
+
+// --- PREPARE: Set_Event_Mask -> Write_SSP_Mode -> Write_Page_Timeout, each awaiting its
+// Command Complete.  Copied from the head of the old page().  None aborts on failure (they are
+// logged and tolerated), so PREPARE always finishes OK. ---
+void BtLink::tickPrepare(uint32_t now) {
+    (void)now;
+    if (m_sub == 0) {                                          // issue Set_Event_Mask (enable the SSP request events 0x31-0x36)
+        uint8_t evmask[8]; memset(evmask, 0xFF, sizeof evmask);
+        if (!issue(OP_SET_EVENT_MASK, evmask, sizeof evmask)) return;
+        m_sub = 1; return;
+    }
+    if (m_sub == 1) {                                          // event_mask done -> issue Write_SSP_Mode
+        logf("event_mask: st=%s status=0x%02X", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+        uint8_t sspMode = m_legacyPin ? 0x00 : 0x01;
+        if (!issue(OP_WRITE_SSP_MODE, &sspMode, 1)) return;
+        m_sub = 2; return;
+    }
+    if (m_sub == 2) {                                          // ssp_mode done -> issue Write_Page_Timeout 0x2000
+        uint8_t sspMode = m_legacyPin ? 0x00 : 0x01;
+        logf("ssp_mode: st=%s status=0x%02X mode=%u", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status, sspMode);
+        uint8_t pt[2] = { 0x00, 0x20 };
+        if (!issue(OP_WRITE_PAGE_TIMEOUT, pt, 2)) return;
+        m_sub = 3; return;
+    }
+    // m_sub == 3: page_timeout done -> finish
+    logf("page_timeout: st=%s status=0x%02X slots=0x2000", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+    finish(OK);
+}
+
+// --- INQUIRY: Inquiry -> field-major Inquiry Result (via onEvent) -> per-hit Remote_Name_Request
+// -> choose the target.  Ported from probeInquiry() + the target-choice head of probeConnect(). ---
+void BtLink::tickInquiry(uint32_t now) {
+    if (m_sub == 0) {                                         // issue Inquiry (GIAC, 12.8 s, unlimited)
+        m_nHits = 0; m_target = -1; m_inqComplete = false;
+        const uint8_t params[5] = { 0x33, 0x8B, 0x9E, 0x0A, 0x00 };
+        if (!issue(OP_INQUIRY, params, sizeof params)) return;
+        m_sub = 1; return;
+    }
+    if (m_sub == 1) {                                         // Inquiry Command Status
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("inquiry=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            finish(TIMEOUT); return;
+        }
+        logf("inquiry=started");
+        m_deadline = now + 15000; m_sub = 2; return;
+    }
+    if (m_sub == 2) {                                         // wait Inquiry Complete
+        if (!m_inqComplete && (int32_t)(now - m_deadline) < 0) return;
+        logf("inquiry_complete: n=%u%s", m_nHits, m_inqComplete ? "" : " timeout=1");
+        m_hitIdx = 0; m_sub = 3; return;
+    }
+    if (m_sub == 3) {                                         // per hit: issue Remote_Name_Request (or advance to choose)
+        if (m_hitIdx >= m_nHits) { m_sub = 6; return; }
+        Hit &h = m_hits[m_hitIdx];
         // Remote_Name_Request: BD_ADDR(6) Page_Scan_Repetition_Mode(1) Reserved(1) Clock_Offset(2, bit15=valid)
         uint8_t p[10];
         memcpy(p, h.bd, 6);
@@ -101,254 +235,284 @@ BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (
         p[8] = (uint8_t)(h.clk & 0xFF);
         p[9] = (uint8_t)((h.clk >> 8) | 0x80);
         h.named = false;
-        Hci::Error ne = m_hci.run(OP_REMOTE_NAME_REQ, p, sizeof p, &r, 1000, idle);
-        t0 = now();
-        // Wait on THIS hit's own flag -- a late Remote_Name_Complete for an
-        // earlier hit must never be able to end an unrelated hit's wait (the
-        // shared-flag race this replaced).
-        while (ne == Hci::OK && !h.named && now() - t0 < 5000) idle();
-        char bs[18]; hciFormatBd(h.bd, bs);
-        if (ne != Hci::OK)  { logf("inq_name: bd=%s fail reason=%s", bs, Hci::errorName(ne)); continue; }
-        if (!h.named)       { logf("inq_name: bd=%s fail reason=no_name_event", bs); continue; }
-        logf("inq_name: bd=%s status=0x%02X name=\"%s\"", bs, h.nameStatus, h.name);
+        if (!issue(OP_REMOTE_NAME_REQ, p, sizeof p)) return;
+        m_sub = 4; return;
     }
-
-    // Choose the target: first hit whose name contains nameSubstr, or (if
-    // nameSubstr is null/empty) the first hit.
-    if (nameSubstr && nameSubstr[0]) {
+    if (m_sub == 4) {                                         // Remote_Name_Request Command Status
+        Hit &h = m_hits[m_hitIdx];
+        if (m_cmdErr != Hci::OK) {
+            char bs[18]; hciFormatBd(h.bd, bs);
+            logf("inq_name: bd=%s fail reason=%s", bs, Hci::errorName(m_cmdErr));
+            m_hitIdx++; m_sub = 3; return;
+        }
+        m_deadline = now + 5000; m_sub = 5; return;
+    }
+    if (m_sub == 5) {                                         // wait THIS hit's Remote_Name_Complete
+        Hit &h = m_hits[m_hitIdx];
+        if (!h.named && (int32_t)(now - m_deadline) < 0) return;
+        char bs[18]; hciFormatBd(h.bd, bs);
+        if (!h.named) logf("inq_name: bd=%s fail reason=no_name_event", bs);
+        else          logf("inq_name: bd=%s status=0x%02X name=\"%s\"", bs, h.nameStatus, h.name);
+        m_hitIdx++; m_sub = 3; return;
+    }
+    // m_sub == 6: choose the target (first hit whose name contains the filter, or the first hit)
+    if (m_inqFilter && m_inqFilter[0]) {
         for (uint8_t i = 0; i < m_nHits; i++)
-            if (m_hits[i].named && strstr(m_hits[i].name, nameSubstr)) { m_target = (int)i; break; }
+            if (m_hits[i].named && strstr(m_hits[i].name, m_inqFilter)) { m_target = (int)i; break; }
     } else if (m_nHits > 0) {
         m_target = 0;
     }
-    if (m_target < 0) { logf("connect=fail reason=no_inquiry_hit"); return NO_INQUIRY_HIT; }
-
+    if (m_target < 0) { logf("connect=fail reason=no_inquiry_hit"); finish(NO_INQUIRY_HIT); return; }
     Hit &d = m_hits[m_target];
     char tbs[18]; hciFormatBd(d.bd, tbs);
     logf("connect: target=%s name=\"%s\"", tbs, d.named ? d.name : "?");
-    return page(d.bd, d.psrm, d.clk, true, d.named ? d.name : nullptr, PAGE_ATTEMPTS, now, idle);
+    finish(OK);
 }
 
-// --- page(): the second half of the old connect(), with the target and the attempt
-// count as parameters (NEW-34: A2dpSource pages bonded candidates through here). ---
-BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name,
-                            uint8_t attempts, uint32_t (*now)(), void (*idle)()) {
-    memcpy(m_bd, bd, 6); m_psrm = psrm; m_clk = clk;
-    BondTable::copyName(m_pageName, name);
-    m_keyOffered = false;                                      // a new candidate: the stored-key flag belongs to this link only
-    m_handle = 0;                                             // a new link attempt: no handle until Connection_Complete says status 0
-    if (attempts == 0) attempts = 1;                           // zero would send the setup commands and report TIMEOUT with no page
-    Hci::Reply r;
-    uint32_t t0;
-
-    // Enable ALL HCI events, incl. the SSP request events (0x31-0x36) which sit
-    // ABOVE the post-Reset default mask -- without this the controller cannot
-    // ask the host to run Simple Pairing.
-    uint8_t evmask[8]; memset(evmask, 0xFF, sizeof evmask);
-    Hci::Error me = m_hci.run(OP_SET_EVENT_MASK, evmask, sizeof evmask, &r, 1000, idle);
-    logf("event_mask: st=%s status=0x%02X", me == Hci::OK ? "ok" : Hci::errorName(me), r.status);
-
-    // SSP on by default; OFF when legacy PIN is forced, so the link is legacy from
-    // the start (pairAndEncrypt()'s first Authentication_Requested then takes the
-    // PIN_Code_Request path with no SSP attempt).  See setLegacyPin().
-    uint8_t sspMode = m_legacyPin ? 0x00 : 0x01;
-    Hci::Error we = m_hci.run(OP_WRITE_SSP_MODE, &sspMode, 1, &r, 1000, idle);
-    logf("ssp_mode: st=%s status=0x%02X mode=%u", we == Hci::OK ? "ok" : Hci::errorName(we), r.status, sspMode);
-
-    // Write_Page_Timeout 0x2000 slots (5.12 s -- the spec default, written EXPLICITLY so the
-    // page either completes or reports Page Timeout inside the wait below, whatever the
-    // firmware's own default).  Answered by Command Complete; a controller that lacks it is
-    // logged and tolerated.
-    uint8_t pt[2] = { 0x00, 0x20 };
-    Hci::Error pe = m_hci.run(OP_WRITE_PAGE_TIMEOUT, pt, 2, &r, 1000, idle);
-    logf("page_timeout: st=%s status=0x%02X slots=0x2000", pe == Hci::OK ? "ok" : Hci::errorName(pe), r.status);
-
-    // Create_Connection: bd(6) pkt_type(2)=0xCC18 psrm(1) reserved(1) clk(2,bit15=valid) role_switch(1)
-    // role_switch=0x00 (NOT allowed): the Mac pages this headset that way (PacketLogger reference
-    // 2026-09-03: ... 18 CC 01 00 54 88 00) and an A2DP source wants to stay master anyway.
-    // Paged up to `attempts` times from here, WITHOUT a fresh inquiry: a headset that has just
-    // left pairing mode, or is asleep between page scans, misses a page and answers the next.
-    for (uint8_t attempt = 1; attempt <= attempts; attempt++) {
+// --- PAGE: Create_Connection per attempt (cancel a silent page, retry on Page Timeout).
+// Translated line-for-line from the loop body of the old page(). ---
+void BtLink::tickPage(uint32_t now) {
+    if (m_sub == 0) {                                         // issue Create_Connection for this attempt
         uint8_t p[13];
         memcpy(p, m_bd, 6);
-        p[6] = 0x18; p[7] = 0xCC;
+        p[6] = 0x18; p[7] = 0xCC;                             // pkt_type 0xCC18
         p[8] = m_psrm; p[9] = 0x00;
         p[10] = (uint8_t)(m_clk & 0xFF);
-        p[11] = (uint8_t)((m_clk >> 8) | (clkValid ? 0x80 : 0x00));
-        p[12] = 0x00;    // no role switch
+        p[11] = (uint8_t)((m_clk >> 8) | (m_clkValid ? 0x80 : 0x00));
+        p[12] = 0x00;                                         // no role switch
         m_connDone = false; m_connStatus = 0xFF;
-        Hci::Error ce = m_hci.run(OP_CREATE_CONNECTION, p, sizeof p, &r, 2000, idle);
-        if (ce != Hci::OK || !r.statusEvent) {
-            logf("connect=fail reason=%s status=0x%02X attempt=%u", ce == Hci::OK ? "not_command_status" : Hci::errorName(ce), r.status, attempt);
-            return TIMEOUT;
-        }
-        // Page Timeout is 5.12 s; a compliant controller has reported one way or the other well
-        // inside 10 s.  Silence past that is the bench's "connect=timeout (no Connection_Complete)".
-        t0 = now();
-        while (!m_connDone && now() - t0 < 10000) idle();
-        if (!m_connDone) {
-            // The controller is (as far as we can tell) still paging, and may have withheld its
-            // command credit for the duration (Num_HCI_Command_Packets=0 in the Command Status,
-            // no NOP since).  Reclaim the credit if so -- otherwise the cancel below can never
-            // leave and every later command starves by name, the wedge measured 2026-09-03 --
-            // then CANCEL the page: the controller stops paging, its Command Complete re-reports
-            // the true credit count, and it follows with a Connection_Complete (status 0x02).
-            logf("connect=timeout (no Connection_Complete) attempt=%u ncmd=%u -> Create_Connection_Cancel", attempt, m_hci.ncmd());
-            if (m_hci.ncmd() == 0) m_hci.reclaimCredit();
-            Hci::Reply rc;
-            Hci::Error xe = m_hci.run(OP_CREATE_CONN_CANCEL, m_bd, 6, &rc, 2000, idle);
-            uint32_t t1 = now();
-            while (xe == Hci::OK && !m_connDone && now() - t1 < 1000) idle();
-            logf("connect_cancel: st=%s status=0x%02X conn_complete=%s", xe == Hci::OK ? "ok" : Hci::errorName(xe), rc.status,
-                 m_connDone ? "seen" : "none");
-            if (m_connDone && m_connStatus == 0x00) {
-                // The page completed while the cancel was in flight (the cancel's Command Complete says
-                // 0x02, Unknown Connection Identifier): that is a LINK, and the caller must treat it as
-                // one -- returning TIMEOUT here would let a bonded-candidate walk page the next address
-                // behind a live ACL.
-                logf("connect=ok (raced the cancel) handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
-                return OK;
-            }
-            if (attempt == attempts) return TIMEOUT;
-            continue;
-        }
-        if (m_connStatus == 0x04 && attempt < attempts) { logf("connect=page_timeout attempt=%u -> retry", attempt); continue; }
-        if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X attempt=%u", m_connStatus, attempt); return CONNECT_STATUS; }
-        logf("connect=ok handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
-        return OK;
+        if (!issue(OP_CREATE_CONNECTION, p, sizeof p)) return;
+        m_sub = 1; return;
     }
-    return TIMEOUT;
+    if (m_sub == 1) {                                         // Create_Connection Command Status
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("connect=fail reason=%s status=0x%02X attempt=%u", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status, m_attempt);
+            finish(TIMEOUT); return;
+        }
+        m_deadline = now + 10000; m_sub = 2; return;         // wait for Connection_Complete
+    }
+    if (m_sub == 2) {
+        if (m_connDone) { m_sub = 4; return; }               // got it -> evaluate status
+        if ((int32_t)(now - m_deadline) < 0) return;         // still waiting
+        // timeout -> reclaim a withheld credit if any, then cancel the silent page
+        logf("connect=timeout (no Connection_Complete) attempt=%u ncmd=%u -> Create_Connection_Cancel", m_attempt, m_hci.ncmd());
+        if (m_hci.ncmd() == 0) m_hci.reclaimCredit();
+        if (!issue(OP_CREATE_CONN_CANCEL, m_bd, 6)) return;
+        m_deadline = now + 1000; m_sub = 3; return;
+    }
+    if (m_sub == 3) {                                         // post-cancel: 1 s for a racing Connection_Complete
+        if (!m_connDone && (int32_t)(now - m_deadline) < 0) return;
+        logf("connect_cancel: st=%s status=0x%02X conn_complete=%s", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status, m_connDone ? "seen" : "none");
+        if (m_connDone && m_connStatus == 0x00) {            // the page raced the cancel: that is a LINK
+            logf("connect=ok (raced the cancel) handle=0x%04X attempt=%u", (unsigned)m_handle, m_attempt);
+            finish(OK); return;
+        }
+        if (m_attempt >= m_attempts) { finish(TIMEOUT); return; }
+        m_attempt++; m_sub = 0; return;
+    }
+    // m_sub == 4: evaluate the Connection_Complete status
+    if (m_connStatus == 0x04 && m_attempt < m_attempts) { logf("connect=page_timeout attempt=%u -> retry", m_attempt); m_attempt++; m_sub = 0; return; }
+    if (m_connStatus != 0x00) { logf("connect=fail status=0x%02X attempt=%u", m_connStatus, m_attempt); finish(CONNECT_STATUS); return; }
+    logf("connect=ok handle=0x%04X attempt=%u", (unsigned)m_handle, m_attempt); finish(OK);
 }
 
-// --- pairAndEncrypt(): Authentication_Requested; if a STORED key was offered (NEW-34)
-// the outcome decides the first rung -- success = a stored-key authentication, a
-// 0x05/0x06 rejection = erase the bond and pair afresh on this link, anything else =
-// transient, keep the bond and fail; then the pre-existing SSP path with its
-// Write_Simple_Pairing_Mode=0 + PIN retry; Set_Connection_Encryption on success.
-// Every command that answers via Command Status is guarded the way page() guards
-// Create_Connection: a rejected/unaccepted command returns immediately. ---
-BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
-    Hci::Reply r;
+// --- PAIR: the stored-key ladder + SSP + legacy-PIN fallback + encryption.  Every branch and
+// every logf() is the old pairAndEncrypt(); each `while (!flag && now-t0<T) idle()` became a
+// deadline sub-state. ---
+void BtLink::tickPair(uint32_t now) {
     uint8_t hp[2] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8) };
-
-    // Authentication_Requested -> Link_Key_Request(stored key or neg) -> [SSP] -> [Link_Key_Notification]
-    //   -> Authentication_Complete.  Encryption needs the link AUTHENTICATED, so
-    //   wait for Auth_Complete (not just Simple_Pairing_Complete) -- else
-    //   Set_Connection_Encryption races ahead and fails with 0x2F.
-    m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
-    Hci::Error ae = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
-    if (ae != Hci::OK || !r.statusEvent) {
-        logf("auth_requested=fail reason=%s status=0x%02X", ae == Hci::OK ? "not_command_status" : Hci::errorName(ae), r.status);
-        return PAIRING_FAILED;
-    }
-    uint32_t t0 = now();
-    while (!m_authDone && now() - t0 < 25000) idle();
-    logf("pairing=%s auth=%s link_key=%s",
-         m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
-         m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
-         m_haveLinkKey ? "stored" : "none");
-
-    if (m_keyOffered) {
-        if (m_authDone && m_authStatus == 0x00 && !m_haveLinkKey) {
-            // The peer accepted the stored key: authenticated with no pairing at all.
-            m_pairedBy = "stored";
-            if (m_bonds) m_bonds->touch(m_bd);
-        } else if (m_authDone && (m_authStatus == 0x05 || m_authStatus == 0x06)) {
-            // The peer holds no matching key for us (it forgot us, or was re-paired elsewhere):
-            // the bond is stale.  Erase it and pair afresh on THIS link -- the next
-            // Link_Key_Request gets the negative reply and the SSP dance (or the PIN path when
-            // SSP is off) follows.  If the peer tears the ACL down first, the command below fails
-            // with No Connection and the next attempt pairs fresh: the bond is already gone.
-            if (m_bonds) m_bonds->erase(m_bd);
-            logf("bond_rejected: status=0x%02X -> erased", m_authStatus);
-            m_pairedBy = "none";
-            m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
-            Hci::Error ae2 = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r, 2000, idle);
-            if (ae2 != Hci::OK || !r.statusEvent) {
-                logf("auth_requested(fresh)=fail reason=%s status=0x%02X", ae2 == Hci::OK ? "not_command_status" : Hci::errorName(ae2), r.status);
-                return PAIRING_FAILED;
-            }
-            t0 = now();
-            while (!m_authDone && now() - t0 < 25000) idle();
-            logf("pairing(fresh)=%s auth=%s link_key=%s",
-                 m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
-                 m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
-                 m_haveLinkKey ? "stored" : "none");
-        } else if (m_authDone && m_authStatus == 0x00) {
-            // Success with a key offered AND a new key notified: the peer chose to re-pair.  The
-            // notification handler already saved the new key and pairedBy() reads ssp/pin.
-        } else {
-            // Any other outcome with a key offered (timeout, LMP response timeout, ...) is
-            // transient: keep the bond, fail the attempt.  No PIN fallback -- nothing was pairing.
-            logf("auth(stored)=fail status=0x%02X -> bond kept", m_authDone ? m_authStatus : 0xFF);
-            return PAIRING_FAILED;
-        }
-    }
-
-    if (!m_authDone || m_authStatus != 0x00) {
-        // SSP failed (or the peer never finished it) -- drop to legacy PIN and
-        // retry once.  onEvent()'s PIN_Code_Request handler sets m_pairedBy
-        // when the peer actually asks for one.
-        m_pairedBy = "none";
-        uint8_t sspOff = 0x00; Hci::Reply r2;
-        m_hci.run(OP_WRITE_SSP_MODE, &sspOff, 1, &r2, 1000, idle);
+    switch (m_sub) {
+    case PR_ENTER:
+        if (m_pairInbound) { m_deadline = now + m_encWaitMs; m_sub = PR_WAIT_PEER_SECURE; return; }
         m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
-        Hci::Error ae2 = m_hci.run(OP_AUTH_REQUESTED, hp, 2, &r2, 2000, idle);
-        if (ae2 != Hci::OK || !r2.statusEvent) {
-            logf("auth_requested(pin)=fail reason=%s status=0x%02X", ae2 == Hci::OK ? "not_command_status" : Hci::errorName(ae2), r2.status);
-            return PAIRING_FAILED;
+        m_sub = PR_AUTH1_ISSUE; return;
+    case PR_WAIT_PEER_SECURE:                                 // inbound: the peer drives security; adopt it
+        if (m_encDone && m_encrypted) { m_pairedBy = m_keyOffered ? "stored" : "peer"; finish(OK); return; }
+        if ((int32_t)(now - m_deadline) < 0) return;
+        m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
+        m_sub = PR_AUTH1_ISSUE; return;                      // peer did not secure in time: initiate the ordinary ladder
+    case PR_AUTH1_ISSUE:
+        if (!issue(OP_AUTH_REQUESTED, hp, 2)) return;
+        m_sub = PR_AUTH1_STATUS; return;
+    case PR_AUTH1_STATUS:
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("auth_requested=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            finish(PAIRING_FAILED); return;
         }
-        t0 = now();
-        while (!m_authDone && now() - t0 < 25000) idle();
+        m_deadline = now + 25000; m_sub = PR_AUTH1_WAIT; return;
+    case PR_AUTH1_WAIT:
+        if (!m_authDone && (int32_t)(now - m_deadline) < 0) return;
+        logf("pairing=%s auth=%s link_key=%s",
+             m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
+             m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
+             m_haveLinkKey ? "stored" : "none");
+        if (m_keyOffered) {
+            if (m_authDone && m_authStatus == 0x00 && !m_haveLinkKey) {
+                // The peer accepted the stored key: authenticated with no pairing at all.
+                m_pairedBy = "stored";
+                if (m_bonds) m_bonds->touch(m_bd);
+                m_sub = PR_POST_AUTH; return;
+            } else if (m_authDone && (m_authStatus == 0x05 || m_authStatus == 0x06)) {
+                // The peer holds no matching key: erase the stale bond and pair afresh on THIS link.
+                if (m_bonds) m_bonds->erase(m_bd);
+                logf("bond_rejected: status=0x%02X -> erased", m_authStatus);
+                m_pairedBy = "none";
+                m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
+                m_sub = PR_FRESH_ISSUE; return;
+            } else if (m_authDone && m_authStatus == 0x00) {
+                // Success with a key offered AND a new key notified: the peer re-paired.
+                m_sub = PR_POST_AUTH; return;
+            } else {
+                // Any other outcome (timeout, LMP response timeout, ...) is transient: keep the bond.
+                logf("auth(stored)=fail status=0x%02X -> bond kept", m_authDone ? m_authStatus : 0xFF);
+                finish(PAIRING_FAILED); return;
+            }
+        }
+        m_sub = PR_POST_AUTH; return;
+    case PR_FRESH_ISSUE:
+        if (!issue(OP_AUTH_REQUESTED, hp, 2)) return;
+        m_sub = PR_FRESH_STATUS; return;
+    case PR_FRESH_STATUS:
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("auth_requested(fresh)=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            finish(PAIRING_FAILED); return;
+        }
+        m_deadline = now + 25000; m_sub = PR_FRESH_WAIT; return;
+    case PR_FRESH_WAIT:
+        if (!m_authDone && (int32_t)(now - m_deadline) < 0) return;
+        logf("pairing(fresh)=%s auth=%s link_key=%s",
+             m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
+             m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
+             m_haveLinkKey ? "stored" : "none");
+        m_sub = PR_POST_AUTH; return;
+    case PR_POST_AUTH:
+        if (!m_authDone || m_authStatus != 0x00) { m_sub = PR_PIN_SSP_ISSUE; return; }
+        m_sub = PR_ENC_ISSUE; return;
+    case PR_PIN_SSP_ISSUE: {
+        // SSP failed (or the peer never finished it) -- drop to legacy PIN and retry once.
+        m_pairedBy = "none";
+        uint8_t sspOff = 0x00;
+        if (!issue(OP_WRITE_SSP_MODE, &sspOff, 1)) return;
+        m_sub = PR_PIN_SSP_WAIT; return;
+    }
+    case PR_PIN_SSP_WAIT:                                     // Write_SSP_Mode done (result ignored, as the old code did)
+        m_pairDone = false; m_authDone = false; m_haveLinkKey = false; m_keyOffered = false;
+        if (!issue(OP_AUTH_REQUESTED, hp, 2)) return;
+        m_sub = PR_PIN_AUTH_STATUS; return;
+    case PR_PIN_AUTH_STATUS:
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("auth_requested(pin)=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            finish(PAIRING_FAILED); return;
+        }
+        m_deadline = now + 25000; m_sub = PR_PIN_AUTH_WAIT; return;
+    case PR_PIN_AUTH_WAIT: {
+        if (!m_authDone && (int32_t)(now - m_deadline) < 0) return;
         bool sawPin = strcmp(m_pairedBy, "pin") == 0;
         logf("pairing(pin)=%s auth=%s link_key=%s",
              m_pairDone && m_pairStatus == 0x00 ? "ok" : "incomplete",
              m_authDone && m_authStatus == 0x00 ? "ok" : "fail/timeout",
              m_haveLinkKey ? "stored" : "none");
-        if (!m_authDone || m_authStatus != 0x00)
-            return sawPin ? PIN_FAILED : PAIRING_FAILED;
+        if (!m_authDone || m_authStatus != 0x00) { finish(sawPin ? PIN_FAILED : PAIRING_FAILED); return; }
+        m_sub = PR_ENC_ISSUE; return;
     }
-
-    // Set_Connection_Encryption -> Encryption_Change (status=0x00 enabled=1).
-    m_encDone = false; m_encStatus = 0xFF; m_encrypted = false;
-    uint8_t ep[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x01 };
-    Hci::Error ee = m_hci.run(OP_SET_CONN_ENCRYPTION, ep, 3, &r, 2000, idle);
-    if (ee != Hci::OK || !r.statusEvent) {
-        logf("set_conn_encryption=fail reason=%s status=0x%02X", ee == Hci::OK ? "not_command_status" : Hci::errorName(ee), r.status);
-        return ENCRYPTION_FAILED;
+    case PR_ENC_ISSUE: {
+        m_encDone = false; m_encStatus = 0xFF; m_encrypted = false;
+        uint8_t ep[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x01 };
+        if (!issue(OP_SET_CONN_ENCRYPTION, ep, 3)) return;
+        m_sub = PR_ENC_STATUS; return;
     }
-    t0 = now();
-    while (!m_encDone && now() - t0 < 10000) idle();
-    if (m_encDone && m_encStatus == 0x00 && m_encrypted) {
-        logf("connect_secure=ok encryption=on paired_by=%s", m_pairedBy);
-        return OK;
+    case PR_ENC_STATUS:
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("set_conn_encryption=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            finish(ENCRYPTION_FAILED); return;
+        }
+        m_deadline = now + 10000; m_sub = PR_ENC_WAIT; return;
+    case PR_ENC_WAIT:
+        if (!m_encDone && (int32_t)(now - m_deadline) < 0) return;
+        if (m_encDone && m_encStatus == 0x00 && m_encrypted) {
+            logf("connect_secure=ok encryption=on paired_by=%s", m_pairedBy);
+            finish(OK); return;
+        }
+        logf("connect_secure=fail status=0x%02X enabled=%u", m_encDone ? m_encStatus : 0xFF, m_encrypted ? 1u : 0u);
+        finish(ENCRYPTION_FAILED); return;
+    default: finish(PAIRING_FAILED); return;
     }
-    logf("connect_secure=fail status=0x%02X enabled=%u", m_encDone ? m_encStatus : 0xFF, m_encrypted ? 1u : 0u);
-    return ENCRYPTION_FAILED;
 }
 
-// --- disconnect(): HCI_Disconnect(handle, 0x13) -> Command Status -> Disconnection_Complete. ---
-BtLink::Result BtLink::disconnect(uint32_t (*now)(), void (*idle)()) {
-    if (!m_handle) return OK;
-    Hci::Reply r;
-    uint8_t p[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x13 };
-    m_discDone = false;
-    Hci::Error e = m_hci.run(OP_DISCONNECT, p, 3, &r, 2000, idle);
-    if (e != Hci::OK || !r.statusEvent) {
-        logf("disconnect=fail reason=%s status=0x%02X", e == Hci::OK ? "not_command_status" : Hci::errorName(e), r.status);
-        m_handle = 0; m_encrypted = false;          // the link is unusable either way; do not keep paging-blocking state
-        return TIMEOUT;
+// --- DISCONNECT: HCI_Disconnect(handle, 0x13) -> Command Status -> Disconnection_Complete.
+// OK when there is no link. ---
+void BtLink::tickDisconnect(uint32_t now) {
+    if (m_sub == 0) {
+        if (!m_handle) { finish(OK); return; }
+        uint8_t p[3] = { (uint8_t)(m_handle & 0xFF), (uint8_t)(m_handle >> 8), 0x13 };
+        m_discDone = false;
+        if (!issue(OP_DISCONNECT, p, 3)) return;
+        m_sub = 1; return;
     }
-    uint32_t t0 = now();
-    while (!m_discDone && now() - t0 < 3000) idle();
+    if (m_sub == 1) {                                         // Command Status
+        if (m_cmdErr != Hci::OK || !m_cmdReply.statusEvent) {
+            logf("disconnect=fail reason=%s status=0x%02X", m_cmdErr == Hci::OK ? "not_command_status" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+            m_handle = 0; m_encrypted = false;                // the link is unusable either way
+            finish(TIMEOUT); return;
+        }
+        m_deadline = now + 3000; m_sub = 2; return;
+    }
+    // m_sub == 2: wait Disconnection_Complete
+    if (!m_discDone && (int32_t)(now - m_deadline) < 0) return;
     logf("disconnect=%s reason=0x%02X handle=0x%04X", m_discDone ? "ok" : "timeout", m_discReason, (unsigned)m_handle);
     m_handle = 0; m_encrypted = false; m_haveLinkKey = false;
-    return m_discDone ? OK : TIMEOUT;
+    finish(m_discDone ? OK : TIMEOUT);
 }
 
-// --- onEvent(): the SSP/inquiry event handlers, ported from the probe's
-// onEvent().  Replies go out ONLY via m_hci.submit() (never run()) -- this is
-// called from the app's Hci::EventFn, i.e. from inside Hci::service(). ---
+BtLink::Target BtLink::target() const {
+    Target t; memset(&t, 0, sizeof t); t.valid = false;
+    if (m_target < 0) return t;
+    const Hit &h = m_hits[m_target];
+    memcpy(t.bd, h.bd, 6); t.psrm = h.psrm; t.clk = h.clk; t.clkValid = true;
+    if (h.named) memcpy(t.name, h.name, strlen(h.name) + 1);
+    t.valid = true; return t;
+}
+
+// --- Blocking wrappers: drive startX()+tick() to completion for callers not yet on the tick
+// model.  Each reproduces the old method's wire sequence exactly (page()/connect() run PREPARE
+// before the page, as the old page() ran the setup commands inline). ---
+void BtLink::driveBlocking(uint32_t (*now)(), void (*idle)()) {
+    uint32_t t0 = now();
+    while (busy() && (uint32_t)(now() - t0) < 120000) { if (idle) idle(); tick(now()); }
+}
+BtLink::Result BtLink::connect(const char *nameSubstr, uint32_t (*now)(), void (*idle)()) {
+    startInquiry(nameSubstr);
+    driveBlocking(now, idle);
+    if (m_result != OK) return m_result;              // TIMEOUT (inquiry fail) or NO_INQUIRY_HIT
+    Target t = target();
+    startPrepare();
+    driveBlocking(now, idle);
+    startPage(t.bd, t.psrm, t.clk, t.clkValid, t.name[0] ? t.name : nullptr, PAGE_ATTEMPTS);
+    driveBlocking(now, idle);
+    return m_result;
+}
+BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name,
+                            uint8_t attempts, uint32_t (*now)(), void (*idle)()) {
+    startPrepare();
+    driveBlocking(now, idle);
+    startPage(bd, psrm, clk, clkValid, name, attempts);
+    driveBlocking(now, idle);
+    return m_result;
+}
+BtLink::Result BtLink::pairAndEncrypt(uint32_t (*now)(), void (*idle)()) {
+    startPair(false);
+    driveBlocking(now, idle);
+    return m_result;
+}
+BtLink::Result BtLink::disconnect(uint32_t (*now)(), void (*idle)()) {
+    startDisconnect();
+    driveBlocking(now, idle);
+    return m_result;
+}
+
+// --- onEvent(): the SSP/inquiry event handlers, UNCHANGED from NEW-34 piece 1.  Replies go out
+// ONLY via m_hci.submit() (never run()) -- this is called from the app's Hci::EventFn, i.e. from
+// inside Hci::service(). ---
 void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     if (code == EV_INQUIRY_RESULT) {
         // Field-major parse via the tested HciEvents helper.  Keep only
