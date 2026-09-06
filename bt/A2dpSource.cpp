@@ -29,7 +29,7 @@ A2dpSource::Result A2dpSource::connect(const char *name, uint8_t aclNum, uint32_
     if (m_bonds && m_bonds->count()) {
         bool first = true;
         for (uint8_t i = 0; i < m_bonds->count() && !linked; i++) {
-            Bond b = m_bonds->at(i);                                     // a COPY: the ladder may reorder the table later
+            Bond b = m_bonds->at(i);                                     // a COPY: a Link_Key_Notification can upsert() from the idle()-pumped dispatch DURING page(), and the ladder reorders the table after it
             if (name && name[0] && b.name[0] && !strstr(b.name, name)) continue;
             char bs[18]; hciFormatBd(b.bd, bs);
             uint8_t attempts = first ? BtLink::PAGE_ATTEMPTS : 1; first = false;
@@ -38,7 +38,7 @@ A2dpSource::Result A2dpSource::connect(const char *name, uint8_t aclNum, uint32_
         }
         if (!linked) logf("bond_page=none -> inquiry");
     }
-    if (!linked && m_link.connect(name, now, idle) != BtLink::OK) return CONNECT_FAILED;
+    if (!linked && m_link.connect(name, now, idle) != BtLink::OK) { m_link.disconnect(now, idle); return CONNECT_FAILED; }   // no-op with no handle; reclaims a link a racing page left up
     if (m_link.pairAndEncrypt(now, idle) != BtLink::OK) { m_link.disconnect(now, idle); return PAIR_FAILED; }
     m_l2.begin(m_link.handle(), aclNum);
     m_l2.acceptIncoming(true);

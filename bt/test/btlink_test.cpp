@@ -183,6 +183,7 @@ int main() {
         CHECK(io.count(0x0405) == BtLink::PAGE_ATTEMPTS);   // all attempts used
         CHECK(io.count(0x0408) == 0);                        // a REPORTED Page Timeout needs no cancel
         CHECK(io.count(0x0401) == 1);                        // no fresh inquiry between pages
+        CHECK(link.handle() == 0);                           // a FAILED Connection_Complete must not latch a handle (the fake sends 0x0001 even on 0x04)
     }
     {   // 8. NEW-34: a bonded page (no inquiry, clock offset invalid) + a stored-key authentication:
         //    Link_Key_Request is answered with Link_Key_Request_Reply carrying the EXACT stored key; no
@@ -335,6 +336,23 @@ int main() {
             f.cc(op, { 0x01 });
         };
         CHECK(link.page(BD, 1, 0, false, nullptr, 0, fakeNow, idle10) == BtLink::OK && io.count(0x0405) == 1);
+    }
+    {   // 16. The cancel RACE: the peer answers the page just as the 10 s wait expires, so the cancel gets
+        //     Command Complete 0x02 (Unknown Connection Identifier -- the connection already completed) and
+        //     a Connection_Complete status 0x00 lands during the post-cancel wait.  That is a LINK, and page()
+        //     must say so -- a TIMEOUT here would let A2dpSource page the next candidate behind a live ACL.
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); return; }                                   // ... and silence
+            if (op == 0x0408) { std::vector<uint8_t> r = { 0x02 }; r.insert(r.end(), prm.begin(), prm.begin() + 6); f.cc(op, r);   // cancel: too late
+                                f.ev(0x03, connComplete(0x00, 0x0007)); return; }     // the page had completed
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 3, fakeNow, idle10) == BtLink::OK);
+        CHECK(io.count(0x0405) == 1 && io.count(0x0408) == 1 && link.handle() == 0x0007);
+        bool sawRace = false; for (auto &l : g_log) if (l.find("raced the cancel") != std::string::npos) sawRace = true;
+        CHECK(sawRace);
     }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

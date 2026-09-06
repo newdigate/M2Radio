@@ -4,7 +4,6 @@
 // is refused), so every scenario ends PAIR_FAILED -- the walk is what is under test, the QEMU
 // [reconnect] gate covers the rest.
 #include "A2dpSource.h"
-#include "HciTransport.h"
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -29,7 +28,7 @@ struct FakeIo : HciIo {
     void cc(uint16_t op, std::vector<uint8_t> ret, uint8_t ncmd = 1) { std::vector<uint8_t> p = { ncmd, (uint8_t)op, (uint8_t)(op >> 8) }; p.insert(p.end(), ret.begin(), ret.end()); ev(0x0E, p); }
     void cs(uint16_t op, uint8_t status = 0, uint8_t ncmd = 1) { ev(0x0F, { status, ncmd, (uint8_t)op, (uint8_t)(op >> 8) }); }
     int count(uint16_t op) { int n = 0; for (auto &c : cmds) if (c.first == op) n++; return n; }
-    std::vector<std::vector<uint8_t> > pages() { std::vector<std::vector<uint8_t> > v; for (auto &c : cmds) if (c.first == 0x0405) v.push_back(std::vector<uint8_t>(c.second.begin(), c.second.begin() + 6)); return v; }
+    std::vector<std::vector<uint8_t> > pages() { std::vector<std::vector<uint8_t> > v; for (auto &c : cmds) if (c.first == 0x0405) v.push_back(std::vector<uint8_t>(c.second.begin(), c.second.end())); return v; }
 };
 static FakeIo *g_io = nullptr; static Hci *g_hci = nullptr;
 static void idle10() { g_io->now += 10; g_hci->service(); }
@@ -61,7 +60,7 @@ static void controller(FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) 
     if (op == 0x0411) { f.cs(op, 0x0C); return; }                                              // refused: the walk is over, connect() fails at pairing
     f.cc(op, { 0x01 });
 }
-struct Rig { FakeIo io; Hci hci; HciTransport *unused = nullptr; A2dpSource src; BondTable bonds;
+struct Rig { FakeIo io; Hci hci; A2dpSource src; BondTable bonds;
     Rig() : hci(io), src(hci, io) { g_io = &io; g_hci = &hci; hci.onEvent(evThunk, &src); src.setLog(logFn, nullptr); io.onCmd = controller; g_log.clear(); } };
 int main() {
     {   // 1. No table: today's behaviour -- inquiry, then the hit is paged.
@@ -77,10 +76,12 @@ int main() {
     }
     {   // 3. Two bonds, most recent first; the most recent is ABSENT: PAGE_ATTEMPTS pages of it, ONE of the
         //    next, which answers.  No inquiry.
-        Rig r; r.bonds.upsert(mk(SHOKZ, "OpenMove by Shokz")); r.bonds.upsert(mk(SINK, "EVKB-SINK")); r.src.setBonds(&r.bonds); g_present = SHOKZ;
+        Rig r; r.bonds.upsert(mk(SHOKZ, "OpenMove by Shokz")); r.bonds.upsert(mk(SINK, "EVKB-SINK", 2)); r.src.setBonds(&r.bonds); g_present = SHOKZ;
         CHECK(r.src.connect(nullptr, 0, fakeNow, idle10) == A2dpSource::PAIR_FAILED);
         std::vector<std::vector<uint8_t> > p = r.io.pages();
-        CHECK(p.size() == 4 && memcmp(p[0].data(), SINK, 6) == 0 && memcmp(p[2].data(), SINK, 6) == 0 && memcmp(p[3].data(), SHOKZ, 6) == 0);
+        CHECK(p.size() == 4 && memcmp(p[0].data(), SINK, 6) == 0 && memcmp(p[1].data(), SINK, 6) == 0 && memcmp(p[2].data(), SINK, 6) == 0 && memcmp(p[3].data(), SHOKZ, 6) == 0);
+        CHECK(p[0].size() == 13 && p[0][8] == 2 && p[0][10] == 0x00 && p[0][11] == 0x00);   // the stored psrm; clock offset 0 with the valid bit CLEAR
+        CHECK(p[3].size() == 13 && p[3][8] == 1);                                            // the second candidate's own psrm
         CHECK(r.io.count(0x0401) == 0 && logCount("attempts=3") == 1 && logCount("attempts=1") == 1);
     }
     {   // 4. The target-name filter skips a bond whose name does not match, even when it is most recent --
@@ -103,6 +104,15 @@ int main() {
         CHECK(r.io.count(0x0401) == 1 && logCount("bond_page=none -> inquiry") == 1);
         std::vector<std::vector<uint8_t> > p = r.io.pages();
         CHECK(p.size() == 4 && memcmp(p[0].data(), SINK, 6) == 0 && memcmp(p[3].data(), SHOKZ, 6) == 0);
+    }
+    {   // 7. Stop at the FIRST successful page: two bonds, the most recent present -- exactly one page, one
+        //    bond_try, the second candidate never paged.  (Mutation-found: a walk that kept paging after a
+        //    link survived scenarios 1-6, and combined with the cancel race that is an orphaned ACL.)
+        Rig r; r.bonds.upsert(mk(SHOKZ, "OpenMove by Shokz")); r.bonds.upsert(mk(SINK, "EVKB-SINK")); r.src.setBonds(&r.bonds); g_present = SINK;
+        CHECK(r.src.connect(nullptr, 0, fakeNow, idle10) == A2dpSource::PAIR_FAILED);
+        std::vector<std::vector<uint8_t> > p = r.io.pages();
+        CHECK(p.size() == 1 && memcmp(p[0].data(), SINK, 6) == 0 && logCount("bond_try") == 1 && logCount("OpenMove") == 0);
+        CHECK(r.io.count(0x0406) == 1);                                                    // the post-link failure tore the link down
     }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

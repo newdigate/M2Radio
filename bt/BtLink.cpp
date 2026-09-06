@@ -136,6 +136,7 @@ BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, boo
     memcpy(m_bd, bd, 6); m_psrm = psrm; m_clk = clk;
     BondTable::copyName(m_pageName, name);
     m_keyOffered = false;                                      // a new candidate: the stored-key flag belongs to this link only
+    m_handle = 0;                                             // a new link attempt: no handle until Connection_Complete says status 0
     if (attempts == 0) attempts = 1;                           // zero would send the setup commands and report TIMEOUT with no page
     Hci::Reply r;
     uint32_t t0;
@@ -200,6 +201,14 @@ BtLink::Result BtLink::page(const uint8_t bd[6], uint8_t psrm, uint16_t clk, boo
             while (xe == Hci::OK && !m_connDone && now() - t1 < 1000) idle();
             logf("connect_cancel: st=%s status=0x%02X conn_complete=%s", xe == Hci::OK ? "ok" : Hci::errorName(xe), rc.status,
                  m_connDone ? "seen" : "none");
+            if (m_connDone && m_connStatus == 0x00) {
+                // The page completed while the cancel was in flight (the cancel's Command Complete says
+                // 0x02, Unknown Connection Identifier): that is a LINK, and the caller must treat it as
+                // one -- returning TIMEOUT here would let a bonded-candidate walk page the next address
+                // behind a live ACL.
+                logf("connect=ok (raced the cancel) handle=0x%04X attempt=%u", (unsigned)m_handle, attempt);
+                return OK;
+            }
             if (attempt == attempts) return TIMEOUT;
             continue;
         }
@@ -379,7 +388,7 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     } else if (code == EV_CONNECTION_COMPLETE && len >= 11) {
         // status(1) handle(2) bd(6) link_type(1) encryption_mode(1)
         m_connStatus = p[0];
-        m_handle = (uint16_t)(p[1] | (p[2] << 8));
+        if (p[0] == 0x00) m_handle = (uint16_t)(p[1] | (p[2] << 8));   // only a SUCCESSFUL completion carries a handle
         m_connDone = true;
     } else if (code == EV_DISCONNECT_COMPLETE && len >= 4) {
         // status(1) handle(2) reason(1)
