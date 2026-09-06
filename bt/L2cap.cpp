@@ -7,10 +7,20 @@ void L2cap::begin(uint16_t h, uint8_t credits, uint16_t aclMax) {
     memset(m_ch, 0, sizeof m_ch); memset(&m_p, 0, sizeof m_p); memset(m_txq, 0, sizeof m_txq);
     m_nextId = 0x10; m_nextCid = 0x0080;                       // above the caller-chosen 0x0040-0x005F range
     m_txHead = m_txCount = 0; m_dropped = 0;
+    m_creditsMin = credits;
 }
 L2cap::Channel *L2cap::byLocal(uint16_t c)  { for (auto &ch : m_ch) if (ch.state != FREE && ch.localCid == c)  return &ch; return nullptr; }
 L2cap::Channel *L2cap::byRemote(uint16_t c) { for (auto &ch : m_ch) if (ch.state != FREE && ch.remoteCid == c) return &ch; return nullptr; }
 L2cap::Channel *L2cap::byPsm(uint16_t p)    { for (auto &ch : m_ch) if (ch.state != FREE && ch.psm == p)       return &ch; return nullptr; }
+const L2cap::Channel *L2cap::nextInbound(uint16_t psm, const Channel *after) const {
+    bool seen = (after == nullptr);
+    for (const auto &ch : m_ch) {
+        if (ch.state != OPEN || !ch.peerInitiated || ch.psm != psm) continue;
+        if (seen) return &ch;
+        if (&ch == after) seen = true;
+    }
+    return nullptr;
+}
 L2cap::Channel *L2cap::connect(uint16_t psm, uint16_t localCid) {
     if (byLocal(localCid)) return nullptr;                          // caller CID must not collide with an in-use one
     for (auto &ch : m_ch) if (ch.state == FREE || ch.state == CLOSED) {
@@ -30,6 +40,7 @@ void L2cap::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     for (uint8_t i = 0; i < n && (uint16_t)(1 + i * 4 + 3) < len; i++) {
         uint16_t h = (uint16_t)(p[1 + i * 4] | (p[2 + i * 4] << 8)); uint16_t c = (uint16_t)(p[3 + i * 4] | (p[4 + i * 4] << 8));
         if (h == m_handle) { uint32_t v = (uint32_t)m_credits + c; m_credits = v > m_maxCredits ? m_maxCredits : (uint8_t)v; }
+        if (m_credits < m_creditsMin) m_creditsMin = m_credits;   // (NCP only raises credits, but keep the guard uniform)
     }
 }
 void L2cap::onAcl(uint16_t handle, const uint8_t *d, uint16_t len) {
@@ -85,9 +96,11 @@ void L2cap::service() {
     if (m_p.connReq) {
         if (!m_p.connRspReady) {                                                          // compute the outcome ONCE; retries only resend it
             Channel *ch = nullptr;
-            if (m_accept) for (auto &c : m_ch) if (c.state == FREE || c.state == CLOSED) { ch = &c; break; }
+            bool psmOk = (m_nAllow == 0);
+            for (uint8_t i = 0; i < m_nAllow; i++) if (m_allow[i] == m_p.connPsm) psmOk = true;
+            if (m_accept && psmOk) for (auto &c : m_ch) if (c.state == FREE || c.state == CLOSED) { ch = &c; break; }
             m_p.connRspId = m_p.connId; m_p.connRspScid = m_p.connScid;                   // snapshot NOW: a later CONN_REQ must not touch these
-            m_p.connRspRes = ch ? 0x0000 : 0x0004; m_p.connRspLocal = 0;                  // 0x0004 = no resources
+            m_p.connRspRes = ch ? 0x0000 : (psmOk ? 0x0004 : 0x0002); m_p.connRspLocal = 0;   // 0x0004 no resources, 0x0002 PSM not supported
             if (ch) { memset(ch, 0, sizeof *ch); ch->state = CONFIG; ch->psm = m_p.connPsm; ch->remoteCid = m_p.connScid;
                       ch->localCid = m_p.connRspLocal = m_nextCid++; ch->mtuOut = 672; ch->mtuIn = RX_MTU; ch->peerInitiated = true; }
             m_p.connRspReady = true;
@@ -122,5 +135,6 @@ void L2cap::service() {
         uint8_t pkt[9 + MAX_PAYLOAD]; memcpy(pkt, h, 9); memcpy(pkt + 9, t.buf, t.len); m_io.write(pkt, (size_t)(9 + t.len));
         if (m_trace) m_trace(m_traceCtx, true, m_handle, pkt + 5, (uint16_t)(t.len + 4));   // L2CAP PDU = len(2)+cid(2)+payload
         m_txHead = (uint8_t)((m_txHead + 1) % TXQ); m_txCount--; m_credits--;
+        if (m_credits < m_creditsMin) m_creditsMin = m_credits;
     }
 }

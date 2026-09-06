@@ -41,6 +41,20 @@ public:
     uint8_t  credits() const { return m_credits; }
     uint32_t dropped() const { return m_dropped; }
     void     acceptIncoming(bool yes) { m_accept = yes; }          // peer-initiated channels (answered with our next free CID)
+    // Restrict which PSMs a peer-initiated CONN_REQ may open (in addition to acceptIncoming()).  Up to
+    // two.  With NONE added, acceptIncoming() accepts any PSM (today's behaviour, unchanged).  With any
+    // added, a CONN_REQ for a PSM not in the list is refused with result 0x0002 (PSM not supported) --
+    // an AVCTP (0x0017/AVRCP, piece 3) channel from a headset lands here rather than consuming a slot.
+    void allowPsm(uint16_t psm) { if (m_nAllow < 2) m_allow[m_nAllow++] = psm; }
+    // Drop every channel and empty the tx queue -- used between reconnect attempts (== begin(0,0)).
+    void reset() { begin(0, 0, m_aclMax); m_nAllow = 0; }
+    // Iterate peer-initiated OPEN channels of a PSM in slot order: nextInbound(psm, nullptr) returns the
+    // first, nextInbound(psm, prev) the next, nullptr at the end.  The AVDTP acceptor uses it to find the
+    // signalling channel the headset opened (first) and, later, the media channel (next).
+    const Channel *nextInbound(uint16_t psm, const Channel *after) const;
+    // Running minimum ACL credit seen since resetCreditsMin() (piece 4's air-link-starvation floor).
+    uint8_t  creditsMin() const { return m_creditsMin; }
+    void     resetCreditsMin() { m_creditsMin = m_credits; }
     // Largest L2CAP payload send() will accept (== one Tx buffer).  A larger
     // payload is DROPPED, not fragmented -- this is basic mode with one ACL
     // packet per SDU -- so a media producer MUST cap its packet at this value.
@@ -64,6 +78,8 @@ private:
     bool sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command; false if the txq is full
     void handleSig(const uint8_t *d, uint16_t len);
     HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits, m_maxCredits; bool m_accept;
+    uint16_t m_allow[2] = {0, 0}; uint8_t m_nAllow = 0;
+    uint8_t  m_creditsMin = 0;
     Channel m_ch[MAX_CHANNELS]; uint8_t m_nextId; uint16_t m_nextCid;
     Tx m_txq[TXQ]; uint8_t m_txHead, m_txCount; uint32_t m_dropped;
     // Only one request of each type is buffered between service() calls -- fine because service()

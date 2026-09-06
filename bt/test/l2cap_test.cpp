@@ -152,5 +152,72 @@ int main() {
         }
         CHECK(sawIn); CHECK(sawOut);
     }
+    {   // A1. allowPsm(): an inbound CONN_REQ for an allowed PSM is accepted; for any other PSM it is
+        //     refused with result 0x0002 (PSM not supported) -- an AVCTP (0x0017) channel from a
+        //     headset (AVRCP, piece 3) must NOT consume a slot.
+        CapIo io; L2cap l(io); l.begin(0x0001, 7); l.acceptIncoming(true);
+        l.allowPsm(0x0019); l.allowPsm(0x0001);
+        // peer CONN_REQ: code 0x02, id 0x20, len 4, psm 0x0017 (AVCTP), scid 0x0055
+        std::vector<uint8_t> req = l2(0x0001, {0x02, 0x20, 4, 0, 0x17, 0x00, 0x55, 0x00});
+        l.onAcl(0x0001, req.data(), (uint16_t)req.size()); l.service();
+        bool sawRefuse = false;
+        for (auto &t : io.tx) if (t.size() >= 9 + 12 && t[9] == 0x03) {              // CONN_RSP (12-byte L2CAP payload)
+            CHECK(t[9 + 4] == 0x00 && t[9 + 5] == 0x00);                             // DCID 0 (no channel)
+            CHECK(t[9 + 8] == 0x02 && t[9 + 9] == 0x00);                             // result 0x0002 PSM not supported
+            sawRefuse = true;
+        }
+        CHECK(sawRefuse); CHECK(l.byPsm(0x0017) == nullptr);
+        // an allowed PSM IS accepted
+        io.tx.clear();
+        std::vector<uint8_t> ok = l2(0x0001, {0x02, 0x21, 4, 0, 0x19, 0x00, 0x56, 0x00});
+        l.onAcl(0x0001, ok.data(), (uint16_t)ok.size()); l.service();
+        bool sawAccept = false;
+        for (auto &t : io.tx) if (t.size() >= 9 + 12 && t[9] == 0x03 && t[9 + 8] == 0x00 && t[9 + 9] == 0x00) sawAccept = true;
+        CHECK(sawAccept); CHECK(l.byPsm(0x0019) != nullptr);
+    }
+    {   // A2. With NO allow-list set (default), acceptIncoming(true) keeps today's behaviour: any PSM is
+        //     accepted -- so the existing avdtp/media/[avdtp]-gate paths, which never call allowPsm, are unchanged.
+        CapIo io; L2cap l(io); l.begin(0x0001, 7); l.acceptIncoming(true);
+        std::vector<uint8_t> req = l2(0x0001, {0x02, 0x22, 4, 0, 0x17, 0x00, 0x57, 0x00});
+        l.onAcl(0x0001, req.data(), (uint16_t)req.size()); l.service();
+        CHECK(l.byPsm(0x0017) != nullptr);                                            // accepted, as before
+    }
+    {   // A3. reset(): every channel goes FREE and the tx queue empties, so the next attempt starts clean.
+        CapIo io; L2cap l(io); l.begin(0x0001, 7);
+        CHECK(l.connect(0x0019, 0x0041) != nullptr);
+        l.reset();
+        CHECK(l.byLocal(0x0041) == nullptr && l.byPsm(0x0019) == nullptr);
+        l.service();                                                                  // nothing queued survives reset()
+        CHECK(io.tx.empty());
+    }
+    {   // A4a. nextInbound(): iterates peer-initiated OPEN channels of a PSM, in slot order.  Ample credits
+        //      (20): accepting each inbound channel costs 3 signalling packets (CONN_RSP + our CFG_REQ + our
+        //      CFG_RSP), so two channels need 6 -- with only 5 the second never reaches OPEN.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0019);
+        for (uint8_t k = 0; k < 2; k++) {
+            std::vector<uint8_t> rq = l2(0x0001, {0x02, (uint8_t)(0x30 + k), 4, 0, 0x19, 0x00, (uint8_t)(0x60 + k), 0x00});
+            l.onAcl(0x0001, rq.data(), (uint16_t)rq.size()); l.service();
+            L2cap::Channel *ch = l.byRemote((uint16_t)(0x0060 + k)); CHECK(ch);
+            std::vector<uint8_t> cq = l2(0x0001, {0x04, (uint8_t)(0x40 + k), 8, 0, (uint8_t)ch->localCid, (uint8_t)(ch->localCid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03});
+            l.onAcl(0x0001, cq.data(), (uint16_t)cq.size());
+            std::vector<uint8_t> cr = l2(0x0001, {0x05, (uint8_t)(0x50 + k), 6, 0, (uint8_t)ch->localCid, (uint8_t)(ch->localCid >> 8), 0, 0, 0, 0});
+            l.onAcl(0x0001, cr.data(), (uint16_t)cr.size()); l.service();
+            CHECK(ch->state == L2cap::OPEN);
+        }
+        const L2cap::Channel *a = l.nextInbound(0x0019, nullptr); CHECK(a && a->remoteCid == 0x0060);
+        const L2cap::Channel *b = l.nextInbound(0x0019, a);       CHECK(b && b->remoteCid == 0x0061);
+        CHECK(l.nextInbound(0x0019, b) == nullptr);
+    }
+    {   // A4b. creditsMin(): the running minimum credit since resetCreditsMin(); an NCP refill does NOT raise
+        //      the floor.  Standalone (no channel setup to consume credits): send() queues on any cid, service()
+        //      transmits while credits>0.  Start 5, send 3 (->2), NCP(+2) (->4); the floor stays 2.
+        CapIo io; L2cap l(io); l.begin(0x0001, 5);
+        l.resetCreditsMin();
+        for (int i = 0; i < 3; i++) { const uint8_t d[4] = {0, 1, 2, 3}; l.send(0x0040, d, 4); }
+        l.service();
+        CHECK(l.credits() == 2 && l.creditsMin() == 2);
+        uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x02, 0x00 };  l.onEvent(0x13, ncp, sizeof ncp);
+        CHECK(l.credits() == 4 && l.creditsMin() == 2);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
