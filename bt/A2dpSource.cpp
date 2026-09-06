@@ -41,6 +41,11 @@ void A2dpSource::begin(uint32_t now, uint8_t aclNum) {
 }
 bool A2dpSource::start(const Target &t) {
     if (busy()) return false;
+    // A fresh attempt forgets any prior link loss: the DISCONNECTING teardown path is EXCLUDED from tick()'s
+    // loss-check, so a deliberate disconnect() (or a reconnect after a drop) leaves BtLink in LINK_LOST; without
+    // this ack the first LINKING tick would abort the new attempt as LOST before Connection_Complete is consumed.
+    // ackLost() only clears LINK_LOST->LINK_NONE, so it is a no-op for an INBOUND target (link already UP).
+    m_link.ackLost();
     m_t = t; m_inbound = (t.kind == Target::INBOUND);
     m_pagedFromInquiry = false; m_opIssued = false; m_startWaitAt = 0;
     m_sdpChan = m_sigChan = nullptr; m_result = PENDING;

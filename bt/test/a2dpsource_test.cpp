@@ -163,5 +163,21 @@ int main() {
         CHECK(r.src.result() == A2dpSource::LOST && r.src.state() == A2dpSource::DONE);
         CHECK(r.src.l2().byPsm(Avdtp::PSM) == nullptr && r.src.l2().byPsm(Sdp::PSM) == nullptr);           // media path torn down
     }
+    {   // A fresh attempt must ACK a prior link loss (regression for A2dpSource::start()'s ackLost()).  The
+        //   DISCONNECTING teardown is EXCLUDED from tick()'s loss-check, so a first attempt that fails at
+        //   pairing leaves BtLink in LINK_LOST; without the ack, the NEXT start()'s first LINKING tick aborts
+        //   LOST before it even pages -- so the second attempt must reach PAIR_FAILED (link came up), not LOST.
+        Rig r; g_present = SHOKZ;
+        r.src.begin(fakeNow(), 100);
+        CHECK(runUntil([&]{ return !r.src.link().busy(); }, 5000));                                         // PREPARE done
+        A2dpSource::Target t1{}; t1.kind = A2dpSource::Target::PAGE; memcpy(t1.bd, SHOKZ, 6); t1.psrm = 1; t1.attempts = 1;
+        CHECK(r.src.start(t1));
+        CHECK(runUntil([&]{ return !r.src.busy(); }, 40000) && r.src.result() == A2dpSource::PAIR_FAILED);  // link up, auth refused, torn down
+        CHECK(r.src.link().lost());                                                                         // the stale LINK_LOST precondition
+        A2dpSource::Target t2 = t1;
+        CHECK(r.src.start(t2));
+        CHECK(runUntil([&]{ return !r.src.busy(); }, 40000));
+        CHECK(r.src.result() == A2dpSource::PAIR_FAILED);                                                   // NOT LOST: start() acked the stale loss and the attempt paged
+    }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
