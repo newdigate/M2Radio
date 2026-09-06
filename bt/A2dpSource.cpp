@@ -6,7 +6,8 @@
 const char *A2dpSource::resultName(Result r) {
     switch (r) { case OK: return "ok"; case CONNECT_FAILED: return "connect_failed";
         case PAIR_FAILED: return "pair_failed"; case L2CAP_FAILED: return "l2cap_failed";
-        case AVDTP_FAILED: return "avdtp_failed"; } return "?";
+        case AVDTP_FAILED: return "avdtp_failed"; case LOST: return "lost";
+        case STOPPED: return "stopped"; case PENDING: return "pending"; } return "?";
 }
 void A2dpSource::logf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(m_lb, sizeof m_lb, fmt, ap); va_end(ap);
@@ -15,57 +16,126 @@ void A2dpSource::logf(const char *fmt, ...) {
 void A2dpSource::onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len) {
     A2dpSource *s = (A2dpSource *)ctx;
     if (s->m_sdpServer.onData(ch, p, len)) return;             // the PEER's SDP query of us (its own channel): answered in service()
-    if (ch.psm == Avdtp::PSM && ch.localCid == 0x0041) s->m_avdtp.onSignalling(p, len);
-    else if (ch.psm == Sdp::PSM) { s->m_sdpVer = Sdp::parseAvdtpVersion(p, len); s->m_sdpDone = true; }   // OUR client channel
+    if (ch.psm == Avdtp::PSM) {
+        // Route the AVDTP signalling channel to the state machine -- both our outbound channel (0x0041)
+        // and the peer-opened acceptor channel (its L2cap-assigned CID).  The media channel carries RTP,
+        // never signalling, so it is the one AVDTP channel we do NOT forward.
+        uint16_t media = s->m_avdtp.mediaRemoteCid();
+        if (media != 0 && ch.remoteCid == media) return;
+        s->m_avdtp.onSignalling(p, len);
+    } else if (ch.psm == Sdp::PSM) { s->m_sdpVer = Sdp::parseAvdtpVersion(p, len); s->m_sdpDone = true; }   // OUR client channel
 }
-A2dpSource::Result A2dpSource::connect(const char *name, uint8_t aclNum, uint32_t (*now)(), void (*idle)()) {
-    // NEW-34: bonded candidates first -- most recent first, filtered by the target name when one
-    // is given (an EMPTY stored name is a wildcard: a nameless bond costs one page, never a dead
-    // slot), the first candidate paged PAGE_ATTEMPTS times and each later one once -- then today's
-    // inquiry path as the fallback on every attempt (brainstorm decision 3).  Passing b.name to
-    // page() is load-bearing: after a rejection the bond is erased before the new key is notified,
-    // so the name page() was given is the only surviving source for the re-created bond.
-    bool linked = false;
-    if (m_bonds && m_bonds->count()) {
-        bool first = true;
-        for (uint8_t i = 0; i < m_bonds->count() && !linked; i++) {
-            Bond b = m_bonds->at(i);                                     // a COPY: a Link_Key_Notification can upsert() from the idle()-pumped dispatch DURING page(), and the ladder reorders the table after it
-            if (name && name[0] && b.name[0] && !strstr(b.name, name)) continue;
-            char bs[18]; hciFormatBd(b.bd, bs);
-            uint8_t attempts = first ? BtLink::PAGE_ATTEMPTS : 1; first = false;
-            logf("bond_try: bd=%s name=\"%s\" attempts=%u", bs, b.name, attempts);
-            if (m_link.page(b.bd, b.psrm, 0, false, b.name, attempts, now, idle) == BtLink::OK) linked = true;
+void A2dpSource::adoptConfig() {
+    const Avdtp::SbcConfig &c = m_avdtp.sbcConfig();
+    m_params.rate = c.rate >= 48000 ? Sbc::RATE_48000 : c.rate >= 44100 ? Sbc::RATE_44100
+                  : c.rate >= 32000 ? Sbc::RATE_32000 : Sbc::RATE_16000;
+    m_params.mode = c.mode == Avdtp::MONO ? Sbc::MONO : c.mode == Avdtp::DUAL ? Sbc::DUAL
+                  : c.mode == Avdtp::STEREO ? Sbc::STEREO : Sbc::JOINT_STEREO;
+    m_params.alloc = c.alloc == Avdtp::SNR ? Sbc::SNR : Sbc::LOUDNESS;
+    m_params.blocks = c.blocks; m_params.subbands = c.subbands; m_params.bitpool = c.maxBitpool;
+    logf("attempt: adopted sbc bitpool=%u mode=%u blocks=%u sub=%u", c.maxBitpool, (unsigned)m_params.mode, c.blocks, c.subbands);
+}
+void A2dpSource::begin(uint32_t now, uint8_t aclNum) {
+    m_aclNum = aclNum; m_st = IDLE; m_result = OK;
+    m_link.begin(now); m_link.startPrepare();                  // PREPARE once per session; start() waits for it via LINKING/PAIRING
+}
+bool A2dpSource::start(const Target &t) {
+    if (busy()) return false;
+    m_t = t; m_inbound = (t.kind == Target::INBOUND);
+    m_pagedFromInquiry = false; m_opIssued = false; m_startWaitAt = 0;
+    m_sdpChan = m_sigChan = nullptr; m_result = PENDING;
+    switch (t.kind) {
+    case Target::PAGE:    m_opIssued = m_link.startPage(t.bd, t.psrm, t.clk, t.clkValid, t.name, t.attempts); m_st = LINKING; break;
+    case Target::INQUIRY: m_opIssued = m_link.startInquiry(t.nameFilter); m_st = LINKING; break;
+    case Target::INBOUND: m_link.ackInboundUp(); m_opIssued = m_link.startPair(true); m_st = PAIRING; break;
+    }
+    return true;
+}
+void A2dpSource::stop() { m_result = STOPPED; m_st = DISCONNECTING; }
+// Outbound: open our AVDTP signalling channel and wait (in AVDTP_WAIT) for it to reach OPEN.
+void A2dpSource::beginAvdtpConnect(uint32_t now) {
+    m_sigChan = m_l2.connect(Avdtp::PSM, 0x0041);
+    if (!m_sigChan) { m_result = L2CAP_FAILED; m_st = DISCONNECTING; return; }
+    m_st = AVDTP_WAIT; m_deadline = now + 5000;
+}
+void A2dpSource::tick(uint32_t now) {
+    m_link.tick(now);
+    // A link loss in any live state tears the media path down and ends the attempt LOST.
+    if (m_st != IDLE && m_st != DONE && m_st != DISCONNECTING && m_link.lost()) {
+        m_link.ackLost(); m_avdtp.reset(); m_l2.reset();
+        logf("attempt: link lost reason=0x%02X", m_link.lostReason());
+        m_result = LOST; m_st = DONE; return;
+    }
+    switch (m_st) {
+    case LINKING:
+        if (m_link.busy()) return;
+        if (!m_opIssued) {                                     // PREPARE was still running at start(): launch the op now
+            m_opIssued = (m_t.kind == Target::INQUIRY) ? m_link.startInquiry(m_t.nameFilter)
+                       : m_link.startPage(m_t.bd, m_t.psrm, m_t.clk, m_t.clkValid, m_t.name, m_t.attempts);
+            return;
         }
-        if (!linked) logf("bond_page=none -> inquiry");
+        if (m_t.kind == Target::INQUIRY && m_link.op() == BtLink::NONE && m_link.result() == BtLink::OK && !m_pagedFromInquiry) {
+            BtLink::Target h = m_link.target();
+            if (!h.valid) { m_result = CONNECT_FAILED; m_st = DISCONNECTING; break; }
+            m_pagedFromInquiry = true; m_link.startPage(h.bd, h.psrm, h.clk, h.clkValid, h.name, BtLink::PAGE_ATTEMPTS); return;
+        }
+        if (m_link.result() != BtLink::OK) { m_result = CONNECT_FAILED; m_st = DISCONNECTING; break; }
+        m_opIssued = m_link.startPair(m_inbound); m_st = PAIRING; break;
+    case PAIRING:
+        if (m_link.busy()) return;
+        if (!m_opIssued) { m_opIssued = m_link.startPair(m_inbound); return; }   // PREPARE delayed the pair (INBOUND)
+        if (m_link.result() != BtLink::OK) { m_result = PAIR_FAILED; m_st = DISCONNECTING; break; }
+        m_l2.begin(m_link.handle(), m_aclNum); m_l2.acceptIncoming(true);
+        m_l2.allowPsm(Avdtp::PSM); m_l2.allowPsm(Sdp::PSM); m_l2.onData(onData, this);
+        m_st = L2; m_deadline = now + 5000;
+        if (!m_inbound) m_sdpChan = m_l2.connect(Sdp::PSM, 0x0040);              // outbound: query the sink's AVDTP version
+        break;
+    case L2:
+        if (m_inbound) { m_st = AVDTP_WAIT; m_deadline = now + m_avdtpWaitMs; m_startWaitAt = 0; break; }
+        if (!m_sdpChan) { beginAvdtpConnect(now); break; }                      // no SDP channel available: skip SDP
+        if (m_sdpChan->state == L2cap::OPEN) {                                   // query the AudioSink ProtocolDescriptorList
+            uint8_t q[18]; m_l2.send(m_sdpChan->remoteCid, q, Sdp::buildAudioSinkPdlRequest(q, 1));
+            m_sdpDone = false; m_st = SDP; m_deadline = now + 5000; break;
+        }
+        if ((int32_t)(now - m_deadline) < 0) return;                            // still waiting for the SDP channel to open
+        beginAvdtpConnect(now); break;                                          // SDP never opened -> straight to AVDTP
+    case SDP:
+        if (m_sdpDone || (int32_t)(now - m_deadline) >= 0) { beginAvdtpConnect(now); break; }   // SDP is informational; a timeout is not fatal
+        return;
+    case AVDTP_WAIT:
+        if (m_inbound) {
+            m_avdtp.adoptInbound(m_l2);                                         // adopt the peer's signalling channel once it opens
+            if (m_avdtp.role() == Avdtp::ACCEPTOR) { m_st = AVDTP; m_deadline = now + 15000; m_startWaitAt = 0; break; }
+            if ((int32_t)(now - m_deadline) < 0) return;
+            L2cap::Channel *sig = m_l2.connect(Avdtp::PSM, 0x0041);             // peer never opened AVDTP: initiate ourselves
+            if (!sig) { m_result = L2CAP_FAILED; m_st = DISCONNECTING; break; }
+            Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
+            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
+        }
+        if (m_sigChan && m_sigChan->state == L2cap::OPEN) {                      // outbound: our signalling channel is up -> initiate
+            Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
+            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
+        }
+        if ((int32_t)(now - m_deadline) < 0) return;
+        m_result = L2CAP_FAILED; m_st = DISCONNECTING; break;
+    case AVDTP:
+        if (m_inbound) {
+            m_avdtp.adoptInbound(m_l2);                                         // pick up the peer's media channel in OPENING
+            if (m_avdtp.configChanged()) adoptConfig();
+            if (m_avdtp.mediaReady()) {                                         // media OPEN but no peer START: self-START after START_WAIT_MS
+                if (m_startWaitAt == 0) m_startWaitAt = now + START_WAIT_MS;
+                else if ((int32_t)(now - m_startWaitAt) >= 0) m_avdtp.startSelf();
+            }
+        }
+        if (m_avdtp.started()) { m_result = OK; m_st = STREAMING; break; }
+        if (m_avdtp.state() == Avdtp::FAILED) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; break; }
+        if ((int32_t)(now - m_deadline) >= 0) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; break; }
+        break;
+    case DISCONNECTING:
+        if (!m_link.busy() && m_link.op() == BtLink::NONE && m_link.handle() == 0) { m_st = DONE; return; }
+        if (m_link.op() != BtLink::DISCONNECT) m_link.startDisconnect();
+        break;
+    default: break;                                                            // IDLE, STREAMING, DONE: nothing to advance
     }
-    if (!linked && m_link.connect(name, now, idle) != BtLink::OK) { m_link.disconnect(now, idle); return CONNECT_FAILED; }   // no-op with no handle; reclaims a link a racing page left up
-    if (m_link.pairAndEncrypt(now, idle) != BtLink::OK) { m_link.disconnect(now, idle); return PAIR_FAILED; }
-    m_l2.begin(m_link.handle(), aclNum);
-    m_l2.acceptIncoming(true);
-    m_l2.onData(onData, this);
-    // (the app wires hci.onAcl -> a thunk that calls this->onAcl)
-    // SDP (informational; failure here does not abort AVDTP)
-    L2cap::Channel *sdp = m_l2.connect(Sdp::PSM, 0x0040);
-    uint32_t t0 = now();
-    if (sdp) while (sdp->state != L2cap::OPEN && now() - t0 < 5000) { service(); idle(); }
-    if (sdp && sdp->state == L2cap::OPEN) {
-        uint8_t q[18]; m_l2.send(sdp->remoteCid, q, Sdp::buildAudioSinkPdlRequest(q, 1));
-        m_sdpDone = false; t0 = now();
-        while (!m_sdpDone && now() - t0 < 5000) { service(); idle(); }
-    }
-    // AVDTP DISCOVER..START on the signalling channel 0x0041, media 0x0042
-    L2cap::Channel *sig = m_l2.connect(Avdtp::PSM, 0x0041);
-    if (!sig) { m_link.disconnect(now, idle); return L2CAP_FAILED; }
-    t0 = now();
-    while (sig->state != L2cap::OPEN && now() - t0 < 5000) { service(); idle(); }
-    if (sig->state != L2cap::OPEN) { m_link.disconnect(now, idle); return L2CAP_FAILED; }
-    m_avdtp.begin(m_l2, 0x0041, 0x0042);
-    Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
-    m_avdtp.start(want); t0 = now();
-    while (m_avdtp.state() != Avdtp::STREAMING && m_avdtp.state() != Avdtp::FAILED && now() - t0 < 15000) {
-        service(); idle();
-    }
-    if (m_avdtp.state() == Avdtp::STREAMING) return OK;
-    m_link.disconnect(now, idle);
-    return AVDTP_FAILED;
+    m_l2.service(); m_avdtp.service(); m_sdpServer.service(m_l2);
 }
