@@ -48,6 +48,10 @@ void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
 }
 void Avdtp::reset() {
     m_state = IDLE; m_role = RNONE; m_media = nullptr; m_rspSeen = false; m_cfgChanged = false;
+    // Clear the channel bindings too: after a teardown, a NEW inbound attempt through the same Avdtp must
+    // re-adopt from scratch -- a stale m_sig makes adoptInbound()'s `if (!m_sig)` guard skip re-adoption
+    // and the reconnect silently never becomes ACCEPTOR (found reviewing Task 5, needed by BtSession's reconnect).
+    m_sig = nullptr; m_l2 = nullptr; m_sigCid = 0; m_mediaCid = 0;
     m_peerDiscover = m_peerDelayRpt = m_peerReject = false;
     m_peerCaps = m_peerSetCfg = m_peerOpen = m_peerStart = m_peerSuspend = m_peerClose = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0;

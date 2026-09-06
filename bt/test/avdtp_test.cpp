@@ -268,5 +268,14 @@ int main() {
         CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x08 }));
         CHECK(a.state() != Avdtp::STREAMING && !a.started() && a.mediaRemoteCid() == 0);
     }
+    {   // B7. reset() clears the channel binding so a fresh inbound adoption re-runs -- BtSession drives repeated
+        //     INBOUND attempts through ONE Avdtp on reconnect; a stale m_sig would make adoptInbound skip re-adoption.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        CHECK(a.role() == Avdtp::ACCEPTOR);
+        a.reset();
+        CHECK(a.role() == Avdtp::RNONE);
+        a.adoptInbound(l);                       // the peer AVDTP channel is still OPEN; re-adoption must succeed
+        CHECK(a.role() == Avdtp::ACCEPTOR);
+    }
     printf("avdtp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
