@@ -59,12 +59,12 @@ uint8_t MediaPacketizer::advanceRd(uint8_t cur, uint8_t rd0, uint8_t n) {
 uint8_t MediaPacketizer::count() const {
     return (uint8_t)(((int)m_wr - (int)m_rd + RING) % RING);
 }
-// Assumes the fixed SBC config named at FRAME_BYTES's definition -- a different
-// bitpool/subband/block config would need a different frame size here.
-void MediaPacketizer::begin(uint16_t mtu) {
-    m_mtu = mtu;
+// frameBytes defaults to FRAME_BYTES (the fixed bitpool-53 SBC frame size); an accepted
+// config at a different bitpool passes its real frame length so batching still fills the MTU.
+void MediaPacketizer::begin(uint16_t mtu, uint16_t frameBytes) {
+    m_mtu = mtu; m_frameBytes = frameBytes ? frameBytes : FRAME_BYTES;
     uint16_t avail = mtu > Rtp::HEADER_LEN ? mtu - Rtp::HEADER_LEN : 0;
-    m_perPkt = avail / FRAME_BYTES;          // whole SBC frames per packet
+    m_perPkt = avail / m_frameBytes;         // whole SBC frames per packet
     if (m_perPkt == 0) m_perPkt = 1;
     if (m_perPkt > 8)  m_perPkt = 8;        // A2DP frame-count nibble cap; and PKT_MAX sizing
     m_wr = m_rd = 0; m_seq = 0; m_ts = 0;

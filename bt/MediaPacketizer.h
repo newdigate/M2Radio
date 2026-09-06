@@ -20,7 +20,7 @@ public:
     // keeps the frames for the next drain().
     typedef bool (*SendFn)(void *ctx, const uint8_t *pkt, uint16_t len);
 
-    void begin(uint16_t mtu);
+    void begin(uint16_t mtu, uint16_t frameBytes = FRAME_BYTES);
     // Producer side (call from the ISR).  Copies the frame; drops the OLDEST on a full ring.
     void push(const uint8_t *frame, uint16_t len);
     // Consumer side (call from the main loop).  Batches whole frames up to mtu into RTP
@@ -46,6 +46,7 @@ private:
     uint8_t  m_buf[RING][FRAME_MAX]; uint16_t m_len[RING];
     volatile uint8_t m_wr = 0, m_rd = 0;    // SPSC indices, mod RING
     uint16_t m_mtu = 0, m_perPkt = 0;
+    uint16_t m_frameBytes = FRAME_BYTES;
     uint16_t m_seq = 0; uint32_t m_ts = 0;
     uint32_t m_frames = 0, m_packets = 0, m_drops = 0; uint8_t m_hw = 0;
 };

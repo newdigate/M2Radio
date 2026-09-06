@@ -2,6 +2,7 @@
 #include "Rtp.h"
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 static int g_fails = 0, g_checks = 0;
 #define CHECK(c) do { g_checks++; if (!(c)) { g_fails++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
@@ -78,6 +79,16 @@ int main() {
         CHECK(MediaPacketizer::advanceRd(14, 10, 3) == 14);   // ISR dropped >n: keep ISR's further pos
         CHECK(MediaPacketizer::advanceRd(64, 63, 3) == 1);    // wrap: (63+3)%65 == 1
         CHECK(MediaPacketizer::advanceRd(1, 63, 3) == 1);     // ISR wrapped past rd0+n: keep cur
+    }
+    {   // Frame length is a begin() parameter: an 83-byte frame (bitpool 35, joint stereo) batches
+        //   floor((mtu-13)/83) per packet, not floor((mtu-13)/119).
+        MediaPacketizer pk; pk.begin(/*mtu*/ 400, /*frameBytes*/ 83);
+        CHECK(pk.framesPerPacket() == (400 - Rtp::HEADER_LEN) / 83);   // == 4, not 3
+        uint8_t f[83]; memset(f, 0x9C, sizeof f);
+        for (int i = 0; i < 4; i++) pk.push(f, 83);
+        struct Cap { static bool s(void *c, const uint8_t *, uint16_t n){ auto *v=(std::vector<uint16_t>*)c; v->push_back(n); return true; } };
+        std::vector<uint16_t> lens; pk.drain(Cap::s, &lens);
+        CHECK(lens.size() == 1 && lens[0] == Rtp::HEADER_LEN + 4 * 83);
     }
     printf("mediapacketizer_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

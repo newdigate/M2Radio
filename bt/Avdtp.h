@@ -36,7 +36,18 @@ struct Avdtp {
     static bool     parseSbcCaps(const uint8_t *p, uint16_t len, SbcCaps &c);
     static void     sbcCie(const SbcConfig &c, uint8_t out[4]);
     // --- initiator, one stream ---
-    enum State : uint8_t { IDLE, DISCOVERING, GETTING_CAPS, CONFIGURING, OPENING, MEDIA_CONNECTING, STARTING, STREAMING, FAILED };
+    enum State : uint8_t { IDLE, DISCOVERING, GETTING_CAPS, CONFIGURING, OPENING, MEDIA_CONNECTING, STARTING, STREAMING, SUSPENDED, FAILED };
+    enum Role : uint8_t { RNONE, INITIATOR, ACCEPTOR };
+    Role role() const { return m_role; }
+    void reset();                                        // back to IDLE, RNONE, media released
+    void adoptInbound(L2cap &l);                         // find our peer-initiated signalling channel (and later media) from L2cap
+    bool started() const { return m_state == STREAMING; }
+    const SbcConfig &sbcConfig() const { return m_acceptCfg; }   // the config the peer SET (acceptor); valid once configChanged() fired
+    bool configChanged() { bool c = m_cfgChanged; m_cfgChanged = false; return c; }   // one-shot: the app restarts the encoder on true
+    // The peer's OPEN completed and its media channel is OPEN, but no START has arrived yet: the attempt
+    // layer (A2dpSource, which owns a clock) may call startSelf() after its own START_WAIT deadline.
+    bool mediaReady() const { return m_role == ACCEPTOR && m_state == OPENING && m_media && m_media->state == L2cap::OPEN; }
+    void startSelf();                                    // we (acceptor) issue START ourselves; moves to STARTING
     void begin(L2cap &l2, uint16_t sigLocalCid, uint16_t mediaLocalCid);
     bool start(const SbcConfig &want);        // kick off: DISCOVER on the (already OPEN) signalling channel
     void onSignalling(const uint8_t *p, uint16_t len);   // from the L2cap data callback, signalling channel (record only)
@@ -60,6 +71,19 @@ private:
     // a DelayReport (0x0D) gets an ACCEPT; any other command we do not implement gets a General Reject.
     bool m_peerDelayRpt = false; uint8_t m_peerDelayHdr = 0;
     bool m_peerReject = false;   uint8_t m_peerRejHdr = 0, m_peerRejSig = 0;
+    Role m_role = RNONE;
+    SbcConfig m_acceptCfg = { 44100, JOINT_STEREO, 16, 8, LOUDNESS, 2, 53 };
+    bool m_cfgChanged = false;
+    // peer-command recording for the FULL acceptor (beyond m_peerDiscover/m_peerDelayRpt/m_peerReject):
+    bool m_peerCaps = false;    uint8_t m_peerCapsHdr = 0, m_peerCapsSeid = 0, m_peerCapsSig = 0;
+    bool m_peerSetCfg = false;  uint8_t m_peerSetHdr = 0; uint8_t m_peerSetPl[20]; uint16_t m_peerSetLen = 0;
+    bool m_peerOpen = false;    uint8_t m_peerOpenHdr = 0, m_peerOpenSeid = 0;
+    bool m_peerStart = false;   uint8_t m_peerStartHdr = 0;
+    bool m_peerSuspend = false; uint8_t m_peerSuspendHdr = 0;
+    bool m_peerClose = false;   uint8_t m_peerCloseHdr = 0, m_peerCloseSig = 0;
+    static const uint8_t OUR_SEID = 1;
+    uint16_t buildCapsAccept(uint8_t *o, uint8_t hdr, uint8_t sig);
+    bool parseAcceptCfg(const uint8_t *p, uint16_t len, SbcConfig &c, uint8_t &badCat);
     // Returns false if L2cap's TXQ was full and the command was NOT queued -- callers must not advance
     // state on a false return (BT-1's stuck-credit disease: advancing while nothing reached the wire hangs forever).
     bool send(const uint8_t *b, uint16_t n) { return m_l2->send(m_sig->remoteCid, b, n); }

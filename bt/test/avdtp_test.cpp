@@ -36,6 +36,35 @@ static void openSignalling(CapIo &io, L2cap &l, Avdtp &a) {
     Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
     CHECK(a.start(want)); drain(io);
 }
+static void tick(L2cap &l, Avdtp &a);   // forward decl: both acceptor helpers below call it before its definition further down
+// The peer OPENS signalling at us: bring an inbound AVDTP channel (peerInitiated) to OPEN, then hand the
+// Avdtp its inbound signalling channel so it acts as ACCEPTOR.  Returns the peer-assigned remote CID.
+static uint16_t openInboundSignalling(CapIo &io, L2cap &l, Avdtp &a) {
+    l.begin(0x0001, 100); l.acceptIncoming(true); l.allowPsm(Avdtp::PSM); l.onData(onData, &a);
+    // peer CONN_REQ psm 0x0019 scid 0x00C0 -> we accept (our CID assigned by L2cap)
+    feed(l, 0x0001, { 0x02, 0x20, 4, 0, 0x19, 0x00, 0xC0, 0x00 }); l.service();
+    const L2cap::Channel *ch = l.byRemote(0x00C0); CHECK(ch);
+    uint16_t our = ch->localCid;
+    feed(l, 0x0001, { 0x04, 0x21, 8, 0, (uint8_t)our, (uint8_t)(our >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });   // peer CFG_REQ
+    feed(l, 0x0001, { 0x05, 0x22, 6, 0, (uint8_t)our, (uint8_t)(our >> 8), 0, 0, 0, 0 });                     // peer CFG_RSP
+    l.service(); CHECK(l.byRemote(0x00C0)->state == L2cap::OPEN);
+    a.begin(l, 0, 0);                 // no initiator CIDs; acceptor discovers its channel from L2cap
+    a.adoptInbound(l); drain(io);
+    return 0x00C0;
+}
+// Replays B1's DISCOVER..START sequence via the acceptor so B5/B6 do not repeat it.
+static void acceptorToStreaming(CapIo &io, L2cap &l, Avdtp &a) {
+    a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); drain(io);
+    a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+    a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }.data(), 14); tick(l, a); drain(io);
+    a.onSignalling(std::vector<uint8_t>{ 0x60, 0x06, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+    feed(l, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); l.service();
+    const L2cap::Channel *m = l.byRemote(0x00C1);
+    feed(l, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+    feed(l, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0, 0 });
+    l.service(); a.adoptInbound(l); tick(l, a); drain(io);
+    a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+}
 static void tick(L2cap &l, Avdtp &a) { l.service(); a.service(); l.service(); }
 int main() {
     {   // 1. SDP: the AudioSink/ProtocolDescriptorList request is the exact 18 bytes proven on three peers
@@ -152,6 +181,86 @@ int main() {
         a.onSignalling(caps, 12); tick(l, a); o = drain(io);
         CHECK(o.size() == 1 && eq(o[0], { 0x30, 0x03, 1 << 2, 1 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }));
         CHECK(!a.caps().delayReporting);
+    }
+    {   // B1. ACCEPTOR: the peer drives DISCOVER/GET_ALL_CAPABILITIES/SET_CONFIGURATION/OPEN/START and we
+        //     answer from our source SEP; the adopted config is what sbcConfig() reports.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        CHECK(a.role() == Avdtp::ACCEPTOR);
+        // DISCOVER (peer tl 3) -> our one audio-SOURCE SEP, SEID 1
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x01, 1 << 2, 0x00 }));                 // ACCEPT: SEID 1, audio, SRC (in-use bit 0)
+        // GET_ALL_CAPABILITIES SEID 1 -> media transport + SBC caps (all modes, blocks 4..16, sub 4/8, bitpool 2..53) + delay reporting
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x42 && o[0][1] == 0x0C);
+        CHECK(o[0][2] == 0x01 && o[0][3] == 0x00 && o[0][4] == 0x07 && o[0][5] == 0x06 && o[0][6] == 0x00 && o[0][7] == 0x00);
+        CHECK(o[0][8] == 0xFF && o[0][9] == 0xFF && o[0][10] == 0x02 && o[0][11] == 0x35);   // rates/modes/blocks/sub/alloc all, bitpool 2..53
+        // SET_CONFIGURATION at bitpool 35 (cie 21 15 02 23), acp seid 1, int seid 5 -> ACCEPT, config adopted
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x23 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x52, 0x03 }));                               // bare ACCEPT
+        CHECK(a.sbcConfig().maxBitpool == 35 && a.sbcConfig().mode == Avdtp::JOINT_STEREO);
+        CHECK(a.configChanged());                                                       // consumed by the app once
+        // OPEN -> ACCEPT
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x06, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x62, 0x06 }));
+        // the peer opens the media channel; adoptInbound picks it up
+        feed(l, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); l.service();
+        const L2cap::Channel *m = l.byRemote(0x00C1);
+        feed(l, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(l, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0, 0 });
+        l.service(); a.adoptInbound(l); tick(l, a); drain(io);
+        CHECK(a.mediaRemoteCid() == 0x00C1);
+        // START -> ACCEPT -> STREAMING
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x72, 0x07 }));
+        CHECK(a.state() == Avdtp::STREAMING);
+    }
+    {   // B2. SET_CONFIGURATION at a config we cannot serve (48 kHz) is REJECTED with the media-codec category
+        //     byte and error 0x29 (unsupported configuration).  48k = cie byte0 0x10 | mode.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x11, 0x15, 0x02, 0x35 }.data(), 14);
+        tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x33 && o[0][1] == 0x03 && o[0][2] == 0x07 && o[0][3] == 0x29);  // REJECT, category 0x07, 0x29
+        CHECK(a.state() != Avdtp::STREAMING);
+        // Bitpool out of range (99 > 53) is rejected the same way even though rate/mode/blocks/sub/alloc are
+        // all otherwise valid (cie 21 15 02 63 -- only the trailing maxBitpool byte differs from a good config).
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x63 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x33 && o[0][1] == 0x03 && o[0][2] == 0x07 && o[0][3] == 0x29);
+        CHECK(a.state() != Avdtp::STREAMING);
+    }
+    {   // B3. GET_CAPABILITIES / SET_CONFIGURATION for a SEID that is not ours (2) -> REJECT BAD_ACP_SEID 0x12.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x0C, 2 << 2 }.data(), 3); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x33 && o[0][1] == 0x0C && o[0][2] == 0x12);
+    }
+    {   // B4. Collision: our initiator has already SENT SET_CONFIGURATION (CONFIGURING) when the peer sends its
+        //     own -> REJECT BAD_STATE 0x31, and our initiator is untouched.
+        CapIo io; L2cap l(io); Avdtp a; openSignalling(io, l, a);        // initiator path (from the existing helper)
+        tick(l, a); drain(io);                                          // DISCOVER
+        a.onSignalling(std::vector<uint8_t>{ 0x12, 0x01, 1 << 2, 0x08 }.data(), 4); tick(l, a); drain(io);   // caps
+        static const uint8_t caps[12] = { 0x22, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35 };
+        a.onSignalling(caps, 12); tick(l, a); drain(io);                // we send SET_CONFIGURATION -> CONFIGURING
+        CHECK(a.state() == Avdtp::CONFIGURING);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }.data(), 14);
+        tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x53 && o[0][1] == 0x03 && o[0][3] == 0x31);   // REJECT BAD_STATE
+        CHECK(a.state() == Avdtp::CONFIGURING);                          // initiator unharmed
+    }
+    {   // B5. SUSPEND pauses (started() false, state SUSPENDED), a later START resumes to STREAMING.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        // fast-path to STREAMING via the acceptor (reuse B1's sequence up to START); helper below:
+        acceptorToStreaming(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x09, 1 << 2 }.data(), 3); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x09 }) && a.state() == Avdtp::SUSPENDED && !a.started());
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x07, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x42, 0x07 }) && a.state() == Avdtp::STREAMING && a.started());
+    }
+    {   // B6. CLOSE returns the SEP to idle so the attempt can re-open (state back to a non-streaming, non-configured state).
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a); acceptorToStreaming(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x08, 1 << 2 }.data(), 3); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x08 }));
+        CHECK(a.state() != Avdtp::STREAMING && !a.started() && a.mediaRemoteCid() == 0);
     }
     printf("avdtp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
