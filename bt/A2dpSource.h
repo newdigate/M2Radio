@@ -37,6 +37,10 @@ public:
     BondTable *bonds() { return m_bonds; }
     void setPin(const char *pin4) { m_link.setPin(pin4); }
     void setLegacyPin(bool v)     { m_link.setLegacyPin(v); }
+    // NEW-34 piece 3 capture: accept the peer's AVCTP/AVRCP L2CAP channel (PSM 0x0017) instead of refusing
+    // it (the allow-list otherwise permits only SDP + AVDTP).  Diagnostic -- no AVRCP logic behind it; used
+    // to see whether the refusal alone triggers the Shokz self-power-off.  Default off (behaviour unchanged).
+    void setAllowAvctp(bool v)    { m_allowAvctp = v; }
     // ---- The attempt state machine -----------------------------------------------------------
     void begin(uint32_t now, uint8_t aclNum);        // reset the attempt machine; call once per session (with the ACL buffer count)
     bool start(const Target &t);                      // begin one attempt; false if one is already running
@@ -71,6 +75,7 @@ private:
     void adoptConfig();                     // map m_avdtp.sbcConfig() (acceptor) into m_params
     BtLink::LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[96];
     BondTable *m_bonds = nullptr;
+    bool m_allowAvctp = false;              // NEW-34 piece 3 capture: allow inbound AVCTP (0x0017)
     Hci   &m_hci;
     L2cap  m_l2;
     BtLink m_link;

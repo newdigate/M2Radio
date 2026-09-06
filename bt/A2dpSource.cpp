@@ -95,7 +95,9 @@ void A2dpSource::tick(uint32_t now) {
         if (!m_opIssued) { m_opIssued = m_link.startPair(m_inbound); return; }   // PREPARE delayed the pair (INBOUND)
         if (m_link.result() != BtLink::OK) { m_result = PAIR_FAILED; m_st = DISCONNECTING; break; }
         m_l2.begin(m_link.handle(), m_aclNum); m_l2.acceptIncoming(true);
-        m_l2.allowPsm(Avdtp::PSM); m_l2.allowPsm(Sdp::PSM); m_l2.onData(onData, this);
+        m_l2.allowPsm(Avdtp::PSM); m_l2.allowPsm(Sdp::PSM);
+        if (m_allowAvctp) m_l2.allowPsm(0x0017);   // NEW-34 piece 3 capture: accept AVCTP/AVRCP
+        m_l2.onData(onData, this);
         m_st = L2; m_deadline = now + 5000;
         if (!m_inbound) m_sdpChan = m_l2.connect(Sdp::PSM, 0x0040);              // outbound: query the sink's AVDTP version
         break;
