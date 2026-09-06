@@ -233,6 +233,12 @@ int main() {
         CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
         a.onSignalling(std::vector<uint8_t>{ 0x30, 0x0C, 2 << 2 }.data(), 3); tick(l, a); auto o = drain(io);
         CHECK(o.size() == 1 && o[0][0] == 0x33 && o[0][1] == 0x0C && o[0][2] == 0x12);
+        // SET_CONFIGURATION for the wrong SEID must ALSO be rejected BAD_ACP_SEID (its own guard, distinct from the
+        // caps one above -- pins the acp!=OUR_SEID check in the SET_CONFIGURATION handler, which the caps arm cannot).
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x03, 2 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x23 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && o[0][0] == 0x43 && o[0][1] == 0x03 && o[0][3] == 0x12);   // REJECT sig 0x03, error 0x12
+        CHECK(a.state() != Avdtp::STREAMING && !a.configChanged());
     }
     {   // B4. Collision: our initiator has already SENT SET_CONFIGURATION (CONFIGURING) when the peer sends its
         //     own -> REJECT BAD_STATE 0x31, and our initiator is untouched.
