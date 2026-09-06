@@ -114,5 +114,34 @@ int main() {
         CHECK(p.size() == 1 && memcmp(p[0].data(), SINK, 6) == 0 && logCount("bond_try") == 1 && logCount("OpenMove") == 0);
         CHECK(r.io.count(0x0406) == 1);                                                    // the post-link failure tore the link down
     }
+    {   // 8. The name seam (mutation-found: page(..., nullptr, ...) survived every suite): a bonded page whose
+        //    stored key is REJECTED (0x06) -> BtLink erases the bond and pairs afresh WITHOUT an inquiry, so the
+        //    name page() was given is the only source for the re-created bond.  This controller completes the
+        //    SSP dance and encryption, then (aclNum == 0: no ACL credit) L2CAP never opens and connect() ends
+        //    L2CAP_FAILED -- the BOND, not the result, is what is under test.
+        Rig r; r.bonds.upsert(mk(SHOKZ, "OpenMove by Shokz")); r.src.setBonds(&r.bonds); g_present = SHOKZ;
+        r.io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            std::vector<uint8_t> bd(SHOKZ, SHOKZ + 6);
+            std::vector<uint8_t> okbd = { 0x00 }; okbd.insert(okbd.end(), prm.begin(), prm.begin() + (prm.size() >= 6 ? 6 : 0));
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, bd); return; }                                          // Link_Key_Request
+            if (op == 0x040B) { f.cc(op, okbd); f.ev(0x06, { 0x06, 0x01, 0x00 }); return; }                   // the stored key: PIN or Key Missing
+            if (op == 0x040C) { f.cc(op, okbd); f.ev(0x31, bd); return; }                                     // negative reply -> IO_Capability_Request
+            if (op == 0x042B) { f.cc(op, okbd);
+                                std::vector<uint8_t> rsp = bd; rsp.push_back(0x03); rsp.push_back(0x00); rsp.push_back(0x04); f.ev(0x32, rsp);
+                                std::vector<uint8_t> uc = bd; uc.push_back(0x40); uc.push_back(0xE2); uc.push_back(0x01); uc.push_back(0x00); f.ev(0x33, uc); return; }
+            if (op == 0x042C) { f.cc(op, okbd);
+                                std::vector<uint8_t> spc = { 0x00 }; spc.insert(spc.end(), SHOKZ, SHOKZ + 6); f.ev(0x36, spc);
+                                std::vector<uint8_t> lk = bd; for (int i = 0; i < 16; i++) lk.push_back(0x77); lk.push_back(0x04); f.ev(0x18, lk);   // the NEW key
+                                f.ev(0x06, { 0x00, 0x01, 0x00 }); return; }
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }                   // Encryption_Change on
+            controller(f, op, prm);                                                                          // page succeeds; everything later is refused
+        };
+        A2dpSource::Result res = r.src.connect("Shokz", 0, fakeNow, idle10);
+        CHECK(res == A2dpSource::L2CAP_FAILED);                                                              // got past pairing and encryption
+        CHECK(r.io.count(0x0401) == 0 && r.io.count(0x040B) == 1 && r.io.count(0x040C) == 1);                // no inquiry: the name cannot have come from a hit
+        const Bond *b = r.bonds.find(SHOKZ);
+        CHECK(b && b->key[0] == 0x77 && b->keyType == 4 && strcmp(b->name, "OpenMove by Shokz") == 0);       // re-created under the PAGED name
+        CHECK(logCount("bond_rejected: status=0x06 -> erased") == 1 && r.io.count(0x0406) == 1);
+    }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
