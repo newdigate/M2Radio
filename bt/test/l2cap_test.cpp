@@ -219,5 +219,38 @@ int main() {
         uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x02, 0x00 };  l.onEvent(0x13, ncp, sizeof ncp);
         CHECK(l.credits() == 4 && l.creditsMin() == 2);
     }
+    {   // C1. Normal flow: N packets sent, all N credits returned -> sent==returned==N, credits back to max,
+        //     credmin correct, no starve, no clamp (NEW-34 piece 4 credit-leak instrument).
+        CapIo io; L2cap l(io); l.begin(0x0001, 4); l.resetCreditStats();
+        for (int i = 0; i < 4; i++) { const uint8_t d[4] = {0,1,2,3}; l.send(0x0040, d, 4); }
+        l.tickClock(io.now); l.service();                                  // 4 sent -> credits 0
+        CHECK(l.pktsSent() == 4 && l.credits() == 0 && l.creditsMin() == 0);
+        uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x04, 0x00 }; l.onEvent(0x13, ncp, sizeof ncp);   // return all 4
+        CHECK(l.creditsReturned() == 4 && l.credits() == 4);
+        CHECK(l.pktsSent() - l.creditsReturned() == 0);                    // outstanding == 0
+        CHECK(l.clampHits() == 0 && l.starves() == 0);
+    }
+    {   // C2. Withheld NCP (the load-bearing negative): a credit that never comes back keeps the pool down, and
+        //     once the pool sits at 0 with work pending the starve fingerprint appears and grows with the clock.
+        CapIo io; L2cap l(io); l.begin(0x0001, 2); l.resetCreditStats();
+        const uint8_t d[4] = {0,1,2,3};
+        io.now = 1000; l.send(0x0040, d, 4); l.send(0x0040, d, 4); l.tickClock(io.now); l.service();   // 2 sent -> credits 0
+        CHECK(l.credits() == 0 && l.pktsSent() == 2);
+        uint8_t ncp1[] = { 0x01, 0x01, 0x00, 0x01, 0x00 }; l.onEvent(0x13, ncp1, sizeof ncp1);          // return only ONE
+        CHECK(l.creditsReturned() == 1 && l.credits() == 1 && l.pktsSent() - l.creditsReturned() == 1);
+        // queue TWO more: service() sends one (credits 1 -> 0), the other STAYS queued -> credits==0 with work pending
+        l.send(0x0040, d, 4); l.send(0x0040, d, 4); l.tickClock(io.now); l.service();
+        CHECK(l.credits() == 0 && l.pktsSent() - l.creditsReturned() == 2);                             // one stuck, one still outstanding
+        io.now = 1300; l.tickClock(io.now); l.service();                                                // 300 ms later, still 0-with-work (NCP withheld)
+        CHECK(l.starves() >= 1 && l.starveMaxMs() >= 300);
+    }
+    {   // C3. Over-return (clamp): the controller returns more credits than were outstanding -> credits caps at
+        //     maxCredits and clampHits records the discard (the opposite failure -- a double-count).
+        CapIo io; L2cap l(io); l.begin(0x0001, 3); l.resetCreditStats();
+        const uint8_t d[4] = {0,1,2,3};
+        l.send(0x0040, d, 4); l.tickClock(io.now); l.service();            // 1 sent -> credits 2, one outstanding
+        uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x05, 0x00 }; l.onEvent(0x13, ncp, sizeof ncp);   // return FIVE (only 1 outstanding)
+        CHECK(l.credits() == 3 && l.clampHits() >= 1);                     // capped at maxCredits=3, clamp recorded
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

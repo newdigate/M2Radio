@@ -55,6 +55,21 @@ public:
     // Running minimum ACL credit seen since resetCreditsMin() (piece 4's air-link-starvation floor).
     uint8_t  creditsMin() const { return m_creditsMin; }
     void     resetCreditsMin() { m_creditsMin = m_credits; }
+    // Credit-leak instrument (NEW-34 piece 4).  pktsSent == ACL packets written (one per credit consumed);
+    // creditsReturned == credits summed from Number_Of_Completed_Packets; by construction
+    // credits == maxCredits - (pktsSent - creditsReturned), so pktsSent-creditsReturned is the outstanding count.
+    // starves counts entries into "credits==0 with the TXQ non-empty"; starveMaxMs is the longest such stretch --
+    // a lost NCP never recovers, so starveMaxMs grows without bound (the host-visible fingerprint vs backpressure,
+    // which recovers in ms).  clampHits counts when the NCP handler discards credit above maxCredits (a controller
+    // double-count).  tickClock(nowMs) supplies the ms reference for starveMaxMs; call it once per service() pass.
+    uint32_t pktsSent()        const { return m_pktsSent; }
+    uint32_t creditsReturned() const { return m_creditsReturned; }
+    uint32_t starves()         const { return m_starves; }
+    uint32_t starveMaxMs()     const { return m_starveMaxMs; }
+    uint32_t clampHits()       const { return m_clampHits; }
+    void     tickClock(uint32_t nowMs) { m_nowMs = nowMs; }
+    void     resetCreditStats() { m_creditsMin = m_credits; m_pktsSent = 0; m_creditsReturned = 0;
+                                  m_starves = 0; m_starveMaxMs = 0; m_clampHits = 0; m_starveSince = 0; m_starving = false; }
     // Largest L2CAP payload send() will accept (== one Tx buffer).  A larger
     // payload is DROPPED, not fragmented -- this is basic mode with one ACL
     // packet per SDU -- so a media producer MUST cap its packet at this value.
@@ -80,6 +95,8 @@ private:
     HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits, m_maxCredits; bool m_accept;
     uint16_t m_allow[2] = {0, 0}; uint8_t m_nAllow = 0;
     uint8_t  m_creditsMin = 0;
+    uint32_t m_pktsSent = 0, m_creditsReturned = 0, m_starves = 0, m_starveMaxMs = 0, m_clampHits = 0;
+    uint32_t m_nowMs = 0, m_starveSince = 0; bool m_starving = false;
     Channel m_ch[MAX_CHANNELS]; uint8_t m_nextId; uint16_t m_nextCid;
     Tx m_txq[TXQ]; uint8_t m_txHead, m_txCount; uint32_t m_dropped;
     // Only one request of each type is buffered between service() calls -- fine because service()

@@ -39,7 +39,8 @@ void L2cap::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
     uint8_t n = p[0];
     for (uint8_t i = 0; i < n && (uint16_t)(1 + i * 4 + 3) < len; i++) {
         uint16_t h = (uint16_t)(p[1 + i * 4] | (p[2 + i * 4] << 8)); uint16_t c = (uint16_t)(p[3 + i * 4] | (p[4 + i * 4] << 8));
-        if (h == m_handle) { uint32_t v = (uint32_t)m_credits + c; m_credits = v > m_maxCredits ? m_maxCredits : (uint8_t)v; }
+        if (h == m_handle) { m_creditsReturned += c; uint32_t v = (uint32_t)m_credits + c;
+            if (v > m_maxCredits) { m_clampHits++; m_credits = m_maxCredits; } else m_credits = (uint8_t)v; }
         if (m_credits < m_creditsMin) m_creditsMin = m_credits;   // (NCP only raises credits, but keep the guard uniform)
     }
 }
@@ -134,7 +135,18 @@ void L2cap::service() {
         uint8_t h[9] = { 0x02, (uint8_t)hf, (uint8_t)(hf >> 8), (uint8_t)al, (uint8_t)(al >> 8), (uint8_t)t.len, (uint8_t)(t.len >> 8), (uint8_t)t.cid, (uint8_t)(t.cid >> 8) };
         uint8_t pkt[9 + MAX_PAYLOAD]; memcpy(pkt, h, 9); memcpy(pkt + 9, t.buf, t.len); m_io.write(pkt, (size_t)(9 + t.len));
         if (m_trace) m_trace(m_traceCtx, true, m_handle, pkt + 5, (uint16_t)(t.len + 4));   // L2CAP PDU = len(2)+cid(2)+payload
-        m_txHead = (uint8_t)((m_txHead + 1) % TXQ); m_txCount--; m_credits--;
+        m_txHead = (uint8_t)((m_txHead + 1) % TXQ); m_txCount--; m_credits--; m_pktsSent++;
         if (m_credits < m_creditsMin) m_creditsMin = m_credits;
+    }
+    // starve fingerprint (NEW-34 piece 4): credits==0 with work still queued.  Enter -> count + mark the start;
+    // while starving, extend starveMaxMs by how long we have been at zero-with-work; exit when a credit returns
+    // or the TXQ empties.  A lost NCP keeps us here indefinitely -> starveMaxMs grows without bound.
+    bool starving = (m_credits == 0 && m_txCount > 0);
+    if (starving) {
+        if (!m_starving) { m_starving = true; m_starveSince = m_nowMs; m_starves++; }
+        uint32_t dur = m_nowMs - m_starveSince;
+        if (dur > m_starveMaxMs) m_starveMaxMs = dur;
+    } else {
+        m_starving = false;
     }
 }
