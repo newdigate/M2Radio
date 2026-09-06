@@ -252,5 +252,17 @@ int main() {
         uint8_t ncp[] = { 0x01, 0x01, 0x00, 0x05, 0x00 }; l.onEvent(0x13, ncp, sizeof ncp);   // return FIVE (only 1 outstanding)
         CHECK(l.credits() == 3 && l.clampHits() >= 1);                     // capped at maxCredits=3, clamp recorded
     }
+    {   // A4 (NEW-34 piece 5). freeSlots(): reusable (FREE or CLOSED) slots -- the soak's slot-leak baseline.
+        // 5 at begin(); a connect() takes one; a CLOSED channel is reusable again; reset() restores all 5.
+        CapIo io; L2cap l(io); l.begin(0x0001, 7);
+        CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
+        L2cap::Channel *ch = l.connect(0x0019, 0x0041);
+        CHECK(ch != nullptr && l.freeSlots() == L2cap::MAX_CHANNELS - 1);
+        ch->state = L2cap::CLOSED;                                              // a torn-down channel is reusable
+        CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
+        CHECK(l.connect(0x0019, 0x0042) != nullptr && l.freeSlots() == L2cap::MAX_CHANNELS - 1);
+        l.reset();
+        CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

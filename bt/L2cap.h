@@ -52,6 +52,10 @@ public:
     // first, nextInbound(psm, prev) the next, nullptr at the end.  The AVDTP acceptor uses it to find the
     // signalling channel the headset opened (first) and, later, the media channel (next).
     const Channel *nextInbound(uint16_t psm, const Channel *after) const;
+    // Reusable channel slots (FREE or CLOSED -- what connect() and the inbound accept scan for).  NEW-34 piece 5's
+    // slot-leak baseline: sampled at every STREAMING entry it must return to the same value cycle after cycle; a
+    // channel never freed makes it decline.  reset() restores MAX_CHANNELS.
+    uint8_t  freeSlots() const { uint8_t n = 0; for (const auto &ch : m_ch) if (ch.state == FREE || ch.state == CLOSED) n++; return n; }
     // Running minimum ACL credit seen since resetCreditsMin() (piece 4's air-link-starvation floor).
     uint8_t  creditsMin() const { return m_creditsMin; }
     void     resetCreditsMin() { m_creditsMin = m_credits; }
