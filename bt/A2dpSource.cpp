@@ -16,6 +16,7 @@ void A2dpSource::logf(const char *fmt, ...) {
 void A2dpSource::onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len) {
     A2dpSource *s = (A2dpSource *)ctx;
     if (s->m_sdpServer.onData(ch, p, len)) return;             // the PEER's SDP query of us (its own channel): answered in service()
+    if (s->m_avrcp.onData(ch, p, len)) return;                 // the PEER's AV/C command on its AVCTP channel: answered in service()
     if (ch.psm == Avdtp::PSM) {
         // Route the AVDTP signalling channel to the state machine -- both our outbound channel (0x0041)
         // and the peer-opened acceptor channel (its L2cap-assigned CID).  The media channel carries RTP,
@@ -71,7 +72,7 @@ void A2dpSource::tick(uint32_t now) {
     m_link.tick(now);
     // A link loss in any live state tears the media path down and ends the attempt LOST.
     if (m_st != IDLE && m_st != DONE && m_st != DISCONNECTING && m_link.lost()) {
-        m_link.ackLost(); m_avdtp.reset(); m_l2.reset();
+        m_link.ackLost(); m_avdtp.reset(); m_avrcp.reset(); m_l2.reset();
         logf("attempt: link lost reason=0x%02X", m_link.lostReason());
         m_result = LOST; m_st = DONE; return;
     }
@@ -96,7 +97,7 @@ void A2dpSource::tick(uint32_t now) {
         if (m_link.result() != BtLink::OK) { m_result = PAIR_FAILED; m_st = DISCONNECTING; break; }
         m_l2.begin(m_link.handle(), m_aclNum); m_l2.acceptIncoming(true);
         m_l2.allowPsm(Avdtp::PSM); m_l2.allowPsm(Sdp::PSM);
-        if (m_allowAvctp) m_l2.allowPsm(0x0017);   // NEW-34 piece 3 capture: accept AVCTP/AVRCP
+        m_l2.allowPsm(Avrcp::PSM);                  // NEW-34 piece 3: the headset's AVCTP channel (measured: opened 1.8 s after START)
         m_l2.onData(onData, this);
         m_st = L2; m_deadline = now + 5000;
         if (!m_inbound) m_sdpChan = m_l2.connect(Sdp::PSM, 0x0040);              // outbound: query the sink's AVDTP version
@@ -149,4 +150,6 @@ void A2dpSource::tick(uint32_t now) {
     default: break;                                                            // IDLE, STREAMING, DONE: nothing to advance
     }
     m_l2.service(); m_avdtp.service(); m_sdpServer.service(m_l2);
+    { uint32_t before = m_avrcp.notifications(); m_avrcp.service(m_l2);   // NEW-34 piece 3: answer the headset's AV/C
+      if (m_avrcp.notifications() != before) logf("avrcp: register_notification playback_status -> interim playing"); }
 }

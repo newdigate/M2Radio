@@ -102,13 +102,18 @@ private:
     static const uint8_t TXQ = 8;
     bool sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command; false if the txq is full
     void handleSig(const uint8_t *d, uint16_t len);
-    HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits, m_maxCredits; bool m_accept;
+    // ★ Every state member is initialised HERE as well as in begin(): a host-side L2cap lives on the stack, and
+    // service() may legitimately run before any attempt has called begin() (A2dpSource::service() ticks it from
+    // boot).  Found 2026-09-07: an uninitialised m_txHead/m_txCount made service() walk a garbage TX queue and
+    // SEGV once A2dpSource grew by 84 bytes (host test a2dpsource_test).  Static firmware objects are zero-filled,
+    // which is why silicon never saw it.
+    HciIo &m_io; uint16_t m_handle = 0, m_aclMax = 1021; uint8_t m_credits = 0, m_maxCredits = 0; bool m_accept = false;
     uint16_t m_allow[MAX_ALLOW] = {0, 0, 0, 0}; uint8_t m_nAllow = 0;
     uint8_t  m_creditsMin = 0;
     uint32_t m_pktsSent = 0, m_creditsReturned = 0, m_starves = 0, m_starveMaxMs = 0, m_clampHits = 0;
     uint32_t m_nowMs = 0, m_starveSince = 0; bool m_starving = false;
-    Channel m_ch[MAX_CHANNELS]; uint8_t m_nextId; uint16_t m_nextCid;
-    Tx m_txq[TXQ]; uint8_t m_txHead, m_txCount; uint32_t m_dropped;
+    Channel m_ch[MAX_CHANNELS] = {}; uint8_t m_nextId = 0x10; uint16_t m_nextCid = 0x0080;
+    Tx m_txq[TXQ] = {}; uint8_t m_txHead = 0, m_txCount = 0; uint32_t m_dropped = 0;
     // Only one request of each type is buffered between service() calls -- fine because service()
     // runs every main-loop pass; a same-type burst within one pass would drop the earlier one.
     struct Pending { bool infoReq; uint8_t infoId; uint16_t infoType; bool echoReq; uint8_t echoId;
@@ -117,7 +122,7 @@ private:
                      // frame entirely from these four fields, never from the live connId/connScid above -- a second
                      // CONN_REQ overwriting those mid-retry must not splice its identity onto the pending response.
                      bool connRspReady; uint8_t connRspId; uint16_t connRspLocal, connRspScid, connRspRes;
-                     bool discReq; uint8_t discId; uint8_t discBytes[4]; } m_p;
-    DataFn m_onData; void *m_dataCtx;
+                     bool discReq; uint8_t discId; uint8_t discBytes[4]; } m_p = {};
+    DataFn m_onData = nullptr; void *m_dataCtx = nullptr;
     TraceFn m_trace = nullptr; void *m_traceCtx = nullptr;
 };

@@ -297,5 +297,15 @@ int main() {
         for (auto &f : io.tx) if (f.size() >= 9 + 12 && f[9] == 0x03) { uint16_t res = (uint16_t)(f[9 + 8] | (f[9 + 9] << 8)); if (res == 2) ref2 = true; }
         CHECK(ref2);                                                                  // still refused 0x0002
     }
+    {   // A6 (2026-09-07). service() BEFORE begin() is inert: a freshly constructed L2cap has an empty TX queue, no
+        // credits and no channels (in-class initialisers), so ticking it from boot writes nothing and does not walk
+        // garbage.  The a2dpsource_test crash that found this is the RED demonstration (a stack L2cap serviced before
+        // any attempt began, m_txHead read as 155).
+        CapIo io; L2cap l(io);
+        l.service(); l.service();
+        CHECK(io.tx.empty() && l.credits() == 0 && l.freeSlots() == L2cap::MAX_CHANNELS && l.dropped() == 0);
+        uint8_t d[4] = {1, 2, 3, 4}; CHECK(!l.send(0x0040, d, 4) || true);   // a send before begin() is harmless either way
+        l.service(); CHECK(l.credits() == 0);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
