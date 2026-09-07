@@ -1,7 +1,8 @@
 // Avrcp -- the MINIMAL AVRCP target (NEW-34 piece 3): AVCTP (PSM 0x0017) framing plus the one AV/C
 // command a real headset sends to decide the link is live.  Measured on a Shokz OpenMove 2026-09-07:
 // once we serve an AVRCP Target SDP record the headset sends exactly one AV/C command --
-// RegisterNotification(PLAYBACK_STATUS_CHANGED) -- and waits.  We answer INTERIM + PLAYING.  Every
+// GetCapabilities(EVENTS_SUPPORTED) then RegisterNotification(PLAYBACK_STATUS_CHANGED) -- and waits.  We answer
+// STABLE {PLAYBACK_STATUS_CHANGED} and INTERIM + PLAYING.  Every
 // other AV/C command gets AV/C's NOT IMPLEMENTED response (ctype 0x08, operands echoed), so a peer never
 // hangs on an unanswered transaction.  Sized to the capture: nothing the headset has not sent is built.
 // RX entry point only RECORDS (one command slot -- AVCTP transactions are sequential per channel; a
@@ -23,7 +24,7 @@ public:
     void reset() { m_pending = false; m_cid = 0; m_len = 0; }
     bool     pending()       const { return m_pending; }
     uint32_t notifications() const { return m_notifications; }   // RegisterNotification(PLAYBACK_STATUS_CHANGED) answered INTERIM PLAYING
-    uint32_t unsupported()   const { return m_unsupported; }     // AV/C commands answered NOT IMPLEMENTED
+    uint32_t unsupported()   const { return m_unsupported; }     // AV/C commands answered NOT IMPLEMENTED (GetCapabilities is answered STABLE and counted here too, as "not a notification")
     uint32_t dropped()       const { return m_dropped; }
     // Build the AV/C response for one AVCTP command frame (pure; host-tested).  Returns the response
     // length (0 = not an AVRCP command: wrong PID, fragment, or a response frame -- ignored).

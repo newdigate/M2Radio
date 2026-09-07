@@ -5,12 +5,13 @@
 // (byte 0, low nibble), subunit type/id (byte 1), opcode (byte 2), operands.  AVRCP VENDOR DEPENDENT
 // (opcode 0x00): company id (3, Bluetooth SIG 00 19 58), PDU id, packet type, parameter length (2, BE).
 namespace {
-enum { PT_SINGLE = 0x00, CTYPE_NOTIFY = 0x03, RSP_NOT_IMPLEMENTED = 0x08, RSP_INTERIM = 0x0F,
-       OP_VENDOR = 0x00, PDU_REGISTER_NOTIFICATION = 0x31, EVENT_PLAYBACK_STATUS_CHANGED = 0x01, PLAY_STATUS_PLAYING = 0x01 };
+enum { PT_SINGLE = 0x00, CTYPE_STATUS = 0x01, CTYPE_NOTIFY = 0x03, RSP_NOT_IMPLEMENTED = 0x08, RSP_STABLE = 0x0C, RSP_INTERIM = 0x0F,
+       OP_VENDOR = 0x00, PDU_GET_CAPABILITIES = 0x10, PDU_REGISTER_NOTIFICATION = 0x31, CAP_COMPANY_ID = 0x02, CAP_EVENTS_SUPPORTED = 0x03,
+       EVENT_PLAYBACK_STATUS_CHANGED = 0x01, PLAY_STATUS_PLAYING = 0x01 };
 }
 uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t outMax, bool *wasNotification) {
     if (wasNotification) *wasNotification = false;
-    if (len < 6 || outMax < 16) return 0;                       // AVCTP(3) + AV/C header(3) at least
+    if (len < 6 || outMax < 18) return 0;                       // AVCTP(3) + AV/C header(3) at least
     uint8_t h = c[0];
     if ((h & 0x0C) != PT_SINGLE) return 0;                      // fragments: not built (the headset sends single frames)
     if (h & 0x02) return 0;                                     // a RESPONSE frame: nothing to answer
@@ -28,6 +29,17 @@ uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t o
         out[13] = EVENT_PLAYBACK_STATUS_CHANGED; out[14] = PLAY_STATUS_PLAYING;
         if (wasNotification) *wasNotification = true;
         return 15;
+    }
+    // GetCapabilities (PDU 0x10, STATUS ctype, one parameter byte): the Shokz sends it BEFORE registering (measured
+    // 2026-09-07, arm 4: 10 11 0E 01 48 00 00 19 58 10 00 00 01 03).  EVENTS_SUPPORTED (0x03) -> STABLE with the one
+    // event this target raises, PLAYBACK_STATUS_CHANGED; COMPANY_ID (0x02) -> STABLE with the Bluetooth SIG id.
+    if (alen >= 11 && ctype == CTYPE_STATUS && avc[2] == OP_VENDOR && avc[3] == 0x00 && avc[4] == 0x19 && avc[5] == 0x58
+        && avc[6] == PDU_GET_CAPABILITIES && avc[8] == 0x00 && avc[9] == 0x01 && (avc[10] == CAP_EVENTS_SUPPORTED || avc[10] == CAP_COMPANY_ID)) {
+        out[0] = (uint8_t)((h & 0xF0) | 0x02); out[1] = c[1]; out[2] = c[2];
+        out[3] = RSP_STABLE; out[4] = avc[1]; out[5] = OP_VENDOR; out[6] = 0x00; out[7] = 0x19; out[8] = 0x58;
+        out[9] = PDU_GET_CAPABILITIES; out[10] = 0x00;
+        if (avc[10] == CAP_EVENTS_SUPPORTED) { out[11] = 0x00; out[12] = 0x03; out[13] = CAP_EVENTS_SUPPORTED; out[14] = 0x01; out[15] = EVENT_PLAYBACK_STATUS_CHANGED; return 16; }
+        out[11] = 0x00; out[12] = 0x05; out[13] = CAP_COMPANY_ID; out[14] = 0x01; out[15] = 0x00; out[16] = 0x19; out[17] = 0x58; return 18;
     }
     // Anything else: NOT IMPLEMENTED, operands echoed (AV/C: the response frame repeats the command's operands).
     uint16_t n = (uint16_t)(alen > (uint16_t)(outMax - 3) ? outMax - 3 : alen);
