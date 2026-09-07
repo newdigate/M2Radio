@@ -42,10 +42,14 @@ public:
     uint32_t dropped() const { return m_dropped; }
     void     acceptIncoming(bool yes) { m_accept = yes; }          // peer-initiated channels (answered with our next free CID)
     // Restrict which PSMs a peer-initiated CONN_REQ may open (in addition to acceptIncoming()).  Up to
-    // two.  With NONE added, acceptIncoming() accepts any PSM (today's behaviour, unchanged).  With any
+    // MAX_ALLOW (4).  ★ It was TWO until 2026-09-07: A2dpSource allows SDP + AVDTP, so the piece-3
+    // AVCTP (0x0017) entry was silently DROPPED and the Shokz capture build still refused the channel
+    // (measured on silicon: CONN_RSP result 0x0002 with avctp=accepted printed).  Host-tested now.  With NONE added, acceptIncoming() accepts any PSM (today's behaviour, unchanged).  With any
     // added, a CONN_REQ for a PSM not in the list is refused with result 0x0002 (PSM not supported) --
     // an AVCTP (0x0017/AVRCP, piece 3) channel from a headset lands here rather than consuming a slot.
-    void allowPsm(uint16_t psm) { if (m_nAllow < 2) m_allow[m_nAllow++] = psm; }
+    static const uint8_t MAX_ALLOW = 4;
+    void allowPsm(uint16_t psm) { if (m_nAllow < MAX_ALLOW) m_allow[m_nAllow++] = psm; }
+    uint8_t allowedCount() const { return m_nAllow; }
     // Drop every channel and empty the tx queue -- used between reconnect attempts (== begin(0,0)).
     void reset() { begin(0, 0, m_aclMax); m_nAllow = 0; }
     // Iterate peer-initiated OPEN channels of a PSM in slot order: nextInbound(psm, nullptr) returns the
@@ -99,7 +103,7 @@ private:
     bool sig(const uint8_t *cmd, uint16_t len);                     // queue a signalling command; false if the txq is full
     void handleSig(const uint8_t *d, uint16_t len);
     HciIo &m_io; uint16_t m_handle, m_aclMax; uint8_t m_credits, m_maxCredits; bool m_accept;
-    uint16_t m_allow[2] = {0, 0}; uint8_t m_nAllow = 0;
+    uint16_t m_allow[MAX_ALLOW] = {0, 0, 0, 0}; uint8_t m_nAllow = 0;
     uint8_t  m_creditsMin = 0;
     uint32_t m_pktsSent = 0, m_creditsReturned = 0, m_starves = 0, m_starveMaxMs = 0, m_clampHits = 0;
     uint32_t m_nowMs = 0, m_starveSince = 0; bool m_starving = false;

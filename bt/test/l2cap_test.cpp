@@ -279,5 +279,23 @@ int main() {
         l.reset();
         CHECK(l.freeSlots() == L2cap::MAX_CHANNELS);
     }
+    {   // A5 (NEW-34 piece 3, silicon finding 2026-09-07). The allow-list must hold THREE PSMs: A2dpSource allows
+        // SDP + AVDTP and piece 3 adds AVCTP (0x0017) -- with a two-entry list the third was silently dropped and
+        // the Shokz's AVCTP CONN_REQ was still refused 0x0002 on the bench.  A fourth, unlisted PSM stays refused.
+        CapIo io; L2cap l(io); l.begin(0x0001, 7); l.acceptIncoming(true);
+        l.allowPsm(0x0019); l.allowPsm(0x0001); l.allowPsm(0x0017);
+        CHECK(l.allowedCount() == 3);
+        std::vector<uint8_t> req = l2(0x0001, {0x02, 0x07, 4, 0, 0x17, 0x00, 0x43, 0x08});   // CONN_REQ psm 0x0017 scid 0x0843
+        l.onAcl(0x0001, req.data(), (uint16_t)req.size()); l.service();
+        bool acc = false, ref = false;
+        for (auto &f : io.tx) if (f.size() >= 9 + 12 && f[9] == 0x03) { uint16_t res = (uint16_t)(f[9 + 8] | (f[9 + 9] << 8)); if (res == 0) acc = true; if (res == 2) ref = true; }
+        CHECK(acc && !ref);                                                           // AVCTP accepted (result 0x0000)
+        io.tx.clear();
+        std::vector<uint8_t> bad = l2(0x0001, {0x02, 0x08, 4, 0, 0x1F, 0x00, 0x44, 0x08}); // an UNLISTED psm 0x001F
+        l.onAcl(0x0001, bad.data(), (uint16_t)bad.size()); l.service();
+        bool ref2 = false;
+        for (auto &f : io.tx) if (f.size() >= 9 + 12 && f[9] == 0x03) { uint16_t res = (uint16_t)(f[9 + 8] | (f[9 + 9] << 8)); if (res == 2) ref2 = true; }
+        CHECK(ref2);                                                                  // still refused 0x0002
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
