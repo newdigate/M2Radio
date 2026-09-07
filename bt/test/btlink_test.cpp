@@ -312,6 +312,26 @@ int main() {
         bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected: status=0x05 -> erased") != std::string::npos) sawReject = true;
         CHECK(sawReject);
     }
+    {   // 13b. NEW-34 piece 5 soak finding (ESP32 sink, 2026-09-07): the peer rejects with 0x24 (LMP PDU Not Allowed -- it forgot us across a power-cycle and its LMP refuses the combination-key auth): the
+        //     same erase-and-re-pair rung as 0x06.  (Mutation-found: with only 0x06 in the condition the suite stayed green.)
+        FakeIo io; g_io = &io; Hci hci(io); g_hci = &hci; BtLink link(hci); hci.onEvent(evThunk, &link); link.setLog(logFn, nullptr); g_log.clear();
+        BondTable bonds; seedBond(bonds, KEY1, "OpenMove by Shokz"); link.setBonds(&bonds);
+        io.onCmd = [](FakeIo &f, uint16_t op, const std::vector<uint8_t> &prm) {
+            if (preamble(f, op, prm)) return;
+            if (op == 0x0405) { f.cs(op); f.ev(0x03, connComplete(0x00)); return; }
+            if (op == 0x0411) { f.cs(op); f.ev(0x17, std::vector<uint8_t>(BD, BD + 6)); return; }
+            if (op == 0x040B) { f.cc(op, withBd({ 0x00 }, prm)); f.ev(0x06, { 0x24, 0x01, 0x00 }); return; }   // Authentication Failure
+            if (sspDance(f, op, prm, KEY2)) return;
+            if (op == 0x0413) { f.cs(op); f.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); return; }
+            f.cc(op, { 0x01 });
+        };
+        CHECK(link.page(BD, 1, 0, false, "OpenMove by Shokz", 1, fakeNow, idle10) == BtLink::OK);
+        CHECK(link.pairAndEncrypt(fakeNow, idle10) == BtLink::OK);
+        const Bond *b = bonds.find(BD);
+        CHECK(b && memcmp(b->key, KEY2, 16) == 0 && strcmp(link.pairedBy(), "ssp") == 0);
+        bool sawReject = false; for (auto &l : g_log) if (l.find("bond_rejected: status=0x24 -> erased") != std::string::npos) sawReject = true;
+        CHECK(sawReject);
+    }
     {   // 14. NEW-34: a Link_Key_Request for a bonded address that is NOT the one we paged is answered from the
         //     table (a controller is entitled to ask), but must NOT mark a key as offered for THIS link: the rung
         //     acts on m_bd, so otherwise a rejection would erase the WRONG bond and re-offer the rejected one.

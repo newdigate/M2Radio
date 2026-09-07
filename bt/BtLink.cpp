@@ -365,8 +365,11 @@ void BtLink::tickPair(uint32_t now) {
                 m_pairedBy = "stored";
                 if (m_bonds) m_bonds->touch(m_bd);
                 m_sub = PR_POST_AUTH; return;
-            } else if (m_authDone && (m_authStatus == 0x05 || m_authStatus == 0x06)) {
-                // The peer holds no matching key: erase the stale bond and pair afresh on THIS link.
+            } else if (m_authDone && (m_authStatus == 0x05 || m_authStatus == 0x06 || m_authStatus == 0x24)) {
+                // The peer holds no matching key: erase the stale bond and pair afresh on THIS link.  0x05 Authentication
+                // Failure (a DIFFERENT key), 0x06 PIN or Key Missing, and -- measured on the ESP32 sink 2026-09-07 after it
+                // was power-cycled and forgot us -- 0x24 LMP PDU Not Allowed: its LMP refuses the combination-key
+                // authentication outright.  Kept as-is: 0x22 LMP Response Timeout and the rest are transient.
                 if (m_bonds) m_bonds->erase(m_bd);
                 logf("bond_rejected: status=0x%02X -> erased", m_authStatus);
                 m_pairedBy = "none";
