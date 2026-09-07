@@ -144,9 +144,11 @@ void Hci::finish(Error e, const Reply *r) {
 void Hci::onPacket(uint8_t type, const uint8_t *pkt, size_t len) {
     if (type == H4Parser::ACL) {
         if (len < 4) return;
-        uint16_t handle = (uint16_t)((pkt[0] | (pkt[1] << 8)) & 0x0FFF);
+        uint16_t raw    = (uint16_t)(pkt[0] | (pkt[1] << 8));
+        uint16_t handle = (uint16_t)(raw & 0x0FFF);
+        uint8_t  pb     = (uint8_t)((raw >> 12) & 0x3);
         uint16_t dlen   = (uint16_t)(pkt[2] | (pkt[3] << 8));
-        if (m_onAcl) m_onAcl(m_aclCtx, handle, pkt + 4, dlen);
+        if (m_onAcl) m_onAcl(m_aclCtx, handle, pb, pkt + 4, dlen);
         return;
     }
     if (len < 2) return;

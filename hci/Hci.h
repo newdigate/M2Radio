@@ -48,7 +48,10 @@ public:
     // service() return.
     typedef void (*DoneFn)(void *ctx, Error e, const Reply *reply);
     typedef void (*EventFn)(void *ctx, uint8_t code, const uint8_t *params, uint8_t len);
-    typedef void (*AclFn)(void *ctx, uint16_t handle, const uint8_t *data, uint16_t len);
+    // ACL data as received: 12-bit handle, the Packet_Boundary flag (bits 13:12 of the handle word: 0b01 =
+    // continuation of a fragmented L2CAP PDU, anything else begins one), then the ACL payload.  Core Vol 4
+    // Part E 5.4.2: the HOST reassembles on this flag -- L2cap does (2026-09-07).
+    typedef void (*AclFn)(void *ctx, uint16_t handle, uint8_t pb, const uint8_t *data, uint16_t len);
 
     static const uint8_t  QUEUE_DEPTH    = 4;
     static const uint32_t IDLE_RESYNC_MS = 50;

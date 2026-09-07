@@ -148,14 +148,15 @@ int main() {
         CHECK(ev.n == 1); CHECK(ev.code == 0x01); CHECK(ev.len == 1); CHECK(ev.p0 == 0);
         CHECK(hci.events() == 1); CHECK(hci.late() == 0);
     }
-    {   // 11. ACL data reaches the ACL callback with the handle masked to 12 bits
+    {   // 11. ACL data reaches the ACL callback with the handle masked to 12 bits AND the Packet_Boundary flag
+        //     (bits 13:12 of the handle word) passed separately -- 0x2 = first/auto-flushable here.
         FakeIo io; g_io = &io; Hci hci(io); hci.begin();
-        struct A { uint16_t h = 0; uint16_t len = 0; uint8_t d0 = 0;
-                   static void fn(void *c, uint16_t h, const uint8_t *d, uint16_t len) { A *a = (A *)c; a->h = h; a->len = len; a->d0 = d[0]; } } a;
+        struct A { uint16_t h = 0; uint8_t pb = 0xFF; uint16_t len = 0; uint8_t d0 = 0;
+                   static void fn(void *c, uint16_t h, uint8_t pb, const uint8_t *d, uint16_t len) { A *a = (A *)c; a->h = h; a->pb = pb; a->len = len; a->d0 = d[0]; } } a;
         hci.onAcl(A::fn, &a);
         io.deliver({0x02, 0x01, 0x20, 0x02, 0x00, 0xAA, 0xBB});   // handle 0x0001 with PB flags 0x2
         hci.service();
-        CHECK(a.h == 0x0001); CHECK(a.len == 2); CHECK(a.d0 == 0xAA);
+        CHECK(a.h == 0x0001); CHECK(a.pb == 0x2); CHECK(a.len == 2); CHECK(a.d0 == 0xAA);
     }
     {   // 12. run() refuses to overlap
         FakeIo io; g_io = &io; Hci hci(io); hci.begin();
@@ -174,8 +175,8 @@ int main() {
         FakeIo io; g_io = &io; Hci hci(io); hci.begin();
         struct Ev { int n = 0; uint8_t code = 0; uint8_t len = 0; uint8_t p0 = 0xEE;
                     static void fn(void *c, uint8_t code, const uint8_t *p, uint8_t len) { Ev *e = (Ev *)c; e->n++; e->code = code; e->len = len; e->p0 = len ? p[0] : 0xEE; } } ev;
-        struct A { uint16_t h = 0; uint16_t len = 0; uint8_t d0 = 0;
-                   static void fn(void *c, uint16_t h, const uint8_t *d, uint16_t len) { A *a = (A *)c; a->h = h; a->len = len; a->d0 = d[0]; } } a;
+        struct A { uint16_t h = 0; uint8_t pb = 0xFF; uint16_t len = 0; uint8_t d0 = 0;
+                   static void fn(void *c, uint16_t h, uint8_t pb, const uint8_t *d, uint16_t len) { A *a = (A *)c; a->h = h; a->pb = pb; a->len = len; a->d0 = d[0]; } } a;
         hci.onEvent(Ev::fn, &ev);
         hci.onAcl(A::fn, &a);
         hci.begin();                                          // SECOND begin(): must not unhook either callback
@@ -183,7 +184,7 @@ int main() {
         io.deliver({0x02, 0x01, 0x20, 0x02, 0x00, 0xAA, 0xBB}); // handle 0x0001, PB flags 0x2 (case 11)
         hci.service();
         CHECK(ev.n == 1); CHECK(ev.code == 0x01); CHECK(ev.len == 1); CHECK(ev.p0 == 0);
-        CHECK(a.h == 0x0001); CHECK(a.len == 2); CHECK(a.d0 == 0xAA);
+        CHECK(a.h == 0x0001); CHECK(a.pb == 0x2); CHECK(a.len == 2); CHECK(a.d0 == 0xAA);
     }
     {   // 14. A fault must not cancel its own resync when the clock ticks
         //     mid-drain (onFault() no longer re-reads the clock: service()
@@ -257,6 +258,17 @@ int main() {
         hci.service();
         CHECK(s_done == 1 && s_err == Hci::OK); // completes normally
         CHECK(hci.late() == 0);                 // and is not mistaken for a late reply
+    }
+    {   // 16. A CONTINUATION fragment (PB = 0b01) reaches the callback as pb == 1 with the same 12-bit handle.
+        //     Found 2026-09-07: the Shokz fragments its SDP query (17 + 5 bytes) and the old mask discarded the flag,
+        //     so L2cap could never tell a continuation from a new PDU.
+        FakeIo io; g_io = &io; Hci hci(io); hci.begin();
+        struct A { uint16_t h = 0; uint8_t pb = 0xFF; uint16_t len = 0;
+                   static void fn(void *c, uint16_t h, uint8_t pb, const uint8_t *, uint16_t len) { A *a = (A *)c; a->h = h; a->pb = pb; a->len = len; } } a;
+        hci.onAcl(A::fn, &a);
+        io.deliver({0x02, 0x01, 0x10, 0x03, 0x00, 0x03, 0x09, 0x00});   // handle 0x0001, PB 0x1, 3 bytes
+        hci.service();
+        CHECK(a.h == 0x0001); CHECK(a.pb == 0x1); CHECK(a.len == 3);
     }
     printf("hci_test: %d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
