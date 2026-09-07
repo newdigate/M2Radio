@@ -307,5 +307,78 @@ int main() {
         uint8_t d[4] = {1, 2, 3, 4}; CHECK(!l.send(0x0040, d, 4) || true);   // a send before begin() is harmless either way
         l.service(); CHECK(l.credits() == 0);
     }
+    // ---- R. L2CAP reassembly of ACL continuation fragments (2026-09-07, the piece-5 soak's AVDTP-stall root cause) ----
+    // The Shokz delivered its 22-byte SDP query as 17 + 5 bytes (PB first, PB continuation).  Without reassembly the
+    // first packet was dispatched as a 13-byte payload (SDP answered with an error) and the tail parsed as garbage.
+    struct RxCap { int calls = 0; std::vector<uint8_t> last; uint16_t cid = 0;
+                   static void fn(void *c, L2cap::Channel &ch, const uint8_t *p, uint16_t n) { RxCap *r = (RxCap *)c; r->calls++; r->cid = ch.localCid; r->last.assign(p, p + n); } };
+    auto openInbound = [](L2cap &l) -> L2cap::Channel * {           // peer opens PSM 0x0001 at us -> our 0x0080, both configs done
+        std::vector<uint8_t> rq = l2(0x0001, {0x02, 0x30, 4, 0, 0x01, 0x00, 0x85, 0x0E}); l.onAcl(0x0001, rq.data(), (uint16_t)rq.size()); l.service();
+        L2cap::Channel *ch = l.byRemote(0x0E85); if (!ch) return nullptr;
+        std::vector<uint8_t> cq = l2(0x0001, {0x04, 0x40, 8, 0, (uint8_t)ch->localCid, (uint8_t)(ch->localCid >> 8), 0, 0, 0x01, 0x02, 0x30, 0x00}); l.onAcl(0x0001, cq.data(), (uint16_t)cq.size());
+        std::vector<uint8_t> cr = l2(0x0001, {0x05, 0x50, 6, 0, (uint8_t)ch->localCid, (uint8_t)(ch->localCid >> 8), 0, 0, 0, 0}); l.onAcl(0x0001, cr.data(), (uint16_t)cr.size()); l.service();
+        return ch->state == L2cap::OPEN ? ch : nullptr; };
+    // The Shokz's PDU, as two ACL packets: [len=0x12][cid=0x0080] + 13 payload bytes, then the 5-byte tail.
+    const std::vector<uint8_t> SHOKZ_Q = {0x06,0x00,0x01,0x00,0x0D,0x35,0x03,0x19,0x11,0x0A,0x00,0x20,0x35,0x03,0x09,0x00,0x09,0x00};   // 18 bytes
+    auto frag1 = [&]() { std::vector<uint8_t> v = {0x12, 0x00, 0x80, 0x00}; v.insert(v.end(), SHOKZ_Q.begin(), SHOKZ_Q.begin() + 13); return v; };   // 17 bytes
+    auto frag2 = [&]() { return std::vector<uint8_t>(SHOKZ_Q.begin() + 13, SHOKZ_Q.end()); };                                             // 5 bytes
+    {   // R1. 17 + 5 (pb 2 then 1) -> onData fires ONCE with the whole 18-byte payload; one fragment consumed, no drops.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        L2cap::Channel *ch = openInbound(l); CHECK(ch);
+        RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> a = frag1(), b = frag2();
+        l.onAcl(0x0001, a.data(), (uint16_t)a.size(), L2cap::PB_FIRST);
+        CHECK(rx.calls == 0);                                                    // nothing dispatched yet -- the RED line today (calls==1, 13 bytes)
+        l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 1 && rx.last == SHOKZ_Q && rx.cid == 0x0080);
+        CHECK(l.reasmFrags() == 1 && l.reasmDrops() == 0);
+    }
+    {   // R2. A continuation with nothing pending is dropped and counted; nothing dispatched.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 0 && l.reasmDrops() == 1 && l.reasmFrags() == 0);
+    }
+    {   // R3. A new FIRST packet while a partial is pending discards the partial (counted); the new PDU is delivered.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> a = frag1(); l.onAcl(0x0001, a.data(), (uint16_t)a.size(), L2cap::PB_FIRST);
+        std::vector<uint8_t> whole = l2(0x0080, {0x06, 0x00, 0x02, 0x00, 0x00});                     // a complete 5-byte PDU
+        l.onAcl(0x0001, whole.data(), (uint16_t)whole.size(), L2cap::PB_FIRST);
+        CHECK(rx.calls == 1 && rx.last.size() == 5 && rx.last[2] == 0x02);
+        CHECK(l.reasmDrops() == 1);
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);   // the orphaned tail
+        CHECK(rx.calls == 1 && l.reasmDrops() == 2);
+    }
+    {   // R4. A declared length above what we can hold is refused on the first packet, counted.  0x03F0 = 1008 is
+        //     already above the RX_MTU (1004) we advertised, and the PDU it declares is 1008 + 4 = 1012 bytes --
+        //     larger than the RX_MTU + 4 buffer.  Either way the peer is at fault and the partial never starts.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> big = {0xF0, 0x03, 0x80, 0x00, 1, 2, 3};
+        l.onAcl(0x0001, big.data(), (uint16_t)big.size(), L2cap::PB_FIRST);
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 0 && l.reasmDrops() >= 1);
+    }
+    {   // R5. A first packet shorter than the 4-byte L2CAP header (2 bytes) still reassembles once the rest arrives.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> a = frag1(); std::vector<uint8_t> a1(a.begin(), a.begin() + 2), a2(a.begin() + 2, a.end());
+        l.onAcl(0x0001, a1.data(), (uint16_t)a1.size(), L2cap::PB_FIRST);
+        l.onAcl(0x0001, a2.data(), (uint16_t)a2.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 0);
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 1 && rx.last == SHOKZ_Q && l.reasmFrags() == 2);
+    }
+    {   // R6. reset() between fragments discards the partial: a stale tail after a reconnect must not be delivered.
+        //     begin() zeroes the counters, so the reasmDrops()==1 below is the ORPHANED CONTINUATION after the
+        //     re-begin -- the reset itself clears the partial silently.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> a = frag1(); l.onAcl(0x0001, a.data(), (uint16_t)a.size(), L2cap::PB_FIRST);
+        l.reset(); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001); CHECK(openInbound(l));
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
+        CHECK(rx.calls == 0 && l.reasmDrops() == 1);
+    }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

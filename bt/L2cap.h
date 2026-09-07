@@ -31,7 +31,15 @@ public:
     typedef void (*TraceFn)(void *ctx, bool out, uint16_t handle, const uint8_t *l2capPdu, uint16_t len);
     void onAclTrace(TraceFn fn, void *ctx) { m_trace = fn; m_traceCtx = ctx; }
     // --- RX (record only) ---
-    void onAcl(uint16_t handle, const uint8_t *d, uint16_t len);   // Hci::AclFn payload
+    // Packet_Boundary values as Hci::AclFn passes them: only 0b01 continues a fragmented PDU; 0b00/0b10/0b11 all begin one.
+    static const uint8_t PB_CONT = 0x1, PB_FIRST = 0x2;
+    // One ACL packet as received.  Reassembles L2CAP PDUs split across packets (Core Vol 4 Part E 5.4.2 -- the
+    // HOST's job): a packet that already carries its whole declared PDU is dispatched in place (zero copy); a
+    // short first packet is held and completed by continuations.  pb defaults to FIRST so a caller feeding whole
+    // PDUs (every host test) is unchanged.
+    void onAcl(uint16_t handle, const uint8_t *d, uint16_t len, uint8_t pb = PB_FIRST);
+    uint32_t reasmFrags() const { return m_reasmFrags; }   // continuation fragments consumed into delivered PDUs
+    uint32_t reasmDrops() const { return m_reasmDrops; }   // partial PDUs discarded (orphan tail, superseded, oversize)
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len);      // needs 0x13 only
     // --- main context ---
     Channel *connect(uint16_t psm, uint16_t localCid);              // sends Connection Request on service()
@@ -114,6 +122,10 @@ private:
     uint32_t m_nowMs = 0, m_starveSince = 0; bool m_starving = false;
     Channel m_ch[MAX_CHANNELS] = {}; uint8_t m_nextId = 0x10; uint16_t m_nextCid = 0x0080;
     Tx m_txq[TXQ] = {}; uint8_t m_txHead = 0, m_txCount = 0; uint32_t m_dropped = 0;
+    // Reassembly (one ACL handle per L2cap): the largest PDU the peer may send us is RX_MTU (we advertised it).
+    uint8_t  m_rx[RX_MTU + 4] = {}; uint16_t m_rxLen = 0, m_rxNeed = 0;   // held bytes; declared length + 4 (0 = not yet known)
+    uint32_t m_reasmFrags = 0, m_reasmDrops = 0;
+    void dispatch(const uint8_t *d, uint16_t len);                       // one complete PDU: trace-free demux
     // Only one request of each type is buffered between service() calls -- fine because service()
     // runs every main-loop pass; a same-type burst within one pass would drop the earlier one.
     struct Pending { bool infoReq; uint8_t infoId; uint16_t infoType; bool echoReq; uint8_t echoId;

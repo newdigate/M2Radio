@@ -8,6 +8,7 @@ void L2cap::begin(uint16_t h, uint8_t credits, uint16_t aclMax) {
     m_nextId = 0x10; m_nextCid = 0x0080;                       // above the caller-chosen 0x0040-0x005F range
     m_txHead = m_txCount = 0; m_dropped = 0;
     m_creditsMin = credits;
+    m_rxLen = m_rxNeed = 0; m_reasmFrags = m_reasmDrops = 0;
 }
 L2cap::Channel *L2cap::byLocal(uint16_t c)  { for (auto &ch : m_ch) if (ch.state != FREE && ch.localCid == c)  return &ch; return nullptr; }
 L2cap::Channel *L2cap::byRemote(uint16_t c) { for (auto &ch : m_ch) if (ch.state != FREE && ch.remoteCid == c) return &ch; return nullptr; }
@@ -44,9 +45,33 @@ void L2cap::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
         if (m_credits < m_creditsMin) m_creditsMin = m_credits;   // (NCP only raises credits, but keep the guard uniform)
     }
 }
-void L2cap::onAcl(uint16_t handle, const uint8_t *d, uint16_t len) {
-    if (handle != m_handle || len < 4) return;
-    if (m_trace) m_trace(m_traceCtx, false, handle, d, len);
+void L2cap::onAcl(uint16_t handle, const uint8_t *d, uint16_t len, uint8_t pb) {
+    if (handle != m_handle) return;
+    if (m_trace) m_trace(m_traceCtx, false, handle, d, len);            // raw, per ACL packet, BEFORE reassembly: the
+                                                                        // instrument that found the fragmentation defect
+    if (pb == PB_CONT) {
+        if (m_rxLen == 0) { m_reasmDrops++; return; }                   // a tail with no head
+        if ((uint32_t)m_rxLen + len > sizeof m_rx) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; return; }
+        memcpy(m_rx + m_rxLen, d, len); m_rxLen = (uint16_t)(m_rxLen + len); m_reasmFrags++;
+        if (m_rxNeed == 0 && m_rxLen >= 4) {
+            m_rxNeed = (uint16_t)((m_rx[0] | (m_rx[1] << 8)) + 4);
+            if (m_rxNeed > sizeof m_rx) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; return; }
+        }
+        if (m_rxNeed && m_rxLen >= m_rxNeed) { dispatch(m_rx, m_rxNeed); m_rxLen = m_rxNeed = 0; }
+        return;
+    }
+    if (m_rxLen) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; }            // a new PDU abandons a pending partial
+    if (len >= 4) {
+        uint16_t need = (uint16_t)((d[0] | (d[1] << 8)) + 4);
+        if (len >= need) { dispatch(d, need); return; }                 // whole PDU in one packet: zero copy (the common case)
+        if (need > sizeof m_rx) { m_reasmDrops++; return; }             // longer than we advertised: the peer's fault
+        m_rxNeed = need;
+    }
+    if (len > sizeof m_rx) { m_reasmDrops++; m_rxNeed = 0; return; }
+    memcpy(m_rx, d, len); m_rxLen = len;                                // short first packet: hold it
+}
+void L2cap::dispatch(const uint8_t *d, uint16_t len) {
+    if (len < 4) return;
     uint16_t cid = (uint16_t)(d[2] | (d[3] << 8));
     if (cid == 0x0001) { handleSig(d, len); return; }
     Channel *ch = byLocal(cid);
