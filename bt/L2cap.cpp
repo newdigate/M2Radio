@@ -55,19 +55,22 @@ void L2cap::onAcl(uint16_t handle, const uint8_t *d, uint16_t len, uint8_t pb) {
         memcpy(m_rx + m_rxLen, d, len); m_rxLen = (uint16_t)(m_rxLen + len); m_reasmFrags++;
         if (m_rxNeed == 0 && m_rxLen >= 4) {
             m_rxNeed = (uint16_t)((m_rx[0] | (m_rx[1] << 8)) + 4);
+            if (m_rxNeed < 4) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; return; }   // declared length wrapped (0xFFFC-0xFFFF): malformed
             if (m_rxNeed > sizeof m_rx) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; return; }
         }
+        // bytes beyond m_rxNeed (a non-conforming peer) are discarded with the partial, uncounted
         if (m_rxNeed && m_rxLen >= m_rxNeed) { dispatch(m_rx, m_rxNeed); m_rxLen = m_rxNeed = 0; }
         return;
     }
-    if (m_rxLen) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; }            // a new PDU abandons a pending partial
+    if (m_rxLen || m_rxNeed) { m_rxLen = m_rxNeed = 0; m_reasmDrops++; } // a new PDU abandons a pending partial
     if (len >= 4) {
         uint16_t need = (uint16_t)((d[0] | (d[1] << 8)) + 4);
+        if (need < 4) { m_reasmDrops++; return; }                       // declared length wrapped (0xFFFC-0xFFFF): malformed
         if (len >= need) { dispatch(d, need); return; }                 // whole PDU in one packet: zero copy (the common case)
         if (need > sizeof m_rx) { m_reasmDrops++; return; }             // longer than we advertised: the peer's fault
         m_rxNeed = need;
     }
-    if (len > sizeof m_rx) { m_reasmDrops++; m_rxNeed = 0; return; }
+    if (len > sizeof m_rx) { m_reasmDrops++; m_rxNeed = 0; return; }    // unreachable today (len < need <= sizeof m_rx above): defence in depth
     memcpy(m_rx, d, len); m_rxLen = len;                                // short first packet: hold it
 }
 void L2cap::dispatch(const uint8_t *d, uint16_t len) {

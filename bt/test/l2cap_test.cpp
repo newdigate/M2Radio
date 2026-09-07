@@ -358,7 +358,8 @@ int main() {
         std::vector<uint8_t> big = {0xF0, 0x03, 0x80, 0x00, 1, 2, 3};
         l.onAcl(0x0001, big.data(), (uint16_t)big.size(), L2cap::PB_FIRST);
         std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
-        CHECK(rx.calls == 0 && l.reasmDrops() >= 1);
+        //     Two drops, exactly: the oversize refusal on the first packet, then the orphaned tail that follows it.
+        CHECK(rx.calls == 0 && l.reasmDrops() == 2);
     }
     {   // R5. A first packet shorter than the 4-byte L2CAP header (2 bytes) still reassembles once the rest arrives.
         CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
@@ -379,6 +380,41 @@ int main() {
         l.reset(); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001); CHECK(openInbound(l));
         std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);
         CHECK(rx.calls == 0 && l.reasmDrops() == 1);
+    }
+    {   // R7. Trailing bytes past the declared length: a whole packet dispatches the DECLARED PDU, not the packet.
+        //     This is the only pin on the dispatch(d, need) change -- reverting it to dispatch(d, len) hands the
+        //     junk tail to onData as part of the payload and fails here (demonstrated RED 2026-09-07).
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> v = l2(0x0080, {0x06, 0x00, 0x03, 0x00, 0x00});
+        v.insert(v.end(), {0xDE, 0xAD, 0xBE});                                   // three bytes the peer should not have sent
+        l.onAcl(0x0001, v.data(), (uint16_t)v.size(), L2cap::PB_FIRST);
+        CHECK(rx.calls == 1 && rx.last.size() == 5 && rx.last[2] == 0x03 && l.reasmDrops() == 0);
+    }
+    {   // R8. A fragmented SIGNALLING PDU (CID 0x0001): the peer's Config Request with an MTU option, split 8 + 8.
+        //     Reassembly is what makes the option readable -- the first fragment is 8 bytes, short of handleSig's
+        //     12-byte CFG_REQ minimum, so without it mtuOut would stay at the 0x0030 openInbound() negotiated.
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        L2cap::Channel *ch = openInbound(l); CHECK(ch); CHECK(ch->mtuOut == 0x0030);
+        uint8_t cidlo = (uint8_t)ch->localCid, cidhi = (uint8_t)(ch->localCid >> 8);
+        std::vector<uint8_t> cfg = l2(0x0001, {0x04, 0x11, 8, 0, cidlo, cidhi, 0, 0, 0x01, 0x02, 0x7F, 0x03});  // 16 bytes total
+        uint32_t frags0 = l.reasmFrags();
+        std::vector<uint8_t> f1(cfg.begin(), cfg.begin() + 8), f2(cfg.begin() + 8, cfg.end());
+        l.onAcl(0x0001, f1.data(), (uint16_t)f1.size(), L2cap::PB_FIRST);
+        CHECK(ch->mtuOut == 0x0030);                                             // nothing parsed from half a PDU
+        l.onAcl(0x0001, f2.data(), (uint16_t)f2.size(), L2cap::PB_CONT);
+        CHECK(ch->mtuOut == 0x037F && l.reasmFrags() == frags0 + 1);
+    }
+    {   // R9. A declared length that WRAPS (0xFFFD + 4 = 1 in 16 bits) is refused and counted, not dispatched.
+        //     The pin for the need < 4 guard: without it need==1 <= len, so dispatch(d, 1) returned silently at its
+        //     own len < 4 test and the packet vanished with reasmDrops()==0 (demonstrated RED 2026-09-07).
+        CapIo io; L2cap l(io); l.begin(0x0001, 20); l.acceptIncoming(true); l.allowPsm(0x0001);
+        CHECK(openInbound(l)); RxCap rx; l.onData(RxCap::fn, &rx);
+        std::vector<uint8_t> w = {0xFD, 0xFF, 0x80, 0x00, 1, 2, 3, 4};
+        l.onAcl(0x0001, w.data(), (uint16_t)w.size(), L2cap::PB_FIRST);
+        CHECK(rx.calls == 0 && l.reasmDrops() == 1);
+        std::vector<uint8_t> b = frag2(); l.onAcl(0x0001, b.data(), (uint16_t)b.size(), L2cap::PB_CONT);   // the orphaned tail
+        CHECK(rx.calls == 0 && l.reasmDrops() == 2);
     }
     printf("l2cap_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

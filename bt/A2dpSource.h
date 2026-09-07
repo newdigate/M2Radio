@@ -52,7 +52,7 @@ public:
     void service() { m_sdpServer.service(m_l2); m_l2.service(); m_avdtp.service(); }
     // Forward from the app's Hci handlers:
     void onEvent(uint8_t code, const uint8_t *p, uint8_t len) { m_link.onEvent(code,p,len); m_l2.onEvent(code,p,len); }
-    void onAcl(uint16_t h, const uint8_t *d, uint16_t len, uint8_t pb = L2cap::PB_FIRST) { m_l2.onAcl(h, d, len, pb); }
+    void onAcl(uint16_t h, const uint8_t *d, uint16_t len, uint8_t pb = L2cap::PB_FIRST) { m_l2.onAcl(h, d, len, pb); }   // forwarding pb is LOAD-BEARING: the default makes an omission compile and silently disable reassembly
     // For AudioOutputBluetooth + poll():
     Hci     &hci()       { return m_hci; }
     L2cap   &l2()        { return m_l2; }

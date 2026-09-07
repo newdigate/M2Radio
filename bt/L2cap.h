@@ -100,9 +100,11 @@ public:
     static const uint16_t MAX_PAYLOAD = 700;
     // The MTU we advertise in OUR Config Request = the largest SDU the peer may send us.
     // 1004 is the value the Mac's A2DP source negotiates with the Shokz (PacketLogger
-    // reference 2026-09-03: option 01 02 EC 03), and it fits this stack's RX path, which
-    // reassembles nothing: an SDU must arrive in ONE ACL packet, and the IW416 reports
-    // acl_len=1021.  The Shokz never answered our DISCOVER while our Config Request
+    // reference 2026-09-03: option 01 02 EC 03).  Since 2026-09-07 the RX path REASSEMBLES
+    // ACL continuation fragments, and m_rx is RX_MTU + 4 (the 4-byte L2CAP header), so any
+    // SDU we advertised fits whether it arrives whole or split across ACL packets -- a
+    // declared length above that is refused and counted (reasmDrops), never buffered.
+    // The Shokz never answered our DISCOVER while our Config Request
     // carried NO options; the compliant reference carries exactly this one.
     static const uint16_t RX_MTU = 1004;
 private:
