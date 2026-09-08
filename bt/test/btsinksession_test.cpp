@@ -86,6 +86,9 @@ static void streamCb(void *, bool s, uint8_t r) { g_stream.push_back(StreamRec{ 
 struct AttRec { A2dpSink::Result r; std::string pairedBy; };
 static std::vector<AttRec> g_att;
 static void attemptCb(void *, A2dpSink::Result r, const char *pb) { g_att.push_back(AttRec{ r, pb ? pb : "" }); }
+// Q6: a stream callback that disconnects the session from INSIDE the callback, on the loss edge.
+static BtSinkSession *g_cbSession = nullptr;
+static void disconnectOnLossCb(void *, bool streaming, uint8_t) { if (!streaming && g_cbSession) g_cbSession->disconnect(); }
 
 struct Rig {
     FakeIo io; Hci hci; A2dpSink sink; BtSinkSession session; BondTable bonds;
@@ -283,6 +286,20 @@ int main() {
         // ... and announcing again.  The SSP dance stored a bond, so page scan only (0x02), not 0x03.
         CHECK(r.bonds.count() == 1);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 500));
+    }
+    {   // Q6. A callback that calls disconnect().  m_state used to be assigned AFTER the stream callback ran,
+        //     so the DISCONNECTING the callback asked for was immediately overwritten with LISTENING and the
+        //     session went straight back to announcing itself -- measured: LISTENING with scan 0x02, i.e. the
+        //     app's disconnect silently did nothing.  m_state is now assigned BEFORE every callback.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        g_cbSession = &r.session; r.session.onStream(disconnectOnLossCb, nullptr);
+        r.inboundToStreaming(0x00C0);
+        r.disconnectionComplete(0x08);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));   // RED: settles LISTENING
+        CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });                     // RED: 0x02
+        r.advanceMs(1000);
+        CHECK(r.session.state() == BtSinkSession::MANUAL);                                     // ... and STAYS there
+        g_cbSession = nullptr;
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

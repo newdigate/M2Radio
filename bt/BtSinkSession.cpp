@@ -14,7 +14,9 @@ void BtSinkSession::tick(uint32_t now) {
     switch (m_state) {
     case LISTENING:
         // A page the controller accepted is the whole trigger: a sink never initiates.
-        if (m_sink.link().inboundUp() && !m_sink.busy()) { m_stats.attempts++; if (m_sink.start()) m_state = CONNECTING; }
+        // attempts counts ATTEMPTS, not triggers: a start() that refuses (busy, or the link went away between
+        // the two calls) never became one, and counting it there made rejects+accepts fail to add up.
+        if (m_sink.link().inboundUp() && !m_sink.busy()) { if (m_sink.start()) { m_stats.attempts++; m_state = CONNECTING; } }
         break;
     case CONNECTING:
         if (m_sink.state() == A2dpSink::STREAMING) {                        // success: A2dpSink stays busy() in STREAMING
@@ -25,21 +27,26 @@ void BtSinkSession::tick(uint32_t now) {
         }
         if (m_sink.busy() || m_sink.link().busy()) break;                   // attempt still running
         m_stats.rejects++;
+        // m_state is assigned BEFORE the callback, here and at both STREAMING exits below: a disconnect()
+        // called from inside a callback assigns DISCONNECTING, and assigning m_state afterwards threw that
+        // away silently -- the session went straight back to announcing itself (btsinksession_test Q6).
+        m_state = LISTENING;
         if (m_attemptCb) m_attemptCb(m_attemptCtx, m_sink.result(), m_sink.link().pairedBy());
-        m_state = LISTENING; break;
+        break;
     case STREAMING:
         if (m_sink.result() == A2dpSink::LOST) {                            // the attempt reported the drop (ackLost already ran in m_sink.tick)
             m_stats.lost++; m_stats.lastReason = m_sink.link().lostReason(); m_stats.lostAt = now;
+            m_state = LISTENING;
             if (m_streamCb) m_streamCb(m_streamCtx, false, m_stats.lastReason);
-            m_state = LISTENING; break;
+            break;
         }
         // A clean CLOSE/ABORT by the source: A2dpSink ends the attempt DISCONNECTING with result OK and
         // reaches DONE (not busy) once the link is torn down -- a completed session, not a failure.  Our own
         // disconnect() cannot be mistaken for one: it leaves STREAMING for DISCONNECTING in the same call.
         if (!m_sink.busy() && m_sink.result() == A2dpSink::OK) {
             m_stats.closed++;
-            if (m_streamCb) m_streamCb(m_streamCtx, false, 0);
             m_state = LISTENING;
+            if (m_streamCb) m_streamCb(m_streamCtx, false, 0);
         }
         break;
     case DISCONNECTING:

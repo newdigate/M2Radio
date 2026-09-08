@@ -66,21 +66,28 @@ void BtSession::beginAttempt(const A2dpSource::Target &t) {
 void BtSession::handleAttemptEnd(uint32_t now) {
     A2dpSource::Result r = m_src.result();
     m_lastResult = r;
-    if (m_attemptCb) m_attemptCb(m_attemptCtx, r, m_src.link().pairedBy());
+    // m_state is settled BEFORE any callback runs.  A disconnect() called from inside a callback assigns
+    // DISCONNECTING, and assigning m_state after the callback threw that away silently.  Everything else keeps
+    // its old position, so what a callback OBSERVES is unchanged apart from state() itself: the stats are still
+    // updated after m_attemptCb, in the same order, and no log line moves.
     if (r == A2dpSource::OK) {
+        m_state = STREAMING;
+        if (m_attemptCb) m_attemptCb(m_attemptCtx, r, m_src.link().pairedBy());
         m_stats.links++; m_stats.accepts++;
         if (m_haveLost) { m_stats.reconnectMs = now - m_stats.lostAt; m_haveLost = false; }
-        m_state = STREAMING;
         if (m_streamCb) m_streamCb(m_streamCtx, true, 0, m_stats.by);
         return;
     }
+    m_state = WAITING; m_retryAt = now + m_retryMs;
+    if (m_attemptCb) m_attemptCb(m_attemptCtx, r, m_src.link().pairedBy());
     m_stats.rejects++;
     // A CONNECT_FAILED means the link never came up -> try the next boot candidate.  Any other failure
     // (PAIR/L2CAP/AVDTP/LOST) means the page succeeded and a link came up, so we must NOT page later
     // candidates -- stop the walk exactly as the old A2dpSource::connect did (a post-link failure is
     // terminal for the pass).  A reconnect (not m_boot) never advances: it retries the lost address.
-    if (m_boot && r == A2dpSource::CONNECT_FAILED && advanceBootWalk(now)) return;
-    m_state = WAITING; m_retryAt = now + m_retryMs;
+    // The m_state test is the other half of the rule above: a callback that disconnected us must not have
+    // its DISCONNECTING overwritten by the CONNECTING a new boot candidate would assign.
+    if (m_state == WAITING && m_boot && r == A2dpSource::CONNECT_FAILED) advanceBootWalk(now);
 }
 
 void BtSession::tick(uint32_t now) {
@@ -100,9 +107,9 @@ void BtSession::tick(uint32_t now) {
     case STREAMING:
         if (m_src.result() == A2dpSource::LOST) {                                        // the attempt reported the drop (ackLost already ran in m_src.tick)
             m_stats.lost++; m_stats.lastReason = m_src.link().lostReason(); m_stats.lostAt = now;
-            if (m_streamCb) m_streamCb(m_streamCtx, false, m_stats.lastReason, m_stats.by);
             memcpy(m_lostBd, m_src.link().peer(), 6); m_haveLost = true;
             m_boot = false; m_state = WAITING; m_retryAt = now + m_retryMs;              // FIRST retry waits a full cycle (the headset may page us first)
+            if (m_streamCb) m_streamCb(m_streamCtx, false, m_stats.lastReason, m_stats.by);   // state first: see handleAttemptEnd
         }
         break;
     case WAITING:

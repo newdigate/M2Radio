@@ -21,7 +21,8 @@ uint16_t Avdtp::buildOpen(uint8_t *o, uint8_t tl, uint8_t s)  { o[0] = hdr(tl, C
 uint16_t Avdtp::buildStart(uint8_t *o, uint8_t tl, uint8_t s) { o[0] = hdr(tl, COMMAND); o[1] = 0x07; o[2] = (uint8_t)(s << 2); return 3; }
 uint8_t  Avdtp::rejectError(const uint8_t *p, uint16_t len) { return len ? p[len - 1] : 0; }
 uint8_t  Avdtp::parseDiscover(const uint8_t *p, uint16_t len, Sep *out, uint8_t max) {
-    if (len < 2 || responseType(p[0]) != ACCEPT) return 0; uint8_t n = 0;
+    if (len < 2 || responseType(p[0]) != ACCEPT) return 0;
+    uint8_t n = 0;
     for (uint16_t i = 2; i + 1 < len && n < max; i += 2) { out[n].seid = (uint8_t)(p[i] >> 2); out[n].inUse = (p[i] >> 1) & 1;
         out[n].audio = (p[i + 1] >> 4) == 0; out[n].sink = (p[i + 1] >> 3) & 1; n++; }
     return n;
@@ -42,7 +43,12 @@ bool Avdtp::parseSbcCaps(const uint8_t *p, uint16_t len, SbcCaps &c) {
 }
 void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
     m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1;
-    m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false; m_kickoff = false;
+    // m_sig/m_media are nulled HERE as well as in reset(), so begin() cannot inherit a channel pointer from a
+    // previous attempt: an acceptor's adoptInbound() is guarded on `!m_sig` and would skip re-adoption, and a
+    // stale m_media would make the media adoption below think it already has one.  Nothing relies on begin()
+    // preserving them -- both initiator call sites (A2dpSource) call begin() and start() together, and start()
+    // re-resolves m_sig from m_sigCid.
+    m_err = 0; m_peerDiscover = false; m_sig = nullptr; m_media = nullptr; m_rspSeen = false; m_truncated = false; m_kickoff = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0; m_peerDelay = 0; m_peerDelayRpt = false; m_peerReject = false;
     m_peerDelayCfg = false; m_delayRptOut = false; m_delayRejects = 0; m_peerIntSeid = 0;   // (m_localSep is an identity, set once by the app -- never cleared here)
 }
@@ -250,7 +256,8 @@ void Avdtp::service() {
         if (mt == ACCEPT)                              { m_rspSeen = false; m_delayRptOut = false; return; }
         if (mt == REJECT || mt == GENERAL_REJECT)      { m_delayRejects++; m_rspSeen = false; m_delayRptOut = false; return; }
     }
-    if (!m_rspSeen) return; m_rspSeen = false;
+    if (!m_rspSeen) return;
+    m_rspSeen = false;
     uint8_t b[16];
     if (responseType(m_rsp[0]) != ACCEPT) {
         if (m_state == GETTING_CAPS && m_capSig == 0x0C && responseType(m_rsp[0]) == GENERAL_REJECT) {

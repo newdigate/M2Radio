@@ -10,6 +10,14 @@
 class BtSinkSession {
 public:
     enum State : uint8_t { IDLE, LISTENING, CONNECTING, STREAMING, DISCONNECTING, MANUAL };
+    // links   -- streams that reached STREAMING.  accepts == links BY CONSTRUCTION for a sink (both are
+    //            incremented on the one transition, and a sink never pages), so the pair is not two
+    //            independent readings the way BtSession's is; it is kept for symmetry with that struct.
+    // attempts -- inbound links actually taken over (a start() that refused is not one).
+    // rejects  -- attempts that ended without streaming.  closed -- streams the SOURCE closed cleanly.
+    // lost     -- streams a link drop ended;  lastReason is that drop's HCI reason.
+    // lostAt   -- millis() of the LAST loss, set ONLY on the loss edge.  0 means "no loss yet" AND "a loss
+    //            at t=0" -- the two are indistinguishable, so read it only after seeing lost > 0.
     struct Stats { uint32_t links, lost, closed, attempts, accepts, rejects; uint8_t lastReason; uint32_t lostAt; };
     typedef void (*StreamFn)(void *ctx, bool streaming, uint8_t reason);
     typedef void (*AttemptFn)(void *ctx, A2dpSink::Result r, const char *pairedBy);
