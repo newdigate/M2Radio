@@ -37,6 +37,8 @@ enum {
     OP_ACCEPT_CONN         = 0x0409,   // Accept_Connection_Request (NEW-34 piece 2, Task 4)
     OP_REJECT_CONN         = 0x040A,   // Reject_Connection_Request
     OP_WRITE_LINK_SUP_TO   = 0x0C37,   // Write_Link_Supervision_Timeout (the range-loss-detection knob)
+    OP_WRITE_COD           = 0x0C24,   // Write_Class_of_Device -- the sink's identity (NEW-41)
+    OP_WRITE_LOCAL_NAME    = 0x0C13,   // Write_Local_Name (248 bytes, NUL-padded)
 };
 enum {
     EV_INQUIRY_COMPLETE    = 0x01,
@@ -122,6 +124,7 @@ void BtLink::begin(uint32_t now) {
     // scan is known-off after HCI_Reset (Scan_Enable default 0x00), so reconcileScan() stays a
     // no-op until wantPageScan() creates a delta -- never an unsolicited Write_Scan_Enable.
     m_wantScan = false; m_haveScan = false; m_scanKnown = true;
+    m_wantInqScan = false; m_haveInqScan = false;               // ... and inquiry scan is off too (NEW-41)
     // NOTE: does NOT clear m_bd/m_handle/link state -- begin() may be re-called mid-session.
 }
 
@@ -161,9 +164,18 @@ void BtLink::finish(Result r) { m_result = r; m_op = NONE; m_sub = 0; }
 // scan only) / 0x00 (none) only on a real delta.
 void BtLink::reconcileScan() {
     if (m_cmdBusy) return;
-    if (!(m_scanKnown && m_haveScan == m_wantScan)) {
-        uint8_t s = m_wantScan ? 0x02 : 0x00;    // page scan only (not inquiry scan)
-        if (issue(OP_WRITE_SCAN_ENABLE, &s, 1)) { m_haveScan = m_wantScan; m_scanKnown = true; logf("page_scan=%s", m_wantScan ? "on" : "off"); }
+    if (!(m_scanKnown && m_haveScan == m_wantScan && m_haveInqScan == m_wantInqScan)) {
+        // bit 1 = page scan, bit 0 = inquiry scan (Vol 4 Part E 7.3.18).  A SOURCE only ever sets page
+        // scan; a SINK adds inquiry scan so a phone can FIND it (NEW-41 wantDiscoverable).
+        uint8_t s = (uint8_t)((m_wantScan ? 0x02 : 0x00) | (m_wantInqScan ? 0x01 : 0x00));
+        bool pageDelta = (m_haveScan != m_wantScan), inqDelta = (m_haveInqScan != m_wantInqScan);
+        if (issue(OP_WRITE_SCAN_ENABLE, &s, 1)) {
+            m_haveScan = m_wantScan; m_haveInqScan = m_wantInqScan; m_scanKnown = true;
+            // page_scan= is emitted when the PAGE bit changes and only then: the [lifecycle] gate's fake
+            // peer COUNTS those lines, so an inquiry-scan-only delta must not add one.
+            if (pageDelta) logf("page_scan=%s", m_wantScan ? "on" : "off");
+            if (inqDelta)  logf("scan_enable=0x%02X", s);
+        }
         return;
     }
     // NEW-34 piece 2 Task 4: the supervision-timeout write.  Falls through to here only once the scan
@@ -211,8 +223,26 @@ void BtLink::tickPrepare(uint32_t now) {
         if (!issue(OP_WRITE_PAGE_TIMEOUT, pt, 2)) return;
         m_sub = 3; return;
     }
-    // m_sub == 3: page_timeout done -> finish
-    logf("page_timeout: st=%s status=0x%02X slots=0x2000", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+    if (m_sub == 3) {                                          // page_timeout done -> the NEW-41 identity, if any
+        logf("page_timeout: st=%s status=0x%02X slots=0x2000", m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr), m_cmdReply.status);
+        if (!m_cod && !m_name) { finish(OK); return; }         // no identity set: PREPARE is byte-identical to before
+        if (m_cod) {
+            uint8_t c[3] = { (uint8_t)m_cod, (uint8_t)(m_cod >> 8), (uint8_t)(m_cod >> 16) };   // Class_of_Device, LE
+            if (!issue(OP_WRITE_COD, c, 3)) return;
+            m_sub = 4; return;
+        }
+        m_sub = 4;                                             // name only: fall into step 4 this tick
+    }
+    if (m_sub == 4) {                                          // cod done (if written) -> Write_Local_Name
+        if (m_cod) logf("class_of_device=0x%06lX st=%s", (unsigned long)m_cod, m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr));
+        if (!m_name) { finish(OK); return; }
+        uint8_t n[248]; memset(n, 0, sizeof n);                // fixed 248 bytes, NUL-padded (Vol 4 Part E 7.3.11)
+        strncpy((char *)n, m_name, sizeof n - 1);
+        if (!issue(OP_WRITE_LOCAL_NAME, n, sizeof n)) return;
+        m_sub = 5; return;
+    }
+    // m_sub == 5: local_name done -> finish
+    logf("local_name=\"%s\" st=%s", m_name, m_cmdErr == Hci::OK ? "ok" : Hci::errorName(m_cmdErr));
     finish(OK);
 }
 
@@ -592,12 +622,15 @@ void BtLink::onEvent(uint8_t code, const uint8_t *p, uint8_t len) {
             uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0D; logf("conn_req: bd=%s -> reject(0x0D busy)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
         } else if (paging && memcmp(p, m_bd, 6) != 0) {          // paging someone else: refuse this crossed page
             uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0D; logf("conn_req: bd=%s -> reject(0x0D paging other)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
-        } else if (!bonded) {                                    // idle, unknown address: never pair a stranger from an incoming page
+        } else if (!bonded && !m_acceptUnknown) {                // idle, unknown address: a SOURCE never pairs a stranger from an incoming page
             uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x0F; logf("conn_req: bd=%s -> reject(0x0F unknown)", bs); m_hci.submit(OP_REJECT_CONN, r, 7, nullptr, nullptr);
         } else {                                                 // accept: remain slave (role 0x01)
             if (!paging) { memcpy(m_bd, p, 6); m_incoming = true; m_keyOffered = false;
-                const Bond *b = m_bonds->find(p); if (b) BondTable::copyName(m_pageName, b->name); }
-            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x01; logf("conn_req: bd=%s -> accept(slave)", bs);
+                // A stranger (NEW-41 acceptUnknown) has no bond to take a name from -- and m_bonds may be
+                // null entirely, so the lookup must stay INSIDE the bonded branch.
+                const Bond *b = bonded ? m_bonds->find(p) : nullptr;
+                if (b) BondTable::copyName(m_pageName, b->name); else if (!bonded) m_pageName[0] = 0; }
+            uint8_t r[7]; memcpy(r, p, 6); r[6] = 0x01; logf("conn_req: bd=%s -> accept(slave%s)", bs, bonded ? "" : ", unbonded");
             m_hci.submit(OP_ACCEPT_CONN, r, 7, nullptr, nullptr);
         }
     } else if (code == EV_ROLE_CHANGE && len >= 8) {

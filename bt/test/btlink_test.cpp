@@ -29,7 +29,45 @@ struct FakeIo : HciIo {
     int count(uint16_t op) { int n = 0; for (auto &c : cmds) if (c.first == op) n++; return n; }
     const std::vector<uint8_t> *last(uint16_t op) { for (size_t i = cmds.size(); i-- > 0;) if (cmds[i].first == op) return &cmds[i].second; return nullptr; }
     int indexOf(uint16_t op) { for (size_t i = 0; i < cmds.size(); i++) if (cmds[i].first == op) return (int)i; return -1; }
+
+    // --- NEW-41 scaffolding (scenarios I1-I3).  The scenarios above script the controller reply by
+    // reply through onCmd; the identity/scan/incoming-page arms care only about WHAT was written, so
+    // they use a generic answerer instead.  TEST SCAFFOLDING, not library behaviour. ---
+    size_t answered = 0;                                                            // how far answerAll() has replied
+    bool sawCommand(uint16_t op) { return indexOf(op) >= 0; }
+    std::vector<uint8_t> paramsOf(uint16_t op) { int i = indexOf(op); return i >= 0 ? cmds[(size_t)i].second : std::vector<uint8_t>(); }
+    std::vector<uint8_t> lastParamsOf(uint16_t op) { const std::vector<uint8_t> *p = last(op); return p ? *p : std::vector<uint8_t>(); }
+    size_t countOf(uint16_t op) { return (size_t)count(op); }
+    void deliver(const std::vector<uint8_t> &raw) { rx.insert(rx.end(), raw.begin(), raw.end()); }   // raw H4 bytes (0x04 = event)
+    // Command Complete, status 0, in the return shape the scenarios above use for that opcode: the
+    // bd-echoing replies carry the command's BD_ADDR, everything else is a bare status byte.  (The
+    // commands these arms write are all Command-Complete commands; a Command-Status one -- Create_
+    // Connection, Authentication_Requested -- would need its own arm, as scenarios 1-19 give it.)
+    void answerOne(uint16_t op, const std::vector<uint8_t> &prm) {
+        switch (op) {
+            case 0x0409: case 0x040A: case 0x040B: case 0x040C: case 0x040D: case 0x042B: case 0x042C: {
+                std::vector<uint8_t> r = { 0x00 };
+                if (prm.size() >= 6) r.insert(r.end(), prm.begin(), prm.begin() + 6);
+                cc(op, r); break; }
+            default: cc(op, { 0x00 }); break;
+        }
+    }
+    // Answer every command not yet answered, servicing between each: Hci holds ONE command in flight,
+    // so a reply is what lets the next queued command reach the wire (and PREPARE's next sub-state run).
+    void answerAll(Hci &h) {
+        h.service();
+        for (int guard = 0; guard < 64 && answered < cmds.size(); guard++) {
+            uint16_t op = cmds[answered].first; std::vector<uint8_t> prm = cmds[answered].second;
+            answered++;
+            answerOne(op, prm);
+            h.service();
+        }
+    }
 };
+// Drive an in-flight op (PREPARE, in these arms) to completion: tick, answer, advance the fake clock.
+static void drivePrepare(FakeIo &io, Hci &hci, BtLink &l) {
+    for (int i = 0; i < 200 && l.busy(); i++) { l.tick(io.now); io.answerAll(hci); io.now += 10; }
+}
 static FakeIo *g_io = nullptr; static Hci *g_hci = nullptr;
 // NEW-34 piece 2: the engine is driven by tick(now).  idle10() also ticks the link under test when
 // one is registered (g_link), so runUntil() below can drive an op directly; the blocking wrappers the
@@ -531,6 +569,48 @@ int main() {
         CHECK(runUntil([&]{ return io.count(0x0C37) >= 1; }, 500));
         const std::vector<uint8_t> *w = io.last(0x0C37);
         CHECK(w && w->size() == 4 && (*w)[2] == 0x40 && (*w)[3] == 0x1F);   // handle + 0x1F40 slots
+    }
+    {   // I1. IDENTITY: setIdentity(cod, name) makes PREPARE write Class_of_Device (0x0C24, 3 bytes LE) and
+        //     Write_Local_Name (0x0C13, 248 bytes, NUL-padded) after Write_Page_Timeout; without it PREPARE is unchanged.
+        FakeIo io; Hci hci(io); hci.begin(); BtLink l(hci); hci.onEvent(evThunk, &l); l.setLog(logFn, nullptr); g_log.clear(); l.begin(0);
+        l.setIdentity(0x240414, "EVKB-SINK");
+        l.startPrepare(); drivePrepare(io, hci, l);
+        const std::vector<uint8_t> codLe = { 0x14, 0x04, 0x24 };                                     // 0x240414, little-endian
+        CHECK(io.sawCommand(0x0C24) && io.paramsOf(0x0C24) == codLe);
+        CHECK(io.sawCommand(0x0C13) && io.paramsOf(0x0C13).size() == 248 && memcmp(io.paramsOf(0x0C13).data(), "EVKB-SINK", 10) == 0);
+        CHECK(io.indexOf(0x0C18) < io.indexOf(0x0C24) && io.indexOf(0x0C24) < io.indexOf(0x0C13));   // after Write_Page_Timeout, in that order
+        FakeIo io2; Hci hci2(io2); hci2.begin(); BtLink l2(hci2); hci2.onEvent(evThunk, &l2); l2.begin(0); l2.startPrepare(); drivePrepare(io2, hci2, l2);
+        CHECK(!io2.sawCommand(0x0C24) && !io2.sawCommand(0x0C13));
+        CHECK(io2.sawCommand(0x0C01) && io2.sawCommand(0x0C56) && io2.sawCommand(0x0C18));           // the unchanged PREPARE
+    }
+    {   // I2. DISCOVERABLE: wantDiscoverable(true) reconciles Write_Scan_Enable to 0x03 (inquiry + page scan); page
+        //     scan alone stays 0x02; both off -> 0x00.  Only real deltas are written.
+        FakeIo io; Hci hci(io); hci.begin(); BtLink l(hci); hci.onEvent(evThunk, &l); l.setLog(logFn, nullptr); g_log.clear(); l.begin(0);
+        const std::vector<uint8_t> both = { 0x03 }, pageOnly = { 0x02 }, none = { 0x00 };
+        l.wantPageScan(true); l.wantDiscoverable(true); l.tick(1); io.answerAll(hci);
+        CHECK(io.lastParamsOf(0x0C1A) == both);
+        l.wantDiscoverable(false); l.tick(2); io.answerAll(hci);
+        CHECK(io.lastParamsOf(0x0C1A) == pageOnly);
+        size_t n = io.countOf(0x0C1A); l.tick(3); io.answerAll(hci); CHECK(io.countOf(0x0C1A) == n);
+        l.wantPageScan(false); l.tick(4); io.answerAll(hci); CHECK(io.lastParamsOf(0x0C1A) == none);
+        // The [lifecycle] gate's fake peer COUNTS page_scan= lines: an inquiry-scan-only delta must not emit one
+        // (the page bit did not move), and the page-bit deltas must still log exactly as scenario 17 asserts.
+        int onOff = 0; for (auto &s : g_log) if (s.find("page_scan=") != std::string::npos) onOff++;
+        CHECK(onOff == 2);
+    }
+    {   // I3. ACCEPT STRANGERS: acceptUnknown(true) turns an incoming page from an unbonded address into an
+        //     Accept_Connection_Request (slave, role 0x01); the default still rejects it 0x0F.
+        FakeIo io; Hci hci(io); hci.begin(); BtLink l(hci); hci.onEvent(evThunk, &l); l.setLog(logFn, nullptr); g_log.clear(); l.begin(0);
+        const uint8_t bd[6] = { 0x76, 0x1A, 0x7E, 0x8A, 0x0C, 0x00 };
+        std::vector<uint8_t> req = { 0x04, 0x04, 10 }; req.insert(req.end(), bd, bd + 6); req.insert(req.end(), { 0x14, 0x04, 0x24, 0x01 });
+        io.deliver(req); io.answerAll(hci);
+        CHECK(io.paramsOf(0x040A).size() == 7 && io.paramsOf(0x040A)[6] == 0x0F);                       // rejected (unknown)
+        l.acceptUnknown(true); io.deliver(req); io.answerAll(hci);
+        CHECK(io.paramsOf(0x0409).size() == 7 && io.paramsOf(0x0409)[6] == 0x01);                       // accepted as slave
+        // size-guarded, not `sawCommand(op) && paramsOf(op)[6]`: against a mutant that never writes the
+        // command, an unguarded index/memcmp on the empty vector SEGFAULTS instead of failing by name.
+        CHECK(io.paramsOf(0x0409).size() == 7 && memcmp(io.paramsOf(0x0409).data(), bd, 6) == 0 && l.incoming() && memcmp(l.peer(), bd, 6) == 0);
+        CHECK(io.countOf(0x040A) == 1 && io.countOf(0x0409) == 1);   // one each: the knob decided, not a retry
     }
     printf("btlink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

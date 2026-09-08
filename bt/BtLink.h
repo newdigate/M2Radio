@@ -58,6 +58,14 @@ public:
     Target target() const;
     void wantPageScan(bool on) { m_wantScan = on; }  // reconciled in tick() via Write_Scan_Enable
 
+    // ---- Sink identity + discoverability + accepting strangers (NEW-41) ------------------------
+    // A SOURCE pages a sink it already knows; a SINK is the one being found, so it must announce
+    // WHAT it is (Class_of_Device), WHO it is (Local_Name), be INQUIRY-scannable, and accept a page
+    // from a phone it has never met.  All three are opt-in: unset, the wire sequence is unchanged.
+    void setIdentity(uint32_t cod, const char *name) { m_cod = cod; m_name = name; }   // written by PREPARE (0 / null = not written)
+    void wantDiscoverable(bool on) { m_wantInqScan = on; }     // adds INQUIRY scan (0x01) to Write_Scan_Enable
+    void acceptUnknown(bool on) { m_acceptUnknown = on; }      // accept an incoming page from an UNBONDED address (a sink pairs strangers)
+
     // ---- Incoming page, link state, supervision knob (NEW-34 piece 2, Task 4) -------------------
     enum LinkState : uint8_t { LINK_NONE, LINK_UP, LINK_SECURE, LINK_LOST };
     LinkState linkState() const { return m_link; }
@@ -121,6 +129,10 @@ private:
     // disabled (Scan_Enable default 0x00) and the host already knows it, so reconcileScan() is a
     // no-op until wantPageScan() creates a delta -- never an unsolicited Write_Scan_Enable.
     bool m_wantScan = false; bool m_haveScan = false; bool m_scanKnown = true;
+    // sink identity / discoverability / stranger policy (NEW-41)
+    uint32_t m_cod = 0; const char *m_name = nullptr;
+    bool m_wantInqScan = false, m_haveInqScan = false;
+    bool m_acceptUnknown = false;
     // incoming page / link state / supervision knob (NEW-34 piece 2, Task 4)
     LinkState m_link = LINK_NONE; bool m_incoming = false; uint8_t m_role = 0; bool m_inboundUp = false;
     uint16_t m_supSlots = 0; bool m_supDone = false;
