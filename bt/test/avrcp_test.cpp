@@ -26,11 +26,12 @@ int main() {
         CHECK(n == 15 && out[0] == 0x72 && out[3] == 0x0F && out[14] == 0x01);
     }
     {   // 3. GetCapabilities(EVENTS_SUPPORTED), verbatim from arm 4 of the bench capture (the Shokz sends it BEFORE
-        // registering) -> STABLE, one event: PLAYBACK_STATUS_CHANGED.  COMPANY_ID -> STABLE with the SIG id.
+        // registering) -> STABLE with the TWO events this target raises: PLAYBACK_STATUS_CHANGED and, since absolute
+        // volume, VOLUME_CHANGED (0x0D).  COMPANY_ID -> STABLE with the SIG id.
         const uint8_t gc[] = { 0x10, 0x11, 0x0E, 0x01, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x01, 0x03 };
         uint8_t out[64]; bool notif = true; uint16_t n = Avrcp::respond(gc, sizeof gc, out, sizeof out, &notif);
         CHECK(!notif);
-        CHECK(eq(out, n, { 0x12, 0x11, 0x0E, 0x0C, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x03, 0x03, 0x01, 0x01 }));
+        CHECK(eq(out, n, { 0x12, 0x11, 0x0E, 0x0C, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0x0D }));
         const uint8_t co[] = { 0x30, 0x11, 0x0E, 0x01, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x01, 0x02 };
         n = Avrcp::respond(co, sizeof co, out, sizeof out, nullptr);
         CHECK(eq(out, n, { 0x32, 0x11, 0x0E, 0x0C, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x05, 0x02, 0x01, 0x00, 0x19, 0x58 }));
@@ -62,6 +63,42 @@ int main() {
         CHECK(sent && a.notifications() == 1 && !a.pending());
         CHECK(a.onData(*ch, shokz, sizeof shokz) && a.onData(*ch, shokz, sizeof shokz) && a.dropped() == 1);
         L2cap::Channel other = *ch; other.psm = 0x0019; CHECK(!a.onData(other, shokz, sizeof shokz));
+    }
+    {   // V1. SetAbsoluteVolume (PDU 0x50, CONTROL ctype 0x00, 1 param byte 0..127): ACCEPTED (0x09) echoing the volume
+        //     we applied, and the registered callback sees it.  Bit 7 of the parameter is reserved and masked.
+        static uint8_t seen = 0xFF; Avrcp::setVolumeCallback([](void *, uint8_t v) { seen = v; }, nullptr);
+        std::vector<uint8_t> cmd = { 0x00, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0xE5 };   // volume 0x65 | reserved bit
+        uint8_t out[64]; bool notif = false; uint16_t n = Avrcp::respond(cmd.data(), (uint16_t)cmd.size(), out, sizeof out, &notif);
+        CHECK(n == 14 && out[0] == 0x02 && out[3] == 0x09 && out[9] == 0x50 && out[12] == 0x01 && out[13] == 0x65 && seen == 0x65 && !notif);
+        Avrcp::setVolumeCallback(nullptr, nullptr);
+    }
+    {   // V2. GetCapabilities(EVENTS_SUPPORTED) now lists BOTH events (PLAYBACK_STATUS_CHANGED 0x01, VOLUME_CHANGED 0x0D).
+        std::vector<uint8_t> caps = { 0x10, 0x11, 0x0E, 0x01, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x01, 0x03 };
+        uint8_t out[64]; bool notif = false; uint16_t n = Avrcp::respond(caps.data(), (uint16_t)caps.size(), out, sizeof out, &notif);
+        CHECK(n == 17 && out[11] == 0x00 && out[12] == 0x04 && out[13] == 0x03 && out[14] == 0x02 && out[15] == 0x01 && out[16] == 0x0D);
+    }
+    {   // V3. RegisterNotification(VOLUME_CHANGED) is answered INTERIM with the current volume; a later local volume
+        //     change (setLocalVolume) produces ONE CHANGED response on the registered label; the registration is one-shot.
+        Avrcp a; a.setLocalVolume(80);
+        std::vector<uint8_t> reg = { 0x20, 0x11, 0x0E, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x05, 0x0D, 0, 0, 0, 0 };
+        L2cap::Channel ch{}; ch.psm = Avrcp::PSM; ch.remoteCid = 0x0044; ch.state = L2cap::OPEN;
+        CHECK(a.onData(ch, reg.data(), (uint16_t)reg.size()));
+        CapIo io; L2cap l(io); l.begin(0x0001, 10); a.service(l); l.service();
+        CHECK(io.tx.size() == 1 && io.tx[0][9 + 0] == 0x22 && io.tx[0][9 + 3] == 0x0F && io.tx[0][9 + 9] == 0x31 && io.tx[0][9 + 13] == 0x0D && io.tx[0][9 + 14] == 80);
+        io.tx.clear(); a.setLocalVolume(100); a.service(l); l.service();
+        CHECK(io.tx.size() == 1 && io.tx[0][9 + 0] == 0x22 && io.tx[0][9 + 3] == 0x0D && io.tx[0][9 + 13] == 0x0D && io.tx[0][9 + 14] == 100);   // CHANGED, label 2
+        io.tx.clear(); a.setLocalVolume(90); a.service(l); l.service(); CHECK(io.tx.empty());                                            // one-shot
+        CHECK(a.notifications() == 1);
+    }
+    {   // V4. A SetAbsoluteVolume via the object path (onData/service) reaches the callback AND leaves local volume updated,
+        //     so a later VOLUME_CHANGED INTERIM reports what the phone set.
+        static uint8_t seen2 = 0; Avrcp::setVolumeCallback([](void *, uint8_t v) { seen2 = v; }, nullptr);
+        Avrcp a; std::vector<uint8_t> cmd = { 0x30, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40 };
+        L2cap::Channel ch{}; ch.psm = Avrcp::PSM; ch.remoteCid = 0x0044; ch.state = L2cap::OPEN;
+        CapIo io; L2cap l(io); l.begin(0x0001, 10);
+        CHECK(a.onData(ch, cmd.data(), (uint16_t)cmd.size())); a.service(l); l.service();
+        CHECK(io.tx.size() == 1 && io.tx[0][9 + 3] == 0x09 && seen2 == 0x40 && a.volume() == 0x40);
+        Avrcp::setVolumeCallback(nullptr, nullptr);
     }
     printf("avrcp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
