@@ -11,7 +11,14 @@
 struct SbcDecoder {
     static bool parseHeader(const uint8_t *f, uint16_t len, Sbc::Params &p);   // header only; false = not an SBC frame header
     // Decode ONE frame at f (len bytes available).  Returns the frame length consumed (0 = refused).  left/right get
-    // blocks*8 samples each (128 at 16 blocks); MONO copies left into right.
+    // blocks*8 samples each; MONO copies left into right.
+    // ** left AND right MUST EACH HOLD 128 int16 SAMPLES, whatever block count was negotiated. **  The written
+    // length is blocks*8 and `blocks` is read from the FRAME HEADER (a 2-bit field: 4, 8, 12 or 16 blocks, so up
+    // to 128 samples), not from the AVDTP configuration -- a peer that sends 16-block frames after negotiating 4
+    // writes 128 samples into the caller's buffer.  Sizing the buffer from the negotiated block count is a
+    // remotely-triggerable overflow; the decoder deliberately does not clamp, because a short buffer has no
+    // correct behaviour available to it.
+    static const uint16_t MAX_SAMPLES = 128;         // per channel, per frame -- the size left/right must have
     uint16_t decode(const uint8_t *f, uint16_t len, int16_t *left, int16_t *right);
     void reset();                                    // clear the synthesis state (a new stream)
     uint32_t badSync()     const { return m_badSync; }

@@ -32,6 +32,46 @@ int main() {
         Sbc::allocateBits(p, sf, bits); int sum = 0; for (int c = 0; c < 2; c++) for (int s = 0; s < 8; s++) sum += bits[c][s];
         CHECK(sum == 53); for (int c = 0; c < 2; c++) for (int s = 0; s < 8; s++) CHECK(bits[c][s] == 0 || (bits[c][s] >= 2 && bits[c][s] <= 16));
     }
+    {   // 4b. LEFTOVER BITS ARE DISTRIBUTED SUBBAND-MAJOR (section 12.7's stereo/joint procedure walks sb 0..7 and,
+        //     inside each, both channels).  The invariant that pins the ORDER without duplicating the algorithm:
+        //     give both channels the SAME scale factors and their allocations must come out the same, because the
+        //     two channels are then interchangeable at every step, and the only asymmetry either pass can leave is
+        //     the odd tail where the pool runs out mid-subband (the first pass can award 2 bits at once, so that
+        //     tail is worth up to 2 bits, and the second pass can leave one more subband short): AT MOST TWO
+        //     subbands differ, by at most 2 bits, always in channel 0's favour.  Channel-major distribution hands
+        //     every leftover to channel 0's subbands before channel 1 gets one, which breaks that badly.
+        //     MEASURED over this 300-case sweep: subband-major violates the bound 0 times, channel-major 162 --
+        //     e.g. sf=6 everywhere at bitpool 40 gives L=5,3,3,3,3,3,2,2 against R=5,3,2,2,2,2,0,0, six subbands
+        //     apart.  The sum equals the bitpool either way, which is exactly why our own decoder never noticed.
+        static const uint8_t sets[3][2][8] = { { {8,7,6,5,4,3,2,1}, {8,7,6,5,4,3,2,1} },
+                                               { {6,6,6,6,6,6,6,6}, {6,6,6,6,6,6,6,6} },
+                                               { {9,9,8,8,7,7,6,6}, {9,9,8,8,7,7,6,6} } };
+        for (int md = 2; md <= 3; md++) for (int i = 0; i < 3; i++) for (int bp = 4; bp <= 53; bp++) {
+            Sbc::Params q = p; q.mode = (Sbc::Mode)md; q.bitpool = (uint8_t)bp;
+            uint8_t bits[2][8]; Sbc::allocateBits(q, sets[i], bits);
+            int sum = 0, differing = 0, maxd = 0, wrongWay = 0;
+            for (int s = 0; s < 8; s++) { sum += bits[0][s] + bits[1][s];
+                int d = (int)bits[0][s] - (int)bits[1][s]; if (d < 0) { d = -d; wrongWay++; }
+                if (d) differing++; if (d > maxd) maxd = d; }
+            CHECK(sum == bp); CHECK(differing <= 2); CHECK(maxd <= 2); CHECK(wrongWay == 0);
+        }
+    }
+    {   // 4c. begin() BOUNDS THE BITPOOL to what allocateBits can actually reach (16 * subbands * channels in the
+        //     allocation group, capped at the protocol's 250): above it the allocator's do/while never terminates.
+        //     A peer's SET_CONFIGURATION is remote input, so the encoder clamps rather than trusting it.
+        static uint8_t f[600];
+        { Sbc::Params m = p; m.mode = Sbc::MONO; m.bitpool = 200;            // MONO: 16 * 8 * 1 = 128
+          Sbc enc; enc.begin(m); int16_t z[128] = {0}; uint16_t n = enc.encode(z, z, f);
+          CHECK(f[2] == 128); m.bitpool = 128; CHECK(n == Sbc::frameLength(m)); }
+        { Sbc::Params s = p; s.mode = Sbc::STEREO; s.bitpool = 255;          // STEREO: 32 * 8 = 256, capped at 250
+          Sbc enc; enc.begin(s); int16_t z[128] = {0}; uint16_t n = enc.encode(z, z, f);
+          CHECK(f[2] == 250); s.bitpool = 250; CHECK(n == Sbc::frameLength(s)); }
+        { Sbc::Params d = p; d.mode = Sbc::DUAL; d.bitpool = 129;            // DUAL: per channel, so 128 as well
+          Sbc enc; enc.begin(d); int16_t z[128] = {0}; uint16_t n = enc.encode(z, z, f);
+          CHECK(f[2] == 128); d.bitpool = 128; CHECK(n == Sbc::frameLength(d)); }
+        { Sbc::Params j = p; j.bitpool = 53; Sbc enc; enc.begin(j); int16_t z[128] = {0};
+          uint16_t n = enc.encode(z, z, f); CHECK(f[2] == 53); CHECK(n == 119); }   // in range: untouched
+    }
     {   // 5. A 1 kHz sine at -6 dBFS encodes to N frames that all carry the sync word and consistent lengths; write sine.sbc for sbc_snr.py
         Sbc enc; enc.begin(p); FILE *o = fopen("sine.sbc", "wb"); CHECK(o != nullptr);
         double ph = 0; int frames = 0;

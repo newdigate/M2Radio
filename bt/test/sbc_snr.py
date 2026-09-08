@@ -28,4 +28,11 @@ if not (0.5 * 16384 <= amp <= 1.5 * 16384):
     print("sbc_snr: FAIL amp=%.0f outside unity round-trip window [8192,24576]" % amp); ok = False
 if snr < min_db:
     print("sbc_snr: FAIL snr_db=%.1f below min %.1f" % (snr, min_db)); ok = False
+# POLARITY.  sbc_test writes 16384*sin(w*i) starting at phase 0, so a correct encoder's frames decode -- through a
+# FOREIGN decoder, which is the whole point of this oracle -- to a POSITIVE-going sine: the fitted `a` coefficient
+# (the sin component) must be positive.  SNR, amplitude and clipping are all sign-blind, so an encoder whose
+# analysis filterbank inverts every subband sample scores identically here while emitting an inverted stream; it
+# is inaudible on its own and cancels against our own decoder, but it is wrong on the air and it is one sign.
+if a <= 0:
+    print("sbc_snr: FAIL a=%.0f -- decoded tone is INVERTED relative to the source sine (encoder polarity)" % a); ok = False
 sys.exit(0 if ok else 1)
