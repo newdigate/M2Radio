@@ -38,6 +38,13 @@ struct Avdtp {
     // --- initiator, one stream ---
     enum State : uint8_t { IDLE, DISCOVERING, GETTING_CAPS, CONFIGURING, OPENING, MEDIA_CONNECTING, STARTING, STREAMING, SUSPENDED, FAILED };
     enum Role : uint8_t { RNONE, INITIATOR, ACCEPTOR };
+    // Which endpoint WE are (the one SEP the acceptor advertises): SRC (the A2DP source, default) or SNK (NEW-41).
+    enum LocalSep : uint8_t { SEP_SOURCE, SEP_SINK };
+    void setLocalSep(LocalSep s) { m_localSep = s; }
+    bool peerWantsDelayReports() const { return m_peerDelayCfg; }   // the peer's SET_CONFIGURATION carried category 0x08
+    // Acceptor with delay reporting configured: send a DelayReport (0.1 ms units) for our SEP.  false if not STREAMING /
+    // not configured for it / TXQ full.  The source's ACCEPT is consumed by onSignalling (it matches m_tl) and ignored.
+    bool sendDelayReport(uint16_t tenthMs);
     Role role() const { return m_role; }
     void reset();                                        // back to IDLE, RNONE, media released
     void adoptInbound(L2cap &l);                         // find our peer-initiated signalling channel (and later media) from L2cap
@@ -79,6 +86,9 @@ private:
     Role m_role = RNONE;
     SbcConfig m_acceptCfg = { 44100, JOINT_STEREO, 16, 8, LOUDNESS, 2, 53 };
     bool m_cfgChanged = false;
+    LocalSep m_localSep = SEP_SOURCE;   // identity: set once by the app, NOT cleared by begin()/reset()
+    bool m_peerDelayCfg = false;        // the peer's SET_CONFIGURATION carried service category 0x08
+    bool m_delayRptOut = false;         // a DelayReport of ours is outstanding: its ACCEPT is consumed in service()
     // peer-command recording for the FULL acceptor (beyond m_peerDiscover/m_peerDelayRpt/m_peerReject):
     bool m_peerCaps = false;    uint8_t m_peerCapsHdr = 0, m_peerCapsSeid = 0, m_peerCapsSig = 0;
     bool m_peerSetCfg = false;  uint8_t m_peerSetHdr = 0; uint8_t m_peerSetPl[20]; uint16_t m_peerSetLen = 0;

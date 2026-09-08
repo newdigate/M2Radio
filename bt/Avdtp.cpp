@@ -45,6 +45,7 @@ void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
     m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1;
     m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false; m_kickoff = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0; m_peerDelay = 0; m_peerDelayRpt = false; m_peerReject = false;
+    m_peerDelayCfg = false; m_delayRptOut = false;   // (m_localSep is an identity, set once by the app -- never cleared here)
 }
 void Avdtp::reset() {
     m_state = IDLE; m_role = RNONE; m_media = nullptr; m_rspSeen = false; m_cfgChanged = false;
@@ -55,6 +56,7 @@ void Avdtp::reset() {
     m_peerDiscover = m_peerDelayRpt = m_peerReject = false;
     m_peerCaps = m_peerSetCfg = m_peerOpen = m_peerStart = m_peerSuspend = m_peerClose = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0;
+    m_peerDelayCfg = false; m_delayRptOut = false;   // (m_localSep survives: it is what we ARE, not attempt state)
 }
 void Avdtp::adoptInbound(L2cap &l) {
     if (!m_sig) {                                              // not yet acting as acceptor: adopt the first inbound AVDTP channel as signalling
@@ -70,17 +72,29 @@ void Avdtp::adoptInbound(L2cap &l) {
 bool Avdtp::start(const SbcConfig &want) { m_sig = m_l2->byLocal(m_sigCid); if (!m_sig || m_sig->state != L2cap::OPEN) return false;
     m_want = want; m_state = DISCOVERING; m_rspSeen = false; m_kickoff = true; m_role = INITIATOR;
     m_capSig = (m_peerVer && m_peerVer < 0x0103) ? 0x02 : 0x0C; return true; }
+// As the SINK we tell the source how far ahead of playback its media is (AVDTP 1.3 DelayReport, 0.1 ms units).
+// Only meaningful once the source configured category 0x08 and the stream is running.
+bool Avdtp::sendDelayReport(uint16_t tenthMs) {
+    if (m_role != ACCEPTOR || m_state != STREAMING || !m_peerDelayCfg) return false;
+    uint8_t b[5] = { (uint8_t)(((m_tl + 1) << 4) | COMMAND), 0x0D, (uint8_t)(OUR_SEID << 2), (uint8_t)(tenthMs >> 8), (uint8_t)tenthMs };
+    if (!send(b, 5)) return false;
+    m_tl++; m_delayRptOut = true; return true;                 // the ACCEPT matches m_tl and is dropped in service()
+}
 void Avdtp::startSelf() {
     uint8_t b[4]; uint16_t n = buildStart(b, (uint8_t)(m_tl + 1), OUR_SEID);
     if (send(b, n)) { m_tl++; m_state = STARTING; }
 }
-// GET_(ALL_)CAPABILITIES reply body for our SOURCE SEP: media transport + SBC codec (all rates/modes,
-// blocks 4..16, subbands 4/8, both alloc, bitpool 2..53) + delay reporting (only for 0x0C).
+// GET_(ALL_)CAPABILITIES reply body for our one SEP: media transport + SBC codec + delay reporting (only for 0x0C).
+// SOURCE advertises everything (all rates/modes, blocks 4..16, subbands 4/8, both alloc, bitpool 2..53); SINK
+// advertises only what it can decode into one 128-sample audio block: 44.1 kHz, all modes, 16 blocks, 8 subbands,
+// LOUDNESS -- so a source that configures anything else is out of spec and is rejected in parseAcceptCfg().
 uint16_t Avdtp::buildCapsAccept(uint8_t *o, uint8_t hdr, uint8_t sig) {
     o[0] = (uint8_t)((hdr & 0xF0) | ACCEPT); o[1] = sig;
     o[2] = 0x01; o[3] = 0x00;                                   // media transport
     o[4] = 0x07; o[5] = 0x06; o[6] = 0x00; o[7] = 0x00;         // media codec: audio, SBC
-    o[8] = 0xFF; o[9] = 0xFF; o[10] = 0x02; o[11] = 0x35;       // rates/modes all; blocks/sub/alloc all; bitpool 2..53
+    if (m_localSep == SEP_SINK) { o[8] = 0x2F; o[9] = 0x15; }   // 44.1 kHz + all modes; 16 blocks, 8 subbands, loudness
+    else                        { o[8] = 0xFF; o[9] = 0xFF; }   // rates/modes all; blocks/sub/alloc all
+    o[10] = 0x02; o[11] = 0x35;                                 // bitpool 2..53
     if (sig == 0x02) return 12;
     o[12] = 0x08; o[13] = 0x00;                                 // delay reporting (GET_ALL_CAPABILITIES only)
     return 14;
@@ -101,6 +115,9 @@ bool Avdtp::parseAcceptCfg(const uint8_t *p, uint16_t len, SbcConfig &c, uint8_t
             // exactly one bit per field, and 44.1 kHz (0x20) only -- the audio graph runs at 44.1
             auto one = [](uint8_t b){ return b && !(b & (b - 1)); };
             if (rateBit != 0x20 || !one(modeBits) || !one(blkBits) || !one(subBit) || !one(allocBit)) { badCat = 0x07; return false; }
+            // As a SINK we advertised only what the decoder produces one 128-sample block from: 16 blocks, 8
+            // subbands, LOUDNESS.  A source configuring anything else configured something we never offered.
+            if (m_localSep == SEP_SINK && (allocBit != 0x01 || subBit != 0x01 || blkBits != 0x10)) { badCat = 0x07; return false; }
             c.rate = 44100;
             c.mode = (Mode)modeBits; c.alloc = (Alloc)allocBit;
             c.blocks = blkBits == 0x80 ? 4 : blkBits == 0x40 ? 8 : blkBits == 0x20 ? 12 : 16;
@@ -147,7 +164,9 @@ void Avdtp::onSignalling(const uint8_t *p, uint16_t len) {
     memcpy(m_rsp, p, len); m_rspLen = len; m_rspSeen = true;
 }
 void Avdtp::service() {
-    if (m_peerDiscover) { uint8_t b[4]; if (send(b, buildDiscoverAcceptOneSource(b, m_peerHdr))) m_peerDiscover = false; }   // else: TXQ full, retry next tick
+    // Our one SEP, SEID 1, audio, with the TSEP bit (0x08) set when we are the SINK (NEW-41).
+    if (m_peerDiscover) { uint8_t b[4] = { (uint8_t)((m_peerHdr & 0xF0) | ACCEPT), 0x01, 1 << 2, (uint8_t)(m_localSep == SEP_SINK ? 0x08 : 0x00) };
+        if (send(b, 4)) m_peerDiscover = false; }   // else: TXQ full, retry next tick
     if (m_peerDelayRpt) { uint8_t b[2] = { (uint8_t)((m_peerDelayHdr & 0xF0) | ACCEPT), 0x0D }; if (send(b, 2)) m_peerDelayRpt = false; }
     if (m_peerReject)   { uint8_t b[2] = { (uint8_t)((m_peerRejHdr & 0xF0) | GENERAL_REJECT), m_peerRejSig }; if (send(b, 2)) m_peerReject = false; }
     if (m_peerCaps) { uint8_t b[16];
@@ -162,7 +181,14 @@ void Avdtp::service() {
         } else { SbcConfig c;
             if (parseAcceptCfg(m_peerSetPl, m_peerSetLen, c, badCat)) {
                 uint8_t r[2] = { (uint8_t)((m_peerSetHdr & 0xF0) | ACCEPT), 0x03 };
-                if (send(r, 2)) { m_peerSetCfg = false; m_acceptCfg = c; m_cfgChanged = true; m_role = ACCEPTOR; m_state = CONFIGURING; }
+                if (send(r, 2)) { m_peerSetCfg = false; m_acceptCfg = c; m_cfgChanged = true; m_role = ACCEPTOR; m_state = CONFIGURING;
+                    // Did the source configure Delay Reporting (category 0x08)?  Only then may we send DelayReports.
+                    // Bounded exactly like parseSbcCaps's walk: a 16-bit i+2+l can wrap and re-enter the buffer.
+                    m_peerDelayCfg = false;
+                    for (uint16_t i = 4; i + 1 < m_peerSetLen; ) { uint8_t l2 = m_peerSetPl[i + 1];
+                        if (m_peerSetPl[i] == 0x08) { m_peerDelayCfg = true; break; }
+                        if ((uint32_t)i + 2 + l2 >= m_peerSetLen) break;
+                        i = (uint16_t)(i + 2 + l2); } }
             } else {
                 uint8_t r[4] = { (uint8_t)((m_peerSetHdr & 0xF0) | REJECT), 0x03, badCat, 0x29 }; if (send(r, 4)) m_peerSetCfg = false;
             } } }
@@ -188,6 +214,9 @@ void Avdtp::service() {
         // "peer accepts the channel but never drives it to OPEN": Avdtp has no clock of its own; bounded by the caller's outer timeout.
         return;
     }
+    // The source's ACCEPT of a DelayReport WE sent carries our own tl, so onSignalling() filed it as a response;
+    // it advances nothing, so consume it here rather than letting the state machine below read it as one.
+    if (m_rspSeen && m_delayRptOut && m_rspLen >= 2 && m_rsp[1] == 0x0D) { m_rspSeen = false; m_delayRptOut = false; return; }
     if (!m_rspSeen) return; m_rspSeen = false;
     uint8_t b[16];
     if (responseType(m_rsp[0]) != ACCEPT) {

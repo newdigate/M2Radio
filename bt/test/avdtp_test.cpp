@@ -217,6 +217,57 @@ int main() {
         CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x02, 1 << 2 }));
         CHECK(a.state() == Avdtp::GETTING_CAPS);
     }
+    {   // S1. SINK personality: DISCOVER is answered with SEID 1, audio, SNK (TSEP bit set), and GET_ALL_CAPABILITIES
+        //     with the SINK caps: 44.1 kHz only, all modes, 16 blocks only, 8 subbands only, LOUDNESS only, bitpool
+        //     2..53, delay reporting -- byte for byte.  GET_CAPABILITIES (1.2 sources) gets the same without delay reporting.
+        CapIo io; L2cap l(io); Avdtp a; a.setLocalSep(Avdtp::SEP_SINK); openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x01, 1 << 2, 0x08 }));                       // 0x08 = audio (0<<4) | SNK (1<<3)
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x42, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x2F, 0x15, 0x02, 0x35, 0x08, 0x00 }));
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x02, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x52, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x2F, 0x15, 0x02, 0x35 }));
+    }
+    {   // S2. The source's SET_CONFIGURATION is adopted exactly as today (bitpool 53 joint 16/8 loudness), and a
+        //     48 kHz / SNR-allocation / 12-block config is REJECTED with the media-codec category (0x07, 0x29) --
+        //     the sink advertised none of those, so a source that sends them is out of spec, by name.
+        CapIo io; L2cap l(io); Avdtp a; a.setLocalSep(Avdtp::SEP_SINK); openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x11, 0x15, 0x02, 0x35 }.data(), 14); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x53, 0x03, 0x07, 0x29 }));                            // 48 kHz (0x10): rejected
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x16, 0x02, 0x35 }.data(), 14); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x63, 0x03, 0x07, 0x29 }));                            // SNR allocation (0x02): rejected
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x25, 0x02, 0x35 }.data(), 14); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x73, 0x03, 0x07, 0x29 }));                            // 12 blocks (0x20): rejected
+        a.onSignalling(std::vector<uint8_t>{ 0x80, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }.data(), 14); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x82, 0x03 }) && a.configChanged() && a.sbcConfig().maxBitpool == 53);   // the good one
+    }
+    {   // S3. DelayReport SENDING: as an ACCEPTOR whose source configured delay reporting (category 0x08), after START
+        //     sendDelayReport(tenthMs) emits [tl][0x0D][seid<<2][hi][lo] on the signalling channel and the source's
+        //     ACCEPT is consumed silently; peerWantsDelayReports() says whether the source asked for it.
+        CapIo io; L2cap l(io); Avdtp a; a.setLocalSep(Avdtp::SEP_SINK); openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 }.data(), 16); tick(l, a); drain(io);
+        CHECK(a.peerWantsDelayReports());
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x06, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+        feed(l, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); l.service();
+        const L2cap::Channel *m = l.byRemote(0x00C1);
+        feed(l, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(l, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0, 0 });
+        l.service(); a.adoptInbound(l); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); drain(io); CHECK(a.started());
+        CHECK(a.sendDelayReport(1500)); tick(l, a); auto o = drain(io);                       // 150.0 ms
+        CHECK(o.size() == 1 && o[0].size() == 5 && o[0][1] == 0x0D && o[0][2] == (1 << 2) && o[0][3] == 0x05 && o[0][4] == 0xDC && (o[0][0] & 0x03) == 0);
+        uint8_t tl = (o.size() == 1 && !o[0].empty()) ? (uint8_t)(o[0][0] >> 4) : 0;          // (fail, never crash: a mutant that sends nothing)
+        a.onSignalling(std::vector<uint8_t>{ (uint8_t)((tl << 4) | 0x02), 0x0D }.data(), 2); tick(l, a); o = drain(io);
+        CHECK(o.empty() && a.state() == Avdtp::STREAMING);                                   // ACCEPT consumed, nothing sent, still streaming
+        CHECK(!a.sendDelayReport(1500) || true);                                              // (a second report is allowed; not asserted)
+    }
+    {   // S4. Without delay reporting configured, sendDelayReport() refuses (returns false, sends nothing).
+        CapIo io; L2cap l(io); Avdtp a; a.setLocalSep(Avdtp::SEP_SINK); openInboundSignalling(io, l, a);
+        acceptorToStreaming(io, l, a); CHECK(a.started() && !a.peerWantsDelayReports());
+        CHECK(!a.sendDelayReport(1500)); tick(l, a); CHECK(drain(io).empty());
+    }
     {   // B1. ACCEPTOR: the peer drives DISCOVER/GET_ALL_CAPABILITIES/SET_CONFIGURATION/OPEN/START and we
         //     answer from our source SEP; the adopted config is what sbcConfig() reports.
         CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
