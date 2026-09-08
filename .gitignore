@@ -3,8 +3,10 @@ build-*/
 .DS_Store
 sine.sbc
 bt/test/sine.sbc
-# ffmpeg oracle artefacts written into the test cwd by bt/test/run.sh (anchored: only at the repo root)
-/ffmpeg_sine.sbc
-/sine_decoded.raw
-/ffmpeg_noise.sbc
-/ffmpeg_noise.raw
+# ffmpeg oracle artefacts, written into whatever cwd the tests run in by bt/test/run.sh and sbcdecoder_test.
+# DELIBERATELY UNANCHORED: run.sh's documented cwd is the repo root, but every test is equally runnable from
+# bt/test/, and the anchored form left these untracked-and-visible there -- one `git status` away from being
+# committed by accident.  Covers both cwds and the ours->ffmpeg encode-direction arm's files.
+ffmpeg_*.sbc
+ffmpeg_*.raw
+sine_decoded.raw

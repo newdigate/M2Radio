@@ -38,22 +38,28 @@ int main() {
         //     two channels are then interchangeable at every step, and the only asymmetry either pass can leave is
         //     the odd tail where the pool runs out mid-subband (the first pass can award 2 bits at once, so that
         //     tail is worth up to 2 bits, and the second pass can leave one more subband short): AT MOST TWO
-        //     subbands differ, by at most 2 bits, always in channel 0's favour.  Channel-major distribution hands
-        //     every leftover to channel 0's subbands before channel 1 gets one, which breaks that badly.
-        //     MEASURED over this 300-case sweep: subband-major violates the bound 0 times, channel-major 162 --
+        //     subbands differ, always in channel 0's favour.  Channel-major distribution hands every leftover to
+        //     channel 0's subbands before channel 1 gets one, which breaks that badly.
+        //     THE BOUND ON THE DIFFERENCE IS 3, NOT 2, AND THE SWEEP STARTS AT THE PROTOCOL'S MINIMUM BITPOOL OF
+        //     2 (A2DP 4.3.2.6) TO REACH IT: at bitpool 3 the pool cannot be split into two LEGAL allocations at
+        //     all -- a subband gets 0 bits or 2..16, never 1 -- so channel 0 takes all three and one subband
+        //     differs by 3.  Measured: bitpool 3 is the ONLY case that does, for all three scale-factor sets and
+        //     both modes (6 of the 312 cases), and every bitpool from 4 up stays within 2.  A sweep starting at 4
+        //     could assert 2 only because it never asked; that is a calibrated bound presented as a derived one.
+        //     MEASURED over this 312-case sweep: subband-major violates the bound 0 times, channel-major 162 --
         //     e.g. sf=6 everywhere at bitpool 40 gives L=5,3,3,3,3,3,2,2 against R=5,3,2,2,2,2,0,0, six subbands
         //     apart.  The sum equals the bitpool either way, which is exactly why our own decoder never noticed.
         static const uint8_t sets[3][2][8] = { { {8,7,6,5,4,3,2,1}, {8,7,6,5,4,3,2,1} },
                                                { {6,6,6,6,6,6,6,6}, {6,6,6,6,6,6,6,6} },
                                                { {9,9,8,8,7,7,6,6}, {9,9,8,8,7,7,6,6} } };
-        for (int md = 2; md <= 3; md++) for (int i = 0; i < 3; i++) for (int bp = 4; bp <= 53; bp++) {
+        for (int md = 2; md <= 3; md++) for (int i = 0; i < 3; i++) for (int bp = 2; bp <= 53; bp++) {
             Sbc::Params q = p; q.mode = (Sbc::Mode)md; q.bitpool = (uint8_t)bp;
             uint8_t bits[2][8]; Sbc::allocateBits(q, sets[i], bits);
             int sum = 0, differing = 0, maxd = 0, wrongWay = 0;
             for (int s = 0; s < 8; s++) { sum += bits[0][s] + bits[1][s];
                 int d = (int)bits[0][s] - (int)bits[1][s]; if (d < 0) { d = -d; wrongWay++; }
                 if (d) differing++; if (d > maxd) maxd = d; }
-            CHECK(sum == bp); CHECK(differing <= 2); CHECK(maxd <= 2); CHECK(wrongWay == 0);
+            CHECK(sum == bp); CHECK(differing <= 2); CHECK(maxd <= 3); CHECK(wrongWay == 0);
         }
     }
     {   // 4c. begin() BOUNDS THE BITPOOL to what allocateBits can actually reach (16 * subbands * channels in the

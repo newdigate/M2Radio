@@ -12,9 +12,11 @@ for t in bondtable_test l2cap_test avdtp_test sdp_test avrcp_test btlink_test a2
     # HARD TIMEOUT.  sbcdecoder_test's hostile-header arm asserts that decode() RETURNS on a crafted frame, and a
     # bit-allocation loop that cannot reach its bitpool spins forever rather than failing a check -- an unbounded
     # test binary is a hung CI job, not a red one.  60 s against a suite whose slowest member runs in ~3 s.
+    # No fallback to running UNBOUNDED: the timeout is the whole point of this line, and a suite that silently
+    # loses it turns the hang above from a red run into a wedged CI job -- the failure mode the bound exists for.
     if command -v gtimeout >/dev/null; then gtimeout 60 "$OUT/$t"
     elif command -v timeout  >/dev/null; then timeout  60 "$OUT/$t"
-    else "$OUT/$t"; fi
+    else echo "need gtimeout (brew install coreutils)" >&2; exit 1; fi
 done
 # Optional oracle: ffmpeg decodes sine.sbc (written by sbc_test into the cwd above) and checks the
 # recovered 1 kHz tone's SNR + level.  sine.sbc lands in this same cwd, so a bare path finds it.
