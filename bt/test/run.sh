@@ -4,7 +4,7 @@ DIR=$(cd "$(dirname "$0")" && pwd); OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 CXX=${CXX:-c++}
 # The foreign-encoder arm of sbcdecoder_test needs an SBC bitstream from an INDEPENDENT encoder; make it first if ffmpeg is here.
 if command -v ffmpeg >/dev/null; then python3 "$DIR/sbc_decode_snr.py" make || true; fi
-for t in bondtable_test l2cap_test avdtp_test sdp_test avrcp_test btlink_test a2dpsource_test btsession_test sbc_test sbcdecoder_test rtp_test mediapacketizer_test; do
+for t in bondtable_test l2cap_test avdtp_test sdp_test avrcp_test btlink_test a2dpsource_test a2dpsink_test btsession_test sbc_test sbcdecoder_test rtp_test mediapacketizer_test; do
     [ -f "$DIR/$t.cpp" ] || continue
     # bt/ units (BtLink, Sdp, Avdtp) call into Hci, so link the host-compilable hci sources too (as hci/test/run.sh does).
     $CXX -std=c++11 -Wall -Wextra -Werror -I"$DIR/.." -I"$DIR/../../hci" "$DIR/$t.cpp" "$DIR"/../*.cpp \
