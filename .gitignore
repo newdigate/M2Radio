@@ -3,3 +3,5 @@ build-*/
 .DS_Store
 sine.sbc
 bt/test/sine.sbc
+ffmpeg_sine.sbc
+sine_decoded.raw
