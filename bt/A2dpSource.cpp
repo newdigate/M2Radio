@@ -47,6 +47,13 @@ bool A2dpSource::start(const Target &t) {
     // this ack the first LINKING tick would abort the new attempt as LOST before Connection_Complete is consumed.
     // ackLost() only clears LINK_LOST->LINK_NONE, so it is a no-op for an INBOUND target (link already UP).
     m_link.ackLost();
+    // ... and any prior attempt's AVDTP/AVRCP state.  Only tick()'s LOSS branch resets these, so an attempt that
+    // ended any OTHER way (STOPPED, CONNECT/PAIR/L2CAP/AVDTP_FAILED) leaves Avdtp::m_sig and m_role stale:
+    // adoptInbound()'s `if (!m_sig)` guard then skips adoption, the next INBOUND attempt believes it is already
+    // the ACCEPTOR, and answers the peer's DISCOVER on whatever channel that dangling pointer's slot now holds --
+    // a different channel, or cid 0x0000 if L2cap::begin() left the slot empty.  a2dpsource_test's last scenario
+    // is the regression; A2dpSink::start() carries the same reset for the same reason.
+    m_avdtp.reset(); m_avrcp.reset();
     m_t = t; m_inbound = (t.kind == Target::INBOUND);
     // An OUTBOUND attempt negotiates the initiator's own config (bitpool 53); reset m_params so it does NOT
     // inherit a prior INBOUND attempt's ADOPTED config (adoptConfig() is the only other writer).  Without

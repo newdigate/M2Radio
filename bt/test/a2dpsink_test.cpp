@@ -48,6 +48,28 @@ static FakeIo *g_io = nullptr; static Hci *g_hci = nullptr; static A2dpSink *g_s
 static void evThunk(void *ctx, uint8_t code, const uint8_t *p, uint8_t len) { ((A2dpSink *)ctx)->onEvent(code, p, len); }
 static std::vector<std::string> g_log;
 static void logFn(void *, const char *line) { g_log.push_back(std::string(line)); }
+static int logCount(const char *needle) { int n = 0; for (auto &l : g_log) if (l.find(needle) != std::string::npos) n++; return n; }
+// The DESTINATION CID of the most recent outgoing AVDTP response carrying signal id `sig`.  Searched over
+// the RAW ACL stream rather than through Rig::lastAvdtp(), which filters by the CURRENT signalling channel's
+// remote cid and so cannot see a reply addressed to a STALE (or zero) one -- which is the whole point of K4.
+// L2CAP's own signalling channel (cid 1) is skipped: its [code][id] bytes can collide with an AVDTP signal id.
+static uint16_t cidOfLastAvdtpAccept(FakeIo &io, uint8_t sig) {
+    for (size_t i = io.aclOut.size(); i-- > 0;) { const std::vector<uint8_t> &p = io.aclOut[i];
+        if (p.size() < 6) continue;
+        uint16_t cid = (uint16_t)(p[2] | (p[3] << 8));
+        if (cid == 0x0001) continue;
+        if (p[5] == sig && (p[4] & 0x03) == Avdtp::ACCEPT) return cid; }
+    return 0xFFFF;
+}
+// Did we transmit an AVDTP General Reject (the 2-byte [tl<<4|01][sig] Avdtp::service() emits for a command it
+// does not implement) at or after aclOut index `from`?
+static bool sawGeneralReject(FakeIo &io, size_t from) {
+    for (size_t i = from; i < io.aclOut.size(); i++) { const std::vector<uint8_t> &p = io.aclOut[i];
+        if (p.size() != 6) continue;
+        if ((uint16_t)(p[2] | (p[3] << 8)) == 0x0001) continue;
+        if ((p[4] & 0x03) == Avdtp::GENERAL_REJECT) return true; }
+    return false;
+}
 // The phone that pages us -- an address the sink has never met (acceptUnknown is what lets a stranger in).
 static const uint8_t PHONE[6] = { 0x76, 0x1A, 0x7E, 0x8A, 0x0C, 0x00 };     // 00:0C:8A:7E:1A:76, LE byte order
 static const uint8_t KEY[16] = { 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F };
@@ -102,6 +124,9 @@ struct Rig {
         step();
     }
     void failPairing() { g_refuseAuth = true; advanceMs(2500); }                            // the peer never secures; the fallback ladder is refused
+    // The ONE event an inbound pair actually waits on (BtLink PR_WAIT_PEER_SECURE): the peer secured the link.
+    // peerAuthenticates() drives the whole SSP dance to get here; a re-pair after a teardown needs only this.
+    void peerSecures() { io.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); step(); }
     void disconnectionComplete(uint8_t reason) { io.ev(0x05, { 0x00, 0x01, 0x00, reason }); step(); }
     // Deliver an inbound L2CAP PDU addressed to OUR local cid (as Hci would hand it to onAcl).
     void feed(uint16_t localCid, std::vector<uint8_t> pl) {
@@ -200,7 +225,10 @@ int main() {
         CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x01 && (r.lastAvdtp()[0] & 3) == 2; }, 200));
         CHECK((r.lastAvdtp()[3] & 0x08) != 0);                                    // our one SEP is advertised as a SNK (TSEP bit)
         r.peerAvdtp({ 0x20, 0x0C, 1 << 2 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x0C; }, 200));
-        r.peerAvdtp({ 0x30, 0x03, 1 << 2, 1 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 });
+        // INT SEID 2, deliberately NOT our own SEID (Avdtp::OUR_SEID == 1): the DelayReport pin below asserts we
+        // address the SOURCE's endpoint (AVDTP 1.3 s8.19), and with both SEIDs equal to 1 that assertion held
+        // just as well for a sink that sent its OWN seid -- i.e. it tested nothing.
+        r.peerAvdtp({ 0x30, 0x03, 1 << 2, 2 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 });
         CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x03; }, 200));
         CHECK((r.lastAvdtp()[0] & 3) == 2);                                       // ACCEPTed, not rejected
         CHECK(sink.sbcParams().bitpool == 53 && sink.sbcParams().mode == Sbc::JOINT_STEREO);
@@ -215,7 +243,7 @@ int main() {
         // endpoint (the INT SEID of its SET_CONFIGURATION -- AVDTP 1.3 s8.19), and the source's ACCEPT is consumed.
         CHECK(r.countAvdtp(0x0D) == 1);
         std::vector<uint8_t> dr; for (auto &p : r.io.aclOut) if (p.size() >= 6 && p[5] == 0x0D) dr.assign(p.begin() + 4, p.end());
-        CHECK(dr.size() == 5 && dr[2] == (1 << 2) && ((dr[3] << 8) | dr[4]) == 460);
+        CHECK(dr.size() == 5 && dr[2] == (2 << 2) && ((dr[3] << 8) | dr[4]) == 460);   // the SOURCE's seid (2), not ours (1)
         if (dr.size() == 5) r.peerAvdtp({ (uint8_t)((dr[0] & 0xF0) | 0x02), 0x0D });   // the source ACCEPTs it
         r.advanceMs(100);
         CHECK(r.countAvdtp(0x0D) == 1 && sink.avdtp().delayRejects() == 0);       // exactly one, never repeated
@@ -243,6 +271,79 @@ int main() {
         r.advanceMs(31000);                                                        // past the AVDTP deadline (30 s)
         CHECK(r.runUntil([&] { return sink.result() == A2dpSink::AVDTP_FAILED; }, 200));
         CHECK(sink.avdtp().state() != Avdtp::STREAMING);
+    }
+    {   // K4. A SECOND attempt after a FAILED one must re-adopt AVDTP from scratch.  Only the loss branch of
+        //     tick() used to reset Avdtp, so an attempt that ended AVDTP_FAILED (or L2CAP_FAILED / PAIR_FAILED /
+        //     STOPPED) left Avdtp::m_sig and m_role stale: adoptInbound()'s `if (!m_sig)` guard then skipped
+        //     adoption, the sink believed it was already ACCEPTOR, and its DISCOVER reply went to the remote CID
+        //     of a channel that no longer exists -- cid 0x0000 after L2cap::begin() zeroed the table.
+        //     Attempt 1 gets an AVDTP channel and NOTHING else, so it times out AVDTP_FAILED; attempt 2 opens
+        //     AVDTP first and sends DISCOVER, whose ACCEPT must be addressed to the NEW channel.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        sink.begin(0, 8); r.answerPrepare();
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return sink.link().inboundUp(); }, 500));
+        CHECK(sink.start()); r.peerAuthenticates();
+        CHECK(r.runUntil([&] { return sink.state() == A2dpSink::AVDTP_WAIT; }, 2000));
+        r.peerOpens(Sdp::PSM, 0x0050);
+        r.sigLocal = r.peerOpens(Avdtp::PSM, 0x0051);
+        CHECK(r.runUntil([&] { return sink.state() == A2dpSink::AVDTP; }, 500));
+        CHECK(sink.avdtp().role() == Avdtp::ACCEPTOR);
+        r.advanceMs(31000);                                                        // the source drives nothing: past the 30 s AVDTP deadline
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));
+        CHECK(sink.result() == A2dpSink::AVDTP_FAILED && sink.state() == A2dpSink::DONE);
+        // ---- attempt 2: a fresh page, then AVDTP FIRST (no SDP), then DISCOVER ----
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return sink.link().inboundUp(); }, 500));
+        CHECK(sink.start()); r.peerSecures();
+        CHECK(r.runUntil([&] { return sink.state() == A2dpSink::AVDTP_WAIT; }, 2000));
+        r.sigLocal = r.peerOpens(Avdtp::PSM, 0x0052);
+        CHECK(r.runUntil([&] { return sink.avdtp().role() == Avdtp::ACCEPTOR && sink.state() == A2dpSink::AVDTP; }, 500));
+        L2cap::Channel *sig2 = sink.l2().byRemote(0x0052); CHECK(sig2 != nullptr);
+        size_t before = r.io.aclOut.size();
+        r.peerAvdtp({ 0x10, 0x01 });
+        CHECK(r.runUntil([&] { return cidOfLastAvdtpAccept(r.io, 0x01) != 0xFFFF && r.io.aclOut.size() > before; }, 200));
+        CHECK(cidOfLastAvdtpAccept(r.io, 0x01) == 0x0052);                         // the NEW channel -- not 0x0000, not the dead 0x0051
+        CHECK(r.lastAvdtp()[1] == 0x01 && (r.lastAvdtp()[3] & 0x08) != 0);         // ... and it is our SNK SEP
+    }
+    {   // K5. The source CLOSEs the stream while media is flowing.  Two things must happen: the sink ends the
+        //     attempt (it used to sit STREAMING forever), and the media channel's PDUs must NEVER reach
+        //     Avdtp::onSignalling -- Avdtp nulls its media pointer on CLOSE, so a gate on mediaRemoteCid()
+        //     lets an in-flight RTP packet fall through and be answered with a General Reject built out of the
+        //     RTP header.  Routing is by the LATCHED media cid; DELIVERY additionally needs the stream live.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink); r.bringToStreaming(sink);
+        static int calls = 0; calls = 0;
+        sink.onMedia([](void *, const uint8_t *, uint16_t) { calls++; }, nullptr);
+        r.peerAvdtp({ 0x60, 0x08, 1 << 2 });                                       // CLOSE
+        CHECK(r.lastAvdtp()[0] == 0x62 && r.lastAvdtp()[1] == 0x08);               // ACCEPTed
+        CHECK(sink.avdtp().state() != Avdtp::STREAMING);
+        size_t afterAccept = r.io.aclOut.size();
+        r.peerAcl(r.mediaCid(), { 0x80, 0x60, 0, 4, 0,0,0,0, 0,0,0,0, 0x01, 0x9C });   // one media packet, in flight past the CLOSE
+        r.tick();
+        CHECK(calls == 0);                                                          // the stream is closed: nothing is delivered
+        CHECK(!sawGeneralReject(r.io, afterAccept));                                // ... and nothing was mistaken for a peer command
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));
+        CHECK(sink.state() == A2dpSink::DONE && sink.result() == A2dpSink::OK);
+        CHECK(logCount("stream closed") == 1);
+    }
+    {   // K6. The two remaining exits.  (a) the peer never secures the link and the fallback ladder's
+        //     Authentication_Requested is refused -> PAIR_FAILED, torn down.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        sink.begin(0, 8); r.answerPrepare();
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return sink.link().inboundUp(); }, 500));
+        CHECK(sink.start());
+        r.failPairing();
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));
+        CHECK(sink.result() == A2dpSink::PAIR_FAILED && sink.state() == A2dpSink::DONE);
+        CHECK(r.io.count(0x0406) == 1);                                            // the link was torn down
+    }
+    {   // K6(b). stop() while STREAMING -> STOPPED, torn down, not busy.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink); r.bringToStreaming(sink);
+        sink.stop();
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));
+        CHECK(sink.result() == A2dpSink::STOPPED && sink.state() == A2dpSink::DONE);
+        CHECK(r.io.count(0x0406) == 1);
     }
     printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

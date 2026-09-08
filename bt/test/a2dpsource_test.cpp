@@ -62,6 +62,17 @@ static void feedAcl(A2dpSource &src, uint16_t cid, std::vector<uint8_t> pl) {
     std::vector<uint8_t> v = { (uint8_t)pl.size(), (uint8_t)(pl.size() >> 8), (uint8_t)cid, (uint8_t)(cid >> 8) };
     v.insert(v.end(), pl.begin(), pl.end()); src.onAcl(0x0001, v.data(), (uint16_t)v.size());
 }
+// The DESTINATION CID of the most recent outgoing AVDTP response carrying signal id `sig`; 0xFFFF if none.
+// Read off the RAW ACL stream, so a reply addressed to a STALE (or zero) channel is visible rather than
+// filtered out.  L2CAP's own signalling channel (cid 1) is skipped: its [code][id] can collide with a signal id.
+static uint16_t cidOfLastAvdtpAccept(FakeIo &io, uint8_t sig) {
+    for (size_t i = io.aclOut.size(); i-- > 0;) { const std::vector<uint8_t> &p = io.aclOut[i];
+        if (p.size() < 6) continue;
+        uint16_t cid = (uint16_t)(p[2] | (p[3] << 8));
+        if (cid == 0x0001) continue;
+        if (p[5] == sig && (p[4] & 0x03) == Avdtp::ACCEPT) return cid; }
+    return 0xFFFF;
+}
 // Transaction label of the most recent OUTGOING AVDTP PDU carrying signal id `sig`; -1 if none.
 static int lastAvdtpTl(FakeIo &io, uint8_t sig) {
     for (size_t i = io.aclOut.size(); i-- > 0;) { const std::vector<uint8_t> &pdu = io.aclOut[i];
@@ -192,6 +203,41 @@ int main() {
         A2dpSource::Target t{}; t.kind = A2dpSource::Target::PAGE; memcpy(t.bd, SHOKZ, 6); t.psrm = 1; t.attempts = 1;
         CHECK(r.src.start(t));
         CHECK(r.src.sbcParams().bitpool == 53);                                   // OUTBOUND resets to the initiator default, NOT 35
+    }
+    {   // A fresh attempt must reset Avdtp/Avrcp.  Only tick()'s LOSS branch does, so an attempt that ended any
+        //   other way (STOPPED here; CONNECT/PAIR/L2CAP/AVDTP_FAILED alike) leaves Avdtp::m_sig and m_role
+        //   stale -- adoptInbound()'s `if (!m_sig)` guard then skips adoption, the NEXT inbound attempt believes
+        //   it is already the ACCEPTOR, and its DISCOVER reply is addressed to the dead channel's remote cid,
+        //   which is 0x0000 once L2cap::begin() has zeroed the table.  (a2dpsink_test K4 is the same defect.)
+        Rig r; inboundToMediaOpen(r);
+        r.src.stop();
+        CHECK(runUntil([&]{ return !r.src.busy(); }, 3000));
+        CHECK(r.src.result() == A2dpSource::STOPPED);
+        std::vector<uint8_t> creq(SHOKZ, SHOKZ + 6); creq.push_back(0x18); creq.push_back(0x04); creq.push_back(0x24); creq.push_back(0x01);
+        r.io.ev(0x04, creq); step();                                                                   // a SECOND incoming page
+        std::vector<uint8_t> cc = { 0x00, 0x01, 0x00 }; cc.insert(cc.end(), SHOKZ, SHOKZ + 6); cc.push_back(0x01); cc.push_back(0x00);
+        r.io.ev(0x03, cc); step();
+        A2dpSource::Target t{}; t.kind = A2dpSource::Target::INBOUND; memcpy(t.bd, SHOKZ, 6);
+        CHECK(r.src.start(t));
+        r.io.ev(0x08, { 0x00, 0x01, 0x00, 0x01 }); step();                                             // peer secures the new link
+        CHECK(runUntil([&]{ return r.src.state() == A2dpSource::AVDTP_WAIT; }, 5000));
+        // The peer re-reads our SDP record BEFORE opening AVDTP, so the signalling channel lands in a DIFFERENT
+        // L2cap slot than last time.  That is what makes the stale m_sig visible: with both attempts opening AVDTP
+        // first the pointer happens to land back on the same (now correct) slot and the defect hides.
+        feedAcl(r.src, 0x0001, { 0x02, 0x2D, 4, 0, 0x01, 0x00, 0xC3, 0x00 }); step();                  // peer opens SDP
+        L2cap::Channel *sdp2 = r.src.l2().byRemote(0x00C3); CHECK(sdp2);
+        uint16_t dc = sdp2 ? sdp2->localCid : 0;
+        feedAcl(r.src, 0x0001, { 0x04, 0x2E, 8, 0, (uint8_t)dc, (uint8_t)(dc >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feedAcl(r.src, 0x0001, { 0x05, 0x2F, 6, 0, (uint8_t)dc, (uint8_t)(dc >> 8), 0, 0, 0, 0 }); step();
+        feedAcl(r.src, 0x0001, { 0x02, 0x30, 4, 0, 0x19, 0x00, 0xC2, 0x00 }); step();                  // peer opens AVDTP signalling anew
+        L2cap::Channel *sig = r.src.l2().byRemote(0x00C2); CHECK(sig);
+        uint16_t sc2 = sig ? sig->localCid : 0;
+        feedAcl(r.src, 0x0001, { 0x04, 0x31, 8, 0, (uint8_t)sc2, (uint8_t)(sc2 >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feedAcl(r.src, 0x0001, { 0x05, 0x32, 6, 0, (uint8_t)sc2, (uint8_t)(sc2 >> 8), 0, 0, 0, 0 }); step();
+        CHECK(runUntil([&]{ return r.src.avdtp().role() == Avdtp::ACCEPTOR; }, 3000));
+        feedAcl(r.src, sc2, { 0x30, 0x01 }); step();                                                   // DISCOVER
+        CHECK(runUntil([&]{ return cidOfLastAvdtpAccept(r.io, 0x01) != 0xFFFF; }, 500));
+        CHECK(cidOfLastAvdtpAccept(r.io, 0x01) == 0x00C2);                                             // the NEW channel, not 0x0000
     }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

@@ -19,11 +19,16 @@ class A2dpSink {
 public:
     enum Result : uint8_t { OK = 0, PAIR_FAILED, L2CAP_FAILED, AVDTP_FAILED, LOST, STOPPED, PENDING };
     static const char *resultName(Result r);
-    enum St : uint8_t { IDLE, PAIRING, L2, AVDTP_WAIT, AVDTP, STREAMING, DISCONNECTING, DONE };
+    enum St : uint8_t { IDLE, PAIRING, AVDTP_WAIT, AVDTP, STREAMING, DISCONNECTING, DONE };
     typedef void (*MediaFn)(void *ctx, const uint8_t *rtp, uint16_t len);
+    // NOTE: Sdp::setRole() is PROCESS-GLOBAL -- the SDP server publishes ONE role per image, so an image
+    // that constructs an A2dpSink publishes the AudioSink record for everything, A2dpSource included.
     A2dpSink(Hci &hci, HciIo &io) : m_hci(hci), m_l2(io), m_link(hci) { m_avdtp.setLocalSep(Avdtp::SEP_SINK); Sdp::setRole(Sdp::SINK); m_link.acceptUnknown(true); }
     void setLog(BtLink::LogFn fn, void *ctx) { m_link.setLog(fn, ctx); m_log = fn; m_logCtx = ctx; }
     void setBonds(BondTable *t) { m_bonds = t; m_link.setBonds(t); }
+    BondTable *bonds() { return m_bonds; }
+    // `name` is BORROWED, not copied (BtLink keeps the pointer and writes it to the controller in PREPARE):
+    // it must outlive this object, and it must be set BEFORE begin(), which is what runs PREPARE.
     void setIdentity(uint32_t cod, const char *name) { m_link.setIdentity(cod, name); }
     void onMedia(MediaFn fn, void *ctx) { m_mediaFn = fn; m_mediaCtx = ctx; }
     void begin(uint32_t now, uint8_t aclNum);         // reset; PREPARE once per session (identity written there)
@@ -46,10 +51,18 @@ private:
     static void onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len);
     void logf(const char *fmt, ...);
     void adoptConfig();
+    bool streamClosed();          // peer CLOSE/ABORT -> DISCONNECTING(OK); true when it fired this tick
     BtLink::LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[96];
     BondTable *m_bonds = nullptr; Hci &m_hci; L2cap m_l2; BtLink m_link; Avdtp m_avdtp; SdpServer m_sdpServer; Avrcp m_avrcp;
     MediaFn m_mediaFn = nullptr; void *m_mediaCtx = nullptr;
     Sbc::Params m_params = { Sbc::RATE_44100, Sbc::JOINT_STEREO, 16, 8, Sbc::LOUDNESS, 53 };
     St m_st = IDLE; Result m_result = OK; uint32_t m_deadline = 0; uint8_t m_aclNum = 0; bool m_opIssued = false;
     bool m_delaySent = false; uint16_t m_delayTenthMs = 460;      // ~46 ms: a 16-block ring at 44.1 k; the audio node updates it
+    // The media channel's REMOTE cid, latched the first time Avdtp reports one and held until the attempt ends.
+    // Avdtp FORGETS its media channel on a peer CLOSE/ABORT, so routing on m_avdtp.mediaRemoteCid() lets an
+    // in-flight RTP packet fall through to onSignalling() -- where an RTP header parses as a peer command and
+    // earns a bogus General Reject.  Channel IDENTITY is the right gate; whether the stream is LIVE is a
+    // separate question, asked again before the packet is delivered.
+    uint16_t m_mediaRemoteCid = 0;
+    bool m_streamUp = false;      // the peer's SET_CONFIGURATION was accepted: Avdtp back at IDLE now means CLOSE/ABORT
 };
