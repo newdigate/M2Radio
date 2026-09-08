@@ -64,5 +64,11 @@ private:
     // earns a bogus General Reject.  Channel IDENTITY is the right gate; whether the stream is LIVE is a
     // separate question, asked again before the packet is delivered.
     uint16_t m_mediaRemoteCid = 0;
-    bool m_streamUp = false;      // the peer's SET_CONFIGURATION was accepted: Avdtp back at IDLE now means CLOSE/ABORT
+    // TWO latches, and the distinction is the whole of streamClosed()'s verdict.  m_avdtpUp says the peer's
+    // SET_CONFIGURATION was accepted (Avdtp left IDLE), so a RETURN to IDLE is a CLOSE/ABORT rather than a
+    // channel that never started.  m_streamUp says WE reached STREAMING.  A close seen with m_avdtpUp but
+    // without m_streamUp aborted the attempt before a sample ever played: that is AVDTP_FAILED, not the OK a
+    // completed session earns -- m_streamUp used to latch at SET_CONFIGURATION and reported those as OK.
+    bool m_avdtpUp = false;
+    bool m_streamUp = false;
 };

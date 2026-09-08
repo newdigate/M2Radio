@@ -38,14 +38,20 @@ void A2dpSink::adoptConfig() {
 // The peer CLOSEd (0x08) or ABORTed (0x0A) the stream.  Avdtp has NO dedicated signal for this: it accepts
 // the command, drops its media channel and reverts m_state to IDLE with m_role still ACCEPTOR -- which is
 // byte-for-byte the state a freshly ADOPTED signalling channel is in.  So the transition is what identifies
-// it: m_streamUp latches once the peer's SET_CONFIGURATION was accepted (Avdtp leaves IDLE), and a return to
-// IDLE after that is a close.  Ending OK: a stream the source closed is a completed session, not a failure.
+// it: m_avdtpUp latches once the peer's SET_CONFIGURATION was accepted (Avdtp leaves IDLE), and a return to
+// IDLE after that is a close.
+// WHICH ending it earns is a SECOND question, and conflating the two was a real defect: a close seen before
+// the sink ever reached STREAMING (an ABORT during CONFIGURING or OPEN -- three commands before START) used
+// to end the attempt result=OK and log "sink: stream closed", so BtSinkSession reported a completed session
+// for one that never played a sample.  OK is reserved for a stream the source closed AFTER it ran.
 bool A2dpSink::streamClosed() {
     Avdtp::State s = m_avdtp.state();
-    if (s != Avdtp::IDLE && s != Avdtp::FAILED) { m_streamUp = true; return false; }
-    if (!m_streamUp || s != Avdtp::IDLE) return false;
+    if (s != Avdtp::IDLE && s != Avdtp::FAILED) { m_avdtpUp = true; return false; }
+    if (!m_avdtpUp || s != Avdtp::IDLE) return false;
+    m_avdtpUp = false; m_mediaRemoteCid = 0;
+    if (!m_streamUp) { logf("sink: aborted before start"); m_result = AVDTP_FAILED; m_st = DISCONNECTING; return true; }
     logf("sink: stream closed");
-    m_streamUp = false; m_mediaRemoteCid = 0; m_result = OK; m_st = DISCONNECTING; return true;
+    m_streamUp = false; m_result = OK; m_st = DISCONNECTING; return true;
 }
 void A2dpSink::begin(uint32_t now, uint8_t aclNum) { m_aclNum = aclNum; m_st = IDLE; m_result = OK; m_link.begin(now); m_link.startPrepare(); }
 bool A2dpSink::start() {
@@ -55,7 +61,7 @@ bool A2dpSink::start() {
     // stale -- adoptInbound()'s `if (!m_sig)` guard then skips adoption, the sink believes it is already the
     // ACCEPTOR, and the next DISCOVER is answered to a dead channel's remote cid (0x0000 once L2cap::begin()
     // has zeroed the table).  a2dpsink_test K4 is the regression.
-    m_avdtp.reset(); m_avrcp.reset(); m_mediaRemoteCid = 0; m_streamUp = false;
+    m_avdtp.reset(); m_avrcp.reset(); m_mediaRemoteCid = 0; m_avdtpUp = false; m_streamUp = false;
     m_link.ackLost(); m_link.ackInboundUp(); m_delaySent = false; m_result = PENDING;
     m_opIssued = m_link.startPair(true); m_st = PAIRING; return true;
 }
@@ -63,7 +69,7 @@ void A2dpSink::stop() { m_result = STOPPED; m_st = DISCONNECTING; }
 void A2dpSink::tick(uint32_t now) {
     m_link.tick(now);
     if (m_st != IDLE && m_st != DONE && m_st != DISCONNECTING && m_link.lost()) {
-        m_link.ackLost(); m_avdtp.reset(); m_avrcp.reset(); m_l2.reset(); m_mediaRemoteCid = 0; m_streamUp = false;
+        m_link.ackLost(); m_avdtp.reset(); m_avrcp.reset(); m_l2.reset(); m_mediaRemoteCid = 0; m_avdtpUp = false; m_streamUp = false;
         logf("sink: link lost reason=0x%02X", m_link.lostReason()); m_result = LOST; m_st = DONE; return;
     }
     switch (m_st) {
@@ -83,7 +89,9 @@ void A2dpSink::tick(uint32_t now) {
     case AVDTP:
         m_avdtp.adoptInbound(m_l2);
         if (m_avdtp.configChanged()) adoptConfig();
-        if (m_avdtp.started()) { m_result = OK; m_st = STREAMING; logf("sink: streaming bitpool=%u", m_params.bitpool); break; }
+        // m_streamUp latches HERE -- on the sink's OWN transition to STREAMING -- and nowhere else: it is what
+        // tells streamClosed() apart from an abort that never got this far.
+        if (m_avdtp.started()) { m_result = OK; m_st = STREAMING; m_streamUp = true; logf("sink: streaming bitpool=%u", m_params.bitpool); break; }
         if (streamClosed()) break;
         if (m_avdtp.state() == Avdtp::FAILED || (int32_t)(now - m_deadline) >= 0) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; }
         break;

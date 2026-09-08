@@ -69,7 +69,14 @@ void Avdtp::adoptInbound(L2cap &l) {
         if (c) { m_l2 = &l; m_sig = const_cast<L2cap::Channel *>(c); m_sigCid = c->localCid; m_role = ACCEPTOR; m_state = IDLE; }
         return;
     }
-    if (m_role == ACCEPTOR && m_state == OPENING && !m_media) {  // the peer's SECOND AVDTP channel is media
+    // The peer's SECOND AVDTP channel is media.  Adoption is allowed at OPENING *and after* -- NOT only while
+    // OPENING -- because the channel's own L2CAP config completes on the peer's clock, not ours: a media channel
+    // that reaches OPEN inside the same tick's l2.service() (i.e. AFTER this call) while a START is already
+    // recorded is answered by that same tick's avdtp.service(), which moves us to STREAMING.  Gated on OPENING
+    // the window then closed forever: mediaRemoteCid() stayed 0, the stream reported STREAMING, and every RTP
+    // packet missed the media route and was offered to onSignalling() as a peer command (avdtp_test B9,
+    // a2dpsink_test K8).  FAILED is excluded: a dead attempt adopts nothing.
+    if (m_role == ACCEPTOR && m_state >= OPENING && m_state != FAILED && !m_media) {
         const L2cap::Channel *c = l.nextInbound(PSM, m_sig);
         if (c) { m_media = const_cast<L2cap::Channel *>(c); m_mediaCid = c->localCid; }
     }

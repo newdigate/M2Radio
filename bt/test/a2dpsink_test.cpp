@@ -345,5 +345,50 @@ int main() {
         CHECK(sink.result() == A2dpSink::STOPPED && sink.state() == A2dpSink::DONE);
         CHECK(r.io.count(0x0406) == 1);
     }
+    {   // K7. A CLOSE/ABORT that arrives BEFORE the stream ever started is a FAILED attempt, not a completed
+        //     session.  m_streamUp used to latch the moment Avdtp left IDLE -- which is the SET_CONFIGURATION
+        //     accept, three commands before START -- so an ABORT during CONFIGURING ended the attempt
+        //     result=OK and logged "sink: stream closed", and BtSinkSession counted `closed++` for a session
+        //     that never played a sample.  The latch is now the sink's OWN transition to STREAMING.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        r.bringToConfigured(sink, 0x21);                                           // SET_CONFIGURATION ACCEPTed; no OPEN, no START
+        CHECK(sink.avdtp().state() != Avdtp::IDLE && sink.state() == A2dpSink::AVDTP);
+        r.peerAvdtp({ 0x60, 0x0A, 1 << 2 });                                       // ABORT
+        CHECK(r.lastAvdtp()[0] == 0x62 && r.lastAvdtp()[1] == 0x0A);               // ... ACCEPTed
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));
+        CHECK(sink.state() == A2dpSink::DONE);
+        CHECK(sink.result() == A2dpSink::AVDTP_FAILED);                            // RED before the fix: OK
+        CHECK(logCount("stream closed") == 0);                                     // RED before the fix: 1
+        CHECK(logCount("aborted before start") == 1);
+    }
+    {   // K8. The media channel opens LATE, in the SAME tick that answers START.  Its CONN_REQ, its config
+        //     exchange and the peer's START are all fed before one step(): the channel only reaches OPEN inside
+        //     that tick's l2.service() -- AFTER adoptInbound has already run and found nothing -- and the same
+        //     tick's avdtp.service() answers the START and goes STREAMING.  Adoption used to be gated on
+        //     Avdtp::OPENING, so mediaRemoteCid() stayed 0 forever: the sink reports STREAMING while every RTP
+        //     packet misses the media route, falls through to onSignalling() and earns a General Reject.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        r.bringToConfigured(sink, 0x21);
+        r.peerAvdtp({ 0x40, 0x06, 1 << 2 });                                       // OPEN -> Avdtp OPENING
+        CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x06; }, 200));
+        r.feed(0x0001, { 0x02, r.sigId++, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); r.step();   // media CONN_REQ -> channel exists, CONFIG
+        L2cap::Channel *m = sink.l2().byRemote(0x00C1); CHECK(m != nullptr);
+        uint16_t mc = m ? m->localCid : 0;
+        r.feed(0x0001, { 0x04, r.sigId++, 8, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        r.feed(0x0001, { 0x05, r.sigId++, 6, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0, 0 });
+        r.feed(r.sigLocal, { 0x50, 0x07, 1 << 2 });                                // START, recorded but not yet answered
+        r.step();                                                                   // the deciding tick
+        CHECK(r.runUntil([&] { return sink.state() == A2dpSink::STREAMING; }, 500));
+        CHECK(r.runUntil([&] { return sink.avdtp().mediaRemoteCid() == 0x00C1; }, 500));   // RED before the fix: 0 forever
+        CHECK(sink.mediaCid() == 0x00C1);
+        r.mediaLocal = mc;
+        static int calls = 0; calls = 0;
+        sink.onMedia([](void *, const uint8_t *, uint16_t) { calls++; }, nullptr);
+        size_t before = r.io.aclOut.size();
+        r.peerAcl(r.mediaCid(), { 0x80, 0x60, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x9C });
+        r.tick();
+        CHECK(calls == 1);                                                          // RED before the fix: 0
+        CHECK(!sawGeneralReject(r.io, before));                                     // RED before the fix: the RTP header answered as a command
+    }
     printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

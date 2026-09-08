@@ -451,5 +451,32 @@ int main() {
         CHECK(!sentDiscoverCmd);                         // an ACCEPTOR never initiates DISCOVER
         CHECK(a.role() == Avdtp::ACCEPTOR && a.state() == Avdtp::IDLE);
     }
+    {   // B9. The media channel opens LATE -- after the START that already took us to STREAMING.  adoptInbound()
+        //     used to adopt it only while m_state == OPENING, so a peer whose media channel reaches L2CAP OPEN
+        //     in the same pass that answers its START (the channel opens inside l2.service(), i.e. AFTER that
+        //     tick's adoptInbound, and avdtp.service() answers the START in the same tick) left mediaRemoteCid()
+        //     at 0 FOREVER: the stream reports STREAMING, every RTP packet misses the media route and is offered
+        //     to onSignalling(), and no audio ever arrives.  Adoption is now allowed at or after OPENING.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }.data(), 14);
+        tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x06, 1 << 2 }.data(), 3); tick(l, a); drain(io);     // OPEN
+        CHECK(a.state() == Avdtp::OPENING);
+        a.adoptInbound(l);                                       // nothing to adopt yet: the media channel is still CONFIG
+        CHECK(a.mediaRemoteCid() == 0);
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); drain(io);     // START -> STREAMING
+        CHECK(a.state() == Avdtp::STREAMING && a.mediaRemoteCid() == 0);
+        // ... and only NOW does the peer's media channel reach OPEN.
+        feed(l, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); l.service();
+        const L2cap::Channel *m = l.byRemote(0x00C1); CHECK(m);
+        uint16_t mc = m ? m->localCid : 0;
+        feed(l, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(l, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0, 0 });
+        l.service(); a.adoptInbound(l); tick(l, a); drain(io);
+        CHECK(a.mediaRemoteCid() == 0x00C1);                     // RED before the fix: gated on m_state == OPENING
+        CHECK(a.state() == Avdtp::STREAMING);
+    }
     printf("avdtp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

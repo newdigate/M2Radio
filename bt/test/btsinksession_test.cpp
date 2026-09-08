@@ -53,6 +53,7 @@ static A2dpSink *g_sink = nullptr;
 static void evThunk(void *ctx, uint8_t code, const uint8_t *p, uint8_t len) { ((A2dpSink *)ctx)->onEvent(code, p, len); }
 static std::vector<std::string> g_log;
 static void logFn(void *, const char *line) { g_log.push_back(std::string(line)); }
+static int logCount(const char *needle) { int n = 0; for (auto &l : g_log) if (l.find(needle) != std::string::npos) n++; return n; }
 // The phone that pages us -- an address the sink has never met (acceptUnknown is what lets a stranger in).
 static const uint8_t PHONE[6] = { 0x76, 0x1A, 0x7E, 0x8A, 0x0C, 0x00 };     // 00:0C:8A:7E:1A:76, LE byte order
 static const uint8_t KEY[16] = { 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F };
@@ -254,6 +255,33 @@ int main() {
         CHECK(r.io.count(OP_SCAN) == scanWrites && r.session.state() == BtSinkSession::MANUAL);
         r.session.resume();
         CHECK(r.session.state() == BtSinkSession::LISTENING);
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 500));
+    }
+    {   // Q5. The SAME sequence as a2dpsink_test K7, through the session: the source configures us and then
+        //     ABORTs before START.  That is a FAILED attempt -- the session must report AVDTP_FAILED and count
+        //     a reject, never a `closed`, and go back to announcing itself.  Note what does NOT discriminate
+        //     here: rejects/closed read the same either way, because the session never left CONNECTING; the
+        //     teeth are the RESULT the attempt callback carries and the absence of a "stream closed" log.
+        Rig r; r.session.onStream(streamCb, nullptr); r.session.onAttempt(attemptCb, nullptr);
+        r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::CONNECTING; }, 1000));
+        r.peerAuthenticates();
+        CHECK(r.runUntil([&] { return r.sink.state() == A2dpSink::AVDTP_WAIT; }, 3000));
+        r.sigLocal = r.peerOpens(Avdtp::PSM, 0x00B0);
+        CHECK(r.runUntil([&] { return r.sink.avdtp().role() == Avdtp::ACCEPTOR; }, 500));
+        r.peerAvdtp({ 0x10, 0x01 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x01; }, 200));
+        r.peerAvdtp({ 0x20, 0x0C, 1 << 2 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x0C; }, 200));
+        r.peerAvdtp({ 0x30, 0x03, 1 << 2, 2 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 });
+        CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x03; }, 200));
+        r.peerAvdtp({ 0x40, 0x0A, 1 << 2 });                                        // ABORT, before OPEN and before START
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::LISTENING; }, 3000));
+        CHECK(r.session.stats().rejects == 1 && r.session.stats().closed == 0 && r.session.stats().links == 0);
+        CHECK(g_att.size() == 1 && g_att[0].r == A2dpSink::AVDTP_FAILED);           // RED before the fix: OK
+        CHECK(logCount("stream closed") == 0);                                      // RED before the fix: 1
+        CHECK(g_stream.empty());                                                    // it never streamed: no stream event either way
+        // ... and announcing again.  The SSP dance stored a bond, so page scan only (0x02), not 0x03.
+        CHECK(r.bonds.count() == 1);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 500));
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
