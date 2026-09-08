@@ -107,5 +107,7 @@ private:
     bool parseAcceptCfg(const uint8_t *p, uint16_t len, SbcConfig &c, uint8_t &badCat);
     // Returns false if L2cap's TXQ was full and the command was NOT queued -- callers must not advance
     // state on a false return (BT-1's stuck-credit disease: advancing while nothing reached the wire hangs forever).
-    bool send(const uint8_t *b, uint16_t n) { return m_l2->send(m_sig->remoteCid, b, n); }
+    // The null guard is not defensive dressing: reset() nulls BOTH of these while service() can still be
+    // reached with a flag armed, and "nothing reached the wire" is exactly what a false return means here.
+    bool send(const uint8_t *b, uint16_t n) { return m_l2 && m_sig && m_l2->send(m_sig->remoteCid, b, n); }
 };

@@ -48,6 +48,12 @@ void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
 }
 void Avdtp::reset() {
     m_state = IDLE; m_role = RNONE; m_media = nullptr; m_rspSeen = false; m_cfgChanged = false;
+    // The INITIATOR's pending kickoff dies with the attempt.  start() only ARMS the initial DISCOVER --
+    // service() is what sends it, and it retries while L2cap's TXQ is full -- so an attempt torn down
+    // between the two leaves this set while the channel binding below goes null: the next service() then
+    // sends through a nulled m_l2/m_sig, and once that is survivable the flag still leaks a DISCOVER
+    // COMMAND into the next attempt, from a side that has since become the ACCEPTOR (avdtp_test B8).
+    m_kickoff = false;
     // Clear the channel bindings too: after a teardown, a NEW inbound attempt through the same Avdtp must
     // re-adopt from scratch -- a stale m_sig makes adoptInbound()'s `if (!m_sig)` guard skip re-adoption
     // and the reconnect silently never becomes ACCEPTOR (found reviewing Task 5, needed by BtSession's reconnect).

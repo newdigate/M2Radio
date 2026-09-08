@@ -426,5 +426,30 @@ int main() {
         a.adoptInbound(l);                       // the peer AVDTP channel is still OPEN; re-adoption must succeed
         CHECK(a.role() == Avdtp::ACCEPTOR);
     }
+    {   // B8. reset() must also disarm the INITIATOR's pending kickoff.  start() only ARMS the initial DISCOVER
+        //     (service() is what puts it on the wire, retrying while L2cap's TXQ is full), so an attempt torn down
+        //     between the two left m_kickoff set while reset() nulled m_l2/m_sig -- the very next service() then
+        //     sent through a null L2cap.  With send() hardened that is no longer a wild write, and what remains is
+        //     just as wrong and now visible: the flag survives into the NEXT attempt, so a freshly adopted
+        //     ACCEPTOR opens by sending a DISCOVER *command* of its own at the source that is driving it.
+        CapIo io; L2cap l(io); Avdtp a;
+        openSignalling(io, l, a);                        // ... ends with start(): kickoff ARMED, nothing serviced yet
+        a.reset();
+        a.service();                                     // must not touch the nulled channel binding
+        l.allowPsm(Avdtp::PSM);
+        feed(l, 0x0001, { 0x02, 0x30, 4, 0, 0x19, 0x00, 0xC2, 0x00 }); l.service();     // the peer opens AVDTP at us
+        const L2cap::Channel *ch = l.byRemote(0x00C2); CHECK(ch);
+        uint16_t our = ch ? ch->localCid : 0;
+        feed(l, 0x0001, { 0x04, 0x31, 8, 0, (uint8_t)our, (uint8_t)(our >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(l, 0x0001, { 0x05, 0x32, 6, 0, (uint8_t)our, (uint8_t)(our >> 8), 0, 0, 0, 0 });
+        l.service(); a.adoptInbound(l); CHECK(a.role() == Avdtp::ACCEPTOR);
+        drain(io);
+        tick(l, a);
+        std::vector<std::vector<uint8_t> > o = drain(io);
+        bool sentDiscoverCmd = false;
+        for (auto &p : o) if (p.size() >= 2 && (p[0] & 0x03) == Avdtp::COMMAND && p[1] == 0x01) sentDiscoverCmd = true;
+        CHECK(!sentDiscoverCmd);                         // an ACCEPTOR never initiates DISCOVER
+        CHECK(a.role() == Avdtp::ACCEPTOR && a.state() == Avdtp::IDLE);
+    }
     printf("avdtp_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
