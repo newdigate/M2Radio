@@ -154,7 +154,91 @@ int main() {
             }
         printf("sbcdecoder_test: hostile headers cases=%d accepted=%d refused=%d (all returned)\n", cases, accepted, refused);
         CHECK(cases == 448);
-        CHECK(accepted > 0);        // the arm would be vacuous if every crafted frame were refused before the allocator
+        // EXACTLY 72, not merely "> 0": the arm is vacuous if every crafted frame is refused before the allocator,
+        // and a bound that only says "some got through" cannot tell a refusal that got STRICTER (a header check
+        // added in the wrong place) from one that got LOOSER.  Derivation, from decode()'s own two gates:
+        // parseHeader takes bitpool in [2, 16 * subbands * channels-in-group] capped at 250 -- 128 for MONO/DUAL,
+        // 250 for STEREO/JOINT -- and decode() then refuses anything but 8 subbands with LOUDNESS allocation.
+        // Of the sweep's bitpools { 2, 53, 128, 129, 200, 250, 255 }: MONO 3 and DUAL 3 (2/53/128), STEREO 6 and
+        // JOINT 6 (those plus 129/200/250) = 18 per block count, x 4 block counts (4/8/12/16) = 72.  The other
+        // 376 cases are the 4-subband and SNR halves plus the out-of-range bitpools, all refused, all returning.
+        CHECK(accepted == 72);
+    }
+    {   // 8. ENCODE-DIRECTION DIFFERENTIAL ORACLE: OUR encoder's bitstream, decoded by ffmpeg, against OUR OWN
+        //    decode of the same bytes -- the mirror of scenario 6, which only ever runs a FOREIGN encoder's
+        //    bitstream through our decoder.  Nothing else in this suite judges what we PUT ON THE WIRE: the
+        //    round trip in scenario 3 shares Sbc::allocateBits between both ends, so any encoder defect the
+        //    decoder inverts is invisible to it, and it feeds L[i] == R[i], which is degenerate for JOINT_STEREO
+        //    (every subband joins, and the difference channel is identically zero).  Broadband DECORRELATED
+        //    stereo noise -- two independent LCGs, so the per-channel scale factors genuinely differ -- is what
+        //    makes the sample field widths disagree when the bit allocation is wrong.  Run for BOTH STEREO and
+        //    JOINT_STEREO: joint is otherwise unpinned in either direction.
+        //    MEASURED against a channel-major leftover-bit distribution (the defect 7145030 fixed, reintroduced
+        //    on a scratch copy): STEREO 159/300 frames agreed at corr +0.8453, JOINT 0/300 at corr +0.5895,
+        //    worst sample difference ~31000 LSB -- both arms RED by name, and the JOINT one is the reading
+        //    nothing else in this tree produces.
+        //    Both decoders start from zeroed filterbank state, so sample 0 lines up with sample 0: no alignment
+        //    search, which is what makes "agrees within +-8 LSB" mean something.
+        if (system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+            printf("sbcdecoder_test: ffmpeg arms SKIPPED (no ffmpeg)\n");
+        } else {
+            static const int NF = 300;                                  // frames; 300 * 128 = 38400 samples per channel
+            static int16_t nzL[NF * 128], nzR[NF * 128];
+            uint32_t r0 = 0xC0FFEE11u, r1 = 0x5EED2222u;                // INDEPENDENT seeds: decorrelated L/R
+            for (int i = 0; i < NF * 128; i++) {
+                r0 = r0 * 1664525u + 1013904223u; r1 = r1 * 1664525u + 1013904223u;
+                nzL[i] = (int16_t)((int32_t)(r0 >> 16) - 32768) / 4;    // ~0.25 FS, like the anoisesrc a=0.25 reference
+                nzR[i] = (int16_t)((int32_t)(r1 >> 16) - 32768) / 4;
+            }
+            const Sbc::Mode modes[2] = { Sbc::STEREO, Sbc::JOINT_STEREO };
+            const char *names[2] = { "stereo", "joint" };
+            for (int mi = 0; mi < 2; mi++) {
+                Sbc::Params q = { Sbc::RATE_44100, modes[mi], 16, 8, Sbc::LOUDNESS, 53 };
+                Sbc enc; enc.begin(q); SbcDecoder dec;
+                static uint8_t bs[NF * 128]; size_t nb = 0;
+                static int16_t oL[NF * 128], oR[NF * 128];
+                bool encOk = true;
+                for (int fr = 0; fr < NF; fr++) {
+                    uint8_t f[160]; uint16_t n = enc.encode(nzL + fr * 128, nzR + fr * 128, f);
+                    if (!n || nb + n > sizeof bs) { encOk = false; break; }
+                    memcpy(bs + nb, f, n); nb += n;
+                    if (dec.decode(f, n, oL + fr * 128, oR + fr * 128) != n) { encOk = false; break; }
+                }
+                CHECK(encOk);
+                if (!encOk) continue;
+                char sbcPath[64], rawPath[64], cmd[256];
+                snprintf(sbcPath, sizeof sbcPath, "ffmpeg_ours_%s.sbc", names[mi]);
+                snprintf(rawPath, sizeof rawPath, "ffmpeg_ours_%s.raw", names[mi]);
+                FILE *w = fopen(sbcPath, "wb"); CHECK(w != NULL);
+                if (!w) continue;
+                fwrite(bs, 1, nb, w); fclose(w);
+                snprintf(cmd, sizeof cmd, "ffmpeg -v error -y -f sbc -i %s -f s16le -ac 2 -ar 44100 %s", sbcPath, rawPath);
+                int rc = system(cmd);
+                CHECK(rc == 0);                                          // ffmpeg REFUSING our bitstream is itself a failure
+                if (rc != 0) continue;
+                FILE *rf = fopen(rawPath, "rb"); CHECK(rf != NULL);
+                if (!rf) continue;
+                static int16_t ref[2 * NF * 128]; size_t nref = fread(ref, 2, sizeof ref / 2, rf); fclose(rf);
+                int agree = 0, worst = 0;
+                for (int fr = 0; fr < NF; fr++) {
+                    int fmax = 0;
+                    for (int i = 0; i < 128; i++) { size_t si = (size_t)fr * 128 + i; if (2 * si + 1 >= nref) break;
+                        int dl = abs((int)oL[si] - (int)ref[2 * si]), dr = abs((int)oR[si] - (int)ref[2 * si + 1]);
+                        if (dl > fmax) fmax = dl; if (dr > fmax) fmax = dr; }
+                    if (fmax <= 8) agree++; if (fmax > worst) worst = fmax;
+                }
+                double sxy = 0, sxx = 0, syy = 0;
+                for (size_t i = 0; i < (size_t)NF * 128 && 2 * i + 1 < nref; i++) {
+                    double x = oL[i], y = ref[2 * i]; sxy += x * y; sxx += x * x; syy += y * y;
+                    x = oR[i]; y = ref[2 * i + 1]; sxy += x * y; sxx += x * x; syy += y * y; }
+                double corr = (sxx > 0 && syy > 0) ? sxy / sqrt(sxx * syy) : 0.0;
+                printf("sbcdecoder_test: ours->ffmpeg %s frames=%d agree(+-8)=%d worst_abs_diff=%d corr=%+.4f\n",
+                       names[mi], NF, agree, worst, corr);
+                CHECK(nref >= (size_t)NF * 128);        // ffmpeg decoded every frame we wrote, not a truncated prefix
+                CHECK(agree * 100 >= NF * 99);          // >= 99 % of frames within +-8 LSB of ffmpeg's own decode
+                CHECK(corr >= 0.999);                   // POSITIVE: the polarity pin, not |corr|
+            }
+        }
     }
     printf("sbcdecoder_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
