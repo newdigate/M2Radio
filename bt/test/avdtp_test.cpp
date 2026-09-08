@@ -217,16 +217,61 @@ int main() {
         CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x02, 1 << 2 }));
         CHECK(a.state() == Avdtp::GETTING_CAPS);
     }
-    {   // S0. SOURCE personality (no setLocalSep): a SET_CONFIGURATION choosing FOUR subbands is accepted and ADOPTED
-        //     as four.  The source SEP advertises subbands 4 and 8 (caps byte 0xFF), so 4 is in spec here; the sink
-        //     personality refuses it in S2.  cie byte 1 = blocks(4 bits) | subbands(2 bits) | alloc(2 bits) =
-        //     0x10 (16 blocks) | 0x08 (4 subbands) | 0x01 (loudness) = 0x19.  Pins parseAcceptCfg's subband decode,
-        //     which compared the SHIFTED field against the UNSHIFTED 0x08 and so could only ever yield 8 (RED pre-fix).
+    {   // S0. SOURCE personality (no setLocalSep): the ENCODER (Sbc) is hard-wired to 16 blocks / 8 subbands /
+        //     LOUDNESS -- PROTO8, loops s < 8 and b < 16 -- so a SET_CONFIGURATION choosing anything else must be
+        //     REJECTED, not adopted.  Adopting it produced a self-inconsistent frame on the wire: the header
+        //     declared 4 subbands while encode() wrote 8 and frameLength() sized for 4.  Media Codec category
+        //     (0x07) with UNSUPPORTED_CONFIGURATION (0x29), the same pair the 48 kHz reject already uses.
+        //     cie byte 1 = blocks(4 bits) | subbands(2 bits) | alloc(2 bits).
         CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        // 0x10 (16 blocks) | 0x08 (4 subbands) | 0x01 (loudness) = 0x19
         a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x19, 0x02, 0x35 }.data(), 14);
         tick(l, a); auto o = drain(io);
-        CHECK(o.size() == 1 && eq(o[0], { 0x52, 0x03 }));                                 // bare ACCEPT: 4 subbands is in the source's caps
-        CHECK(a.configChanged() && a.sbcConfig().subbands == 4 && a.sbcConfig().blocks == 16);
+        CHECK(o.size() == 1 && eq(o[0], { 0x53, 0x03, 0x07, 0x29 }));                     // 4 subbands: rejected
+        CHECK(!a.configChanged() && a.state() != Avdtp::STREAMING);
+        // 0x40 (8 blocks) | 0x04 (8 subbands) | 0x01 (loudness) = 0x45
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x45, 0x02, 0x35 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x63, 0x03, 0x07, 0x29 }));                     // 8 blocks: rejected
+        CHECK(!a.configChanged() && a.state() != Avdtp::STREAMING);
+        // 0x10 (16 blocks) | 0x04 (8 subbands) | 0x02 (SNR) = 0x16 -- Sbc::begin forces LOUDNESS
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x16, 0x02, 0x35 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x73, 0x03, 0x07, 0x29 }));                     // SNR allocation: rejected
+        CHECK(!a.configChanged() && a.state() != Avdtp::STREAMING);
+        // ...and the one the encoder can actually serve (0x15) is still ACCEPTED and adopted.
+        a.onSignalling(std::vector<uint8_t>{ 0x80, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }.data(), 14);
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x82, 0x03 }));
+        CHECK(a.configChanged() && a.sbcConfig().subbands == 8 && a.sbcConfig().blocks == 16 && a.sbcConfig().alloc == Avdtp::LOUDNESS);
+    }
+    {   // S0b. ...and the SOURCE's advertised caps are NARROWED to match, so a conforming peer never chooses any
+        //      of those in the first place: caps byte 1 is 0x15 (16 blocks, 8 subbands, LOUDNESS) -- the same byte
+        //      the SINK personality advertises.  Byte 0 stays 0xFF: every rate and mode really is negotiable
+        //      (the initiator's own SET_CONFIGURATION picks 44.1 kHz, and parseAcceptCfg still refuses the rest).
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x01, 1 << 2, 0x00 }));                   // SEID 1, audio, SRC
+        a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x42, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0x15, 0x02, 0x35, 0x08, 0x00 }));
+    }
+    {   // S0c. sendDelayReport() is SINK-ONLY: a SOURCE-personality acceptor at STREAMING, with everything else
+        //      the guard could depend on satisfied, still refuses and sends nothing.  AVDTP 1.3 s8.19 makes
+        //      DelayReport a command FROM the sink; a source emitting one is out of spec.  Demonstrated RED by
+        //      deleting the `m_localSep != SEP_SINK` line in Avdtp::sendDelayReport.
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 }.data(), 16); tick(l, a); drain(io);
+        CHECK(a.peerWantsDelayReports());                                    // the source DID configure category 0x08
+        a.onSignalling(std::vector<uint8_t>{ 0x60, 0x06, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+        feed(l, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); l.service();
+        const L2cap::Channel *m = l.byRemote(0x00C1);
+        feed(l, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(l, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)m->localCid, (uint8_t)(m->localCid >> 8), 0, 0, 0, 0 });
+        l.service(); a.adoptInbound(l); tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); drain(io);
+        CHECK(a.started() && a.role() == Avdtp::ACCEPTOR);
+        CHECK(!a.sendDelayReport(1500)); tick(l, a); CHECK(drain(io).empty());
     }
     {   // S1. SINK personality: DISCOVER is answered with SEID 1, audio, SNK (TSEP bit set), and GET_ALL_CAPABILITIES
         //     with the SINK caps: 44.1 kHz only, all modes, 16 blocks only, 8 subbands only, LOUDNESS only, bitpool
@@ -293,11 +338,11 @@ int main() {
         // DISCOVER (peer tl 3) -> our one audio-SOURCE SEP, SEID 1
         a.onSignalling(std::vector<uint8_t>{ 0x30, 0x01 }.data(), 2); tick(l, a); auto o = drain(io);
         CHECK(o.size() == 1 && eq(o[0], { 0x32, 0x01, 1 << 2, 0x00 }));                 // ACCEPT: SEID 1, audio, SRC (in-use bit 0)
-        // GET_ALL_CAPABILITIES SEID 1 -> media transport + SBC caps (all modes, blocks 4..16, sub 4/8, bitpool 2..53) + delay reporting
+        // GET_ALL_CAPABILITIES SEID 1 -> media transport + SBC caps (all rates/modes; 16 blocks, 8 subbands, loudness; bitpool 2..53) + delay reporting
         a.onSignalling(std::vector<uint8_t>{ 0x40, 0x0C, 1 << 2 }.data(), 3); tick(l, a); o = drain(io);
         CHECK(o.size() == 1 && o[0][0] == 0x42 && o[0][1] == 0x0C);
         CHECK(o[0][2] == 0x01 && o[0][3] == 0x00 && o[0][4] == 0x07 && o[0][5] == 0x06 && o[0][6] == 0x00 && o[0][7] == 0x00);
-        CHECK(o[0][8] == 0xFF && o[0][9] == 0xFF && o[0][10] == 0x02 && o[0][11] == 0x35);   // rates/modes/blocks/sub/alloc all, bitpool 2..53
+        CHECK(o[0][8] == 0xFF && o[0][9] == 0x15 && o[0][10] == 0x02 && o[0][11] == 0x35);   // all rates/modes; 16 blocks, 8 subbands, loudness; bitpool 2..53
         // SET_CONFIGURATION at bitpool 35 (cie 21 15 02 23), acp seid 1, int seid 5 -> ACCEPT, config adopted
         a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x23 }.data(), 14);
         tick(l, a); o = drain(io);

@@ -62,7 +62,12 @@ public:
     // A SOURCE pages a sink it already knows; a SINK is the one being found, so it must announce
     // WHAT it is (Class_of_Device), WHO it is (Local_Name), be INQUIRY-scannable, and accept a page
     // from a phone it has never met.  All three are opt-in: unset, the wire sequence is unchanged.
-    void setIdentity(uint32_t cod, const char *name) { m_cod = cod; m_name = name; }   // written by PREPARE (0 / null = not written)
+    // `name` is BORROWED, not copied: BtLink stores the pointer and dereferences it later, from the PREPARE
+    // operation's own steps (Write_Local_Name and the log line after it), so the storage must OUTLIVE the link --
+    // a string literal or a static buffer, never a stack local of the caller.  Only the value in place when
+    // startPrepare() runs reaches the controller: PREPARE is once per session, so setting it afterwards changes
+    // nothing on the wire (and leaves a dangling read if the old storage went away).  0 / null = not written.
+    void setIdentity(uint32_t cod, const char *name) { m_cod = cod; m_name = name; }
     void wantDiscoverable(bool on) { m_wantInqScan = on; }     // adds INQUIRY scan (0x01) to Write_Scan_Enable
     void acceptUnknown(bool on) { m_acceptUnknown = on; }      // accept an incoming page from an UNBONDED address (a sink pairs strangers)
 
