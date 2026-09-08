@@ -22,4 +22,9 @@ struct Sdp {
     // a transaction id to answer).  Never writes past outMax.
     static uint16_t serve(const uint8_t *req, uint16_t len, uint16_t mtu, uint8_t *out, uint16_t outMax);
     static const uint32_t RECORD_HANDLE = 0x00010000;
+    // NEW-41: a device is a SOURCE or a SINK here, never both -- setRole(SINK) publishes the AudioSink record (0x110B)
+    // INSTEAD of the AudioSource one.  The AVRCP Target record is served in both roles.
+    enum Role : uint8_t { SOURCE, SINK };
+    static void setRole(Role r);
+    static Role role();
 };
