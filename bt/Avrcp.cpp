@@ -36,8 +36,9 @@ uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t o
         return 15;
     }
     // GetCapabilities (PDU 0x10, STATUS ctype, one parameter byte): the Shokz sends it BEFORE registering (measured
-    // 2026-09-07, arm 4: 10 11 0E 01 48 00 00 19 58 10 00 00 01 03).  EVENTS_SUPPORTED (0x03) -> STABLE with the one
-    // event this target raises, PLAYBACK_STATUS_CHANGED; COMPANY_ID (0x02) -> STABLE with the Bluetooth SIG id.
+    // 2026-09-07, arm 4: 10 11 0E 01 48 00 00 19 58 10 00 00 01 03).  EVENTS_SUPPORTED (0x03) -> STABLE with the two
+    // events this target raises, PLAYBACK_STATUS_CHANGED and VOLUME_CHANGED (see the reply below -- absolute volume
+    // added the second one); COMPANY_ID (0x02) -> STABLE with the Bluetooth SIG id.
     if (alen >= 11 && ctype == CTYPE_STATUS && avc[2] == OP_VENDOR && avc[3] == 0x00 && avc[4] == 0x19 && avc[5] == 0x58
         && avc[6] == PDU_GET_CAPABILITIES && avc[8] == 0x00 && avc[9] == 0x01 && (avc[10] == CAP_EVENTS_SUPPORTED || avc[10] == CAP_COMPANY_ID)) {
         out[0] = (uint8_t)((h & 0xF0) | 0x02); out[1] = c[1]; out[2] = c[2];
