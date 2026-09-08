@@ -182,6 +182,41 @@ int main() {
         CHECK(o.size() == 1 && eq(o[0], { 0x30, 0x03, 1 << 2, 1 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }));
         CHECK(!a.caps().delayReporting);
     }
+    {   // 8. An AVDTP 1.2 sink (Bose Mini SoundLink, silicon 2026-09-08) answers GET_ALL_CAPABILITIES (0x0C, AVDTP 1.3)
+        //    with the LEGACY two-byte General Reject [tl<<4 | 00][00].  The initiator must fall back to GET_CAPABILITIES
+        //    (0x02) for the SAME SEID and carry on; before the fix it read the reply as a peer COMMAND (signal 0), sent
+        //    a General Reject back, the Bose rejected THAT with BAD_HEADER_FORMAT, and both sides sat out the 15 s deadline.
+        CapIo io; L2cap l(io); Avdtp a; openSignalling(io, l, a);
+        tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x10, 0x01 }));
+        a.onSignalling(std::vector<uint8_t>{ 0x12, 0x01, 0x04, 0x08 }.data(), 4);                   // one audio SNK SEP, SEID 1
+        tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x0C, 1 << 2 }));                                    // version unknown: 0x0C first
+        a.onSignalling(std::vector<uint8_t>{ 0x20, 0x00 }.data(), 2); tick(l, a); o = drain(io);    // the Bose's reply, verbatim
+        CHECK(o.size() == 1 && eq(o[0], { 0x30, 0x02, 1 << 2 }));                                    // fell back to GET_CAPABILITIES, next tl
+        CHECK(a.state() == Avdtp::GETTING_CAPS);
+        static const uint8_t caps[12] = { 0x32, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35 };
+        a.onSignalling(caps, 12); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x40, 0x03, 1 << 2, 1 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35 }));   // SET_CONFIGURATION, no delay reporting
+        CHECK(a.state() == Avdtp::CONFIGURING && !a.caps().delayReporting);
+    }
+    {   // 8b. The same, with the AVDTP 1.3 form of General Reject (message type 01) -- a conforming pre-1.3 sink.
+        CapIo io; L2cap l(io); Avdtp a; openSignalling(io, l, a);
+        tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x12, 0x01, 0x04, 0x08 }.data(), 4); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x0C, 1 << 2 }));
+        a.onSignalling(std::vector<uint8_t>{ 0x21, 0x0C }.data(), 2); tick(l, a); o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x30, 0x02, 1 << 2 }));
+    }
+    {   // 9. When SDP already told us the sink speaks AVDTP < 1.3, ask GET_CAPABILITIES (0x02) FIRST -- no reject round trip.
+        //    (>= 1.3, or unknown/0, keeps 0x0C -- the Shokz path of scenario 4 is unchanged.)
+        CapIo io; L2cap l(io); Avdtp a; a.setPeerVersion(0x0102);          // A2dpSource sets it BEFORE start(), as here
+        openSignalling(io, l, a);
+        tick(l, a); drain(io);
+        a.onSignalling(std::vector<uint8_t>{ 0x12, 0x01, 0x04, 0x08 }.data(), 4); tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x02, 1 << 2 }));
+        CHECK(a.state() == Avdtp::GETTING_CAPS);
+    }
     {   // B1. ACCEPTOR: the peer drives DISCOVER/GET_ALL_CAPABILITIES/SET_CONFIGURATION/OPEN/START and we
         //     answer from our source SEP; the adopted config is what sbcConfig() reports.
         CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);

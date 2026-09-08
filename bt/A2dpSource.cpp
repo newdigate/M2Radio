@@ -122,11 +122,11 @@ void A2dpSource::tick(uint32_t now) {
             L2cap::Channel *sig = m_l2.connect(Avdtp::PSM, 0x0041);             // peer never opened AVDTP: initiate ourselves
             if (!sig) { m_result = L2CAP_FAILED; m_st = DISCONNECTING; break; }
             Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
-            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
+            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.setPeerVersion(m_sdpVer); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
         }
         if (m_sigChan && m_sigChan->state == L2cap::OPEN) {                      // outbound: our signalling channel is up -> initiate
             Avdtp::SbcConfig want = { 44100, Avdtp::JOINT_STEREO, 16, 8, Avdtp::LOUDNESS, 2, 53 };
-            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
+            m_avdtp.begin(m_l2, 0x0041, 0x0042); m_avdtp.setPeerVersion(m_sdpVer); m_avdtp.start(want); m_st = AVDTP; m_deadline = now + 15000; break;
         }
         if ((int32_t)(now - m_deadline) < 0) return;
         m_result = L2CAP_FAILED; m_st = DISCONNECTING; break;

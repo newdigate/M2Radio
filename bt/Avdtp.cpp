@@ -68,7 +68,8 @@ void Avdtp::adoptInbound(L2cap &l) {
     }
 }
 bool Avdtp::start(const SbcConfig &want) { m_sig = m_l2->byLocal(m_sigCid); if (!m_sig || m_sig->state != L2cap::OPEN) return false;
-    m_want = want; m_state = DISCOVERING; m_rspSeen = false; m_kickoff = true; m_role = INITIATOR; return true; }
+    m_want = want; m_state = DISCOVERING; m_rspSeen = false; m_kickoff = true; m_role = INITIATOR;
+    m_capSig = (m_peerVer && m_peerVer < 0x0103) ? 0x02 : 0x0C; return true; }
 void Avdtp::startSelf() {
     uint8_t b[4]; uint16_t n = buildStart(b, (uint8_t)(m_tl + 1), OUR_SEID);
     if (send(b, n)) { m_tl++; m_state = STARTING; }
@@ -117,6 +118,14 @@ bool Avdtp::parseAcceptCfg(const uint8_t *p, uint16_t len, SbcConfig &c, uint8_t
 }
 void Avdtp::onSignalling(const uint8_t *p, uint16_t len) {
     if (len < 1) return;
+    // A General Reject of OUR outstanding command: the AVDTP 1.3 form (message type 01, [hdr][signal]) or the legacy
+    // two-byte form some 1.2 sinks send ([tl<<4 | 00][00] -- message type "command", signal id 0, which no real
+    // command carries; the Bose Mini SoundLink answers GET_ALL_CAPABILITIES this way).  Recorded as a response so
+    // service() can fall back, never as a peer command to reject.
+    if ((p[0] >> 4) == (m_tl & 0x0F) && len == 2 &&
+        (responseType(p[0]) == GENERAL_REJECT || (responseType(p[0]) == COMMAND && p[1] == 0x00))) {
+        m_rsp[0] = (uint8_t)((p[0] & 0xF0) | GENERAL_REJECT); m_rsp[1] = p[1]; m_rspLen = 2; m_rspSeen = true; return;
+    }
     if (responseType(p[0]) == COMMAND) {                     // the PEER's own command: recorded here, answered in service()
         if (len < 2) return;
         uint8_t sig = p[1];
@@ -180,20 +189,28 @@ void Avdtp::service() {
         return;
     }
     if (!m_rspSeen) return; m_rspSeen = false;
-    if (responseType(m_rsp[0]) != ACCEPT) { m_err = rejectError(m_rsp, m_rspLen); m_state = FAILED; return; }
     uint8_t b[16];
+    if (responseType(m_rsp[0]) != ACCEPT) {
+        if (m_state == GETTING_CAPS && m_capSig == 0x0C && responseType(m_rsp[0]) == GENERAL_REJECT) {
+            // a pre-1.3 sink refused GET_ALL_CAPABILITIES: ask GET_CAPABILITIES for this SEP, and for every later one
+            m_capSig = 0x02; uint16_t n2 = buildGetCapabilities(b, (uint8_t)(m_tl + 1), m_acp);
+            if (send(b, n2)) m_tl++; else m_rspSeen = true;
+            return;
+        }
+        m_err = rejectError(m_rsp, m_rspLen); m_state = FAILED; return;
+    }
     switch (m_state) {
     case DISCOVERING: { Sep s[4]; uint8_t n = parseDiscover(m_rsp, m_rspLen, s, 4); m_nCand = 0;
         for (uint8_t i = 0; i < n; i++) if (s[i].audio && s[i].sink && !s[i].inUse && m_nCand < 4) m_cand[m_nCand++] = s[i].seid;
         if (!m_nCand) { m_err = 0xFF; m_state = FAILED; return; }
         m_candIdx = 0; m_acp = m_cand[0];
-        uint16_t n2 = buildGetAllCapabilities(b, (uint8_t)(m_tl + 1), m_acp);
+        uint16_t n2 = buildCaps(b, (uint8_t)(m_tl + 1), m_acp);
         if (send(b, n2)) { m_tl++; m_state = GETTING_CAPS; } else m_rspSeen = true; } break;   // retry: re-parse m_rsp next tick (idempotent)
     case GETTING_CAPS: {
         if (!parseSbcCaps(m_rsp, m_rspLen, m_caps)) {         // this SEP is not SBC (e.g. the Shokz's MPEG SEP): ask the next one
             uint8_t next = (uint8_t)(m_candIdx + 1);
             if (next >= m_nCand) { m_err = 0xFE; m_state = FAILED; return; }
-            uint16_t n2 = buildGetAllCapabilities(b, (uint8_t)(m_tl + 1), m_cand[next]);
+            uint16_t n2 = buildCaps(b, (uint8_t)(m_tl + 1), m_cand[next]);
             if (send(b, n2)) { m_tl++; m_candIdx = next; m_acp = m_cand[next]; } else m_rspSeen = true;   // idx moves only once sent
             break; }
         uint16_t n2 = buildSetConfiguration(b, (uint8_t)(m_tl + 1), m_acp, 1, m_want, m_caps.delayReporting);

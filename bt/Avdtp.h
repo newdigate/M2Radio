@@ -50,6 +50,9 @@ struct Avdtp {
     void startSelf();                                    // we (acceptor) issue START ourselves; moves to STARTING
     void begin(L2cap &l2, uint16_t sigLocalCid, uint16_t mediaLocalCid);
     bool start(const SbcConfig &want);        // kick off: DISCOVER on the (already OPEN) signalling channel
+    // The sink's AVDTP version from its SDP AudioSink record (0 = unknown).  < 1.3 asks GET_CAPABILITIES (0x02) instead
+    // of GET_ALL_CAPABILITIES (0x0C); either way a General Reject of 0x0C falls back to 0x02 (Bose Mini SoundLink, 2026-09-08).
+    void setPeerVersion(uint16_t v) { m_peerVer = v; }
     void onSignalling(const uint8_t *p, uint16_t len);   // from the L2cap data callback, signalling channel (record only)
     void service();                            // main context: advance the state machine, send commands
     State state() const { return m_state; } uint8_t error() const { return m_err; } const SbcCaps &caps() const { return m_caps; }
@@ -60,6 +63,8 @@ struct Avdtp {
 private:
     L2cap *m_l2 = nullptr; L2cap::Channel *m_sig = nullptr, *m_media = nullptr; uint16_t m_sigCid = 0, m_mediaCid = 0;
     State m_state = IDLE; uint8_t m_tl = 1, m_acp = 0, m_err = 0; SbcConfig m_want; SbcCaps m_caps;
+    uint16_t m_peerVer = 0; uint8_t m_capSig = 0x0C;   // which capability command this attempt uses (see setPeerVersion)
+    uint16_t buildCaps(uint8_t *o, uint8_t tl, uint8_t seid) { return m_capSig == 0x02 ? buildGetCapabilities(o, tl, seid) : buildGetAllCapabilities(o, tl, seid); }
     // 172: big enough for a GET_CAPABILITIES reply carrying every AVDTP service category, not just MEDIA_CODEC.
     volatile bool m_rspSeen = false; uint8_t m_rsp[172]; uint16_t m_rspLen = 0; bool m_peerDiscover = false; uint8_t m_peerHdr = 0;
     volatile uint16_t m_peerDelay = 0;

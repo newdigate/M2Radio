@@ -42,6 +42,9 @@ public:
     enum Op : uint8_t { NONE, PREPARE, INQUIRY, PAGE, PAIR, DISCONNECT };
     void begin(uint32_t now);                      // reset op/scan state (call once per session; safe to re-call)
     bool startPrepare();                           // Set_Event_Mask/Write_SSP_Mode/Write_Page_Timeout, once per session
+    // Inquiry access code: GIAC 0x9E8B33 (general, the default) or LIAC 0x9E8B00 (limited -- some sinks answer ONLY
+    // this while in pairing mode).  Bench knob; set before startInquiry()/the session's boot walk.
+    void setInquiryLap(uint32_t lap) { m_lap = lap; }
     bool startInquiry(const char *nameSubstr);     // returns false if an op is already running
     bool startPage(const uint8_t bd[6], uint8_t psrm, uint16_t clk, bool clkValid, const char *name, uint8_t attempts);
     bool startPair(bool inbound);
@@ -111,6 +114,7 @@ private:
     Op m_op = NONE; Result m_result = OK; uint8_t m_sub = 0; uint32_t m_deadline = 0;
     bool m_cmdBusy = false; Hci::Error m_cmdErr = Hci::OK; Hci::Reply m_cmdReply{};
     uint8_t m_attempt = 0, m_attempts = 0; bool m_pairInbound = false; uint8_t m_hitIdx = 0;
+    uint32_t m_lap = 0x9E8B33;
     const char *m_inqFilter = nullptr;
     bool m_clkValid = false;
     // page-scan side channel.  m_scanKnown starts TRUE: the post-Reset controller has scanning

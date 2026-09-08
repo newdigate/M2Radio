@@ -219,9 +219,9 @@ void BtLink::tickPrepare(uint32_t now) {
 // --- INQUIRY: Inquiry -> field-major Inquiry Result (via onEvent) -> per-hit Remote_Name_Request
 // -> choose the target.  Ported from probeInquiry() + the target-choice head of probeConnect(). ---
 void BtLink::tickInquiry(uint32_t now) {
-    if (m_sub == 0) {                                         // issue Inquiry (GIAC, 12.8 s, unlimited)
+    if (m_sub == 0) {                                         // issue Inquiry (m_lap: GIAC by default, 12.8 s, unlimited)
         m_nHits = 0; m_target = -1; m_inqComplete = false;
-        const uint8_t params[5] = { 0x33, 0x8B, 0x9E, 0x0A, 0x00 };
+        const uint8_t params[5] = { (uint8_t)m_lap, (uint8_t)(m_lap >> 8), (uint8_t)(m_lap >> 16), 0x0A, 0x00 };   // LAP LE, 12.8 s, unlimited
         if (!issue(OP_INQUIRY, params, sizeof params)) return;
         m_sub = 1; return;
     }
