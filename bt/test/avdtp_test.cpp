@@ -217,6 +217,17 @@ int main() {
         CHECK(o.size() == 1 && eq(o[0], { 0x20, 0x02, 1 << 2 }));
         CHECK(a.state() == Avdtp::GETTING_CAPS);
     }
+    {   // S0. SOURCE personality (no setLocalSep): a SET_CONFIGURATION choosing FOUR subbands is accepted and ADOPTED
+        //     as four.  The source SEP advertises subbands 4 and 8 (caps byte 0xFF), so 4 is in spec here; the sink
+        //     personality refuses it in S2.  cie byte 1 = blocks(4 bits) | subbands(2 bits) | alloc(2 bits) =
+        //     0x10 (16 blocks) | 0x08 (4 subbands) | 0x01 (loudness) = 0x19.  Pins parseAcceptCfg's subband decode,
+        //     which compared the SHIFTED field against the UNSHIFTED 0x08 and so could only ever yield 8 (RED pre-fix).
+        CapIo io; L2cap l(io); Avdtp a; openInboundSignalling(io, l, a);
+        a.onSignalling(std::vector<uint8_t>{ 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x19, 0x02, 0x35 }.data(), 14);
+        tick(l, a); auto o = drain(io);
+        CHECK(o.size() == 1 && eq(o[0], { 0x52, 0x03 }));                                 // bare ACCEPT: 4 subbands is in the source's caps
+        CHECK(a.configChanged() && a.sbcConfig().subbands == 4 && a.sbcConfig().blocks == 16);
+    }
     {   // S1. SINK personality: DISCOVER is answered with SEID 1, audio, SNK (TSEP bit set), and GET_ALL_CAPABILITIES
         //     with the SINK caps: 44.1 kHz only, all modes, 16 blocks only, 8 subbands only, LOUDNESS only, bitpool
         //     2..53, delay reporting -- byte for byte.  GET_CAPABILITIES (1.2 sources) gets the same without delay reporting.
@@ -257,11 +268,18 @@ int main() {
         l.service(); a.adoptInbound(l); tick(l, a); drain(io);
         a.onSignalling(std::vector<uint8_t>{ 0x70, 0x07, 1 << 2 }.data(), 3); tick(l, a); drain(io); CHECK(a.started());
         CHECK(a.sendDelayReport(1500)); tick(l, a); auto o = drain(io);                       // 150.0 ms
-        CHECK(o.size() == 1 && o[0].size() == 5 && o[0][1] == 0x0D && o[0][2] == (1 << 2) && o[0][3] == 0x05 && o[0][4] == 0xDC && (o[0][0] & 0x03) == 0);
+        // The SEID field is the ACP SEID OF THIS COMMAND -- the SOURCE's endpoint (AVDTP 1.3 s8.19), which arrived as the
+        // INT SEID of its SET_CONFIGURATION above (5), NOT our own SEID 1.
+        CHECK(o.size() == 1 && o[0].size() == 5 && o[0][1] == 0x0D && o[0][2] == (5 << 2) && o[0][3] == 0x05 && o[0][4] == 0xDC && (o[0][0] & 0x03) == 0);
         uint8_t tl = (o.size() == 1 && !o[0].empty()) ? (uint8_t)(o[0][0] >> 4) : 0;          // (fail, never crash: a mutant that sends nothing)
         a.onSignalling(std::vector<uint8_t>{ (uint8_t)((tl << 4) | 0x02), 0x0D }.data(), 2); tick(l, a); o = drain(io);
         CHECK(o.empty() && a.state() == Avdtp::STREAMING);                                   // ACCEPT consumed, nothing sent, still streaming
-        CHECK(!a.sendDelayReport(1500) || true);                                              // (a second report is allowed; not asserted)
+        CHECK(a.sendDelayReport(1500)); tick(l, a); o = drain(io);                            // a second report, once the first was answered
+        // ...which this source REJECTS (error 0x00): counted, consumed, and the stream carries on -- a source that
+        // will not take delay reports still plays the media, so a REJECT must not reach the state machine as one.
+        uint8_t tl2 = (o.size() == 1 && !o[0].empty()) ? (uint8_t)(o[0][0] >> 4) : 0;
+        a.onSignalling(std::vector<uint8_t>{ (uint8_t)((tl2 << 4) | 0x03), 0x0D, 0x00 }.data(), 3); tick(l, a); o = drain(io);
+        CHECK(o.empty() && a.delayRejects() == 1 && a.state() == Avdtp::STREAMING);
     }
     {   // S4. Without delay reporting configured, sendDelayReport() refuses (returns false, sends nothing).
         CapIo io; L2cap l(io); Avdtp a; a.setLocalSep(Avdtp::SEP_SINK); openInboundSignalling(io, l, a);

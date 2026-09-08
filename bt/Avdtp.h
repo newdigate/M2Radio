@@ -29,7 +29,6 @@ struct Avdtp {
     static uint16_t buildSetConfiguration(uint8_t *o, uint8_t tl, uint8_t acpSeid, uint8_t intSeid, const SbcConfig &c, bool delayReporting = false);
     static uint16_t buildOpen(uint8_t *o, uint8_t tl, uint8_t acpSeid);
     static uint16_t buildStart(uint8_t *o, uint8_t tl, uint8_t acpSeid);
-    static uint16_t buildDiscoverAcceptOneSource(uint8_t *o, uint8_t hdrFromPeer); // answers a peer's DISCOVER: SEID 1, audio, SRC
     static MsgType  responseType(uint8_t hdr) { return (MsgType)(hdr & 0x03); }
     static uint8_t  rejectError(const uint8_t *p, uint16_t len);          // last byte of a REJECT
     static uint8_t  parseDiscover(const uint8_t *p, uint16_t len, Sep *out, uint8_t max);
@@ -42,9 +41,12 @@ struct Avdtp {
     enum LocalSep : uint8_t { SEP_SOURCE, SEP_SINK };
     void setLocalSep(LocalSep s) { m_localSep = s; }
     bool peerWantsDelayReports() const { return m_peerDelayCfg; }   // the peer's SET_CONFIGURATION carried category 0x08
-    // Acceptor with delay reporting configured: send a DelayReport (0.1 ms units) for our SEP.  false if not STREAMING /
-    // not configured for it / TXQ full.  The source's ACCEPT is consumed by onSignalling (it matches m_tl) and ignored.
+    // Acceptor with delay reporting configured: send a DelayReport (0.1 ms units).  false unless we ARE the sink
+    // (SEP_SINK) and STREAMING with category 0x08 configured, or if the TXQ is full.  onSignalling() only RECORDS
+    // the source's answer (it matches m_tl, so it lands as a response); service() is what consumes it -- an ACCEPT
+    // silently, a REJECT into delayRejects().
     bool sendDelayReport(uint16_t tenthMs);
+    uint32_t delayRejects() const { return m_delayRejects; }   // DelayReports of ours the source REJECTED (diagnosis only)
     Role role() const { return m_role; }
     void reset();                                        // back to IDLE, RNONE, media released
     void adoptInbound(L2cap &l);                         // find our peer-initiated signalling channel (and later media) from L2cap
@@ -89,6 +91,10 @@ private:
     LocalSep m_localSep = SEP_SOURCE;   // identity: set once by the app, NOT cleared by begin()/reset()
     bool m_peerDelayCfg = false;        // the peer's SET_CONFIGURATION carried service category 0x08
     bool m_delayRptOut = false;         // a DelayReport of ours is outstanding: its ACCEPT is consumed in service()
+    uint32_t m_delayRejects = 0;        // how many of ours the source rejected
+    // The SOURCE's endpoint id, taken from the INT SEID of its SET_CONFIGURATION: the ACP SEID our DelayReport
+    // COMMAND must carry (AVDTP 1.3 s8.19 -- a command names the RECEIVER's endpoint, not the sender's).
+    uint8_t m_peerIntSeid = 0;
     // peer-command recording for the FULL acceptor (beyond m_peerDiscover/m_peerDelayRpt/m_peerReject):
     bool m_peerCaps = false;    uint8_t m_peerCapsHdr = 0, m_peerCapsSeid = 0, m_peerCapsSig = 0;
     bool m_peerSetCfg = false;  uint8_t m_peerSetHdr = 0; uint8_t m_peerSetPl[20]; uint16_t m_peerSetLen = 0;

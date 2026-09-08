@@ -19,7 +19,6 @@ uint16_t Avdtp::buildSetConfiguration(uint8_t *o, uint8_t tl, uint8_t acp, uint8
 }
 uint16_t Avdtp::buildOpen(uint8_t *o, uint8_t tl, uint8_t s)  { o[0] = hdr(tl, COMMAND); o[1] = 0x06; o[2] = (uint8_t)(s << 2); return 3; }
 uint16_t Avdtp::buildStart(uint8_t *o, uint8_t tl, uint8_t s) { o[0] = hdr(tl, COMMAND); o[1] = 0x07; o[2] = (uint8_t)(s << 2); return 3; }
-uint16_t Avdtp::buildDiscoverAcceptOneSource(uint8_t *o, uint8_t peerHdr) { o[0] = (uint8_t)((peerHdr & 0xF0) | ACCEPT); o[1] = 0x01; o[2] = 1 << 2; o[3] = 0x00; return 4; }
 uint8_t  Avdtp::rejectError(const uint8_t *p, uint16_t len) { return len ? p[len - 1] : 0; }
 uint8_t  Avdtp::parseDiscover(const uint8_t *p, uint16_t len, Sep *out, uint8_t max) {
     if (len < 2 || responseType(p[0]) != ACCEPT) return 0; uint8_t n = 0;
@@ -45,7 +44,7 @@ void Avdtp::begin(L2cap &l2, uint16_t sigCid, uint16_t mediaCid) {
     m_l2 = &l2; m_sigCid = sigCid; m_mediaCid = mediaCid; m_state = IDLE; m_tl = 1;
     m_err = 0; m_peerDiscover = false; m_media = nullptr; m_rspSeen = false; m_truncated = false; m_kickoff = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0; m_peerDelay = 0; m_peerDelayRpt = false; m_peerReject = false;
-    m_peerDelayCfg = false; m_delayRptOut = false;   // (m_localSep is an identity, set once by the app -- never cleared here)
+    m_peerDelayCfg = false; m_delayRptOut = false; m_delayRejects = 0; m_peerIntSeid = 0;   // (m_localSep is an identity, set once by the app -- never cleared here)
 }
 void Avdtp::reset() {
     m_state = IDLE; m_role = RNONE; m_media = nullptr; m_rspSeen = false; m_cfgChanged = false;
@@ -56,7 +55,7 @@ void Avdtp::reset() {
     m_peerDiscover = m_peerDelayRpt = m_peerReject = false;
     m_peerCaps = m_peerSetCfg = m_peerOpen = m_peerStart = m_peerSuspend = m_peerClose = false;
     m_nCand = 0; m_candIdx = 0; m_acp = 0;
-    m_peerDelayCfg = false; m_delayRptOut = false;   // (m_localSep survives: it is what we ARE, not attempt state)
+    m_peerDelayCfg = false; m_delayRptOut = false; m_delayRejects = 0; m_peerIntSeid = 0;   // (m_localSep survives: it is what we ARE, not attempt state)
 }
 void Avdtp::adoptInbound(L2cap &l) {
     if (!m_sig) {                                              // not yet acting as acceptor: adopt the first inbound AVDTP channel as signalling
@@ -73,10 +72,15 @@ bool Avdtp::start(const SbcConfig &want) { m_sig = m_l2->byLocal(m_sigCid); if (
     m_want = want; m_state = DISCOVERING; m_rspSeen = false; m_kickoff = true; m_role = INITIATOR;
     m_capSig = (m_peerVer && m_peerVer < 0x0103) ? 0x02 : 0x0C; return true; }
 // As the SINK we tell the source how far ahead of playback its media is (AVDTP 1.3 DelayReport, 0.1 ms units).
-// Only meaningful once the source configured category 0x08 and the stream is running.
+// Only meaningful once the source configured category 0x08 and the stream is running, and only WE-are-the-sink:
+// AVDTP 1.3 s8.19 makes DelayReport a command from the SINK to the SOURCE.
+// The SEID field of a COMMAND is its ACP SEID -- the RECEIVER's endpoint, i.e. the SOURCE's, which reached us as
+// the INT SEID of its SET_CONFIGURATION.  It is NOT our own SEID (BlueZ sends the remote SEID here too; the
+// convention is observed, no code taken from it).
 bool Avdtp::sendDelayReport(uint16_t tenthMs) {
+    if (m_localSep != SEP_SINK) return false;
     if (m_role != ACCEPTOR || m_state != STREAMING || !m_peerDelayCfg) return false;
-    uint8_t b[5] = { (uint8_t)(((m_tl + 1) << 4) | COMMAND), 0x0D, (uint8_t)(OUR_SEID << 2), (uint8_t)(tenthMs >> 8), (uint8_t)tenthMs };
+    uint8_t b[5] = { (uint8_t)(((m_tl + 1) << 4) | COMMAND), 0x0D, (uint8_t)(m_peerIntSeid << 2), (uint8_t)(tenthMs >> 8), (uint8_t)tenthMs };
     if (!send(b, 5)) return false;
     m_tl++; m_delayRptOut = true; return true;                 // the ACCEPT matches m_tl and is dropped in service()
 }
@@ -121,7 +125,7 @@ bool Avdtp::parseAcceptCfg(const uint8_t *p, uint16_t len, SbcConfig &c, uint8_t
             c.rate = 44100;
             c.mode = (Mode)modeBits; c.alloc = (Alloc)allocBit;
             c.blocks = blkBits == 0x80 ? 4 : blkBits == 0x40 ? 8 : blkBits == 0x20 ? 12 : 16;
-            c.subbands = subBit == 0x08 ? 4 : 8;
+            c.subbands = subBit == 0x02 ? 4 : 8;   // subBit is the SHIFTED 2-bit field: 0x02 = 4 subbands, 0x01 = 8
             c.minBitpool = e[2]; c.maxBitpool = e[3];
             if (c.maxBitpool < 2 || c.maxBitpool > 53) { badCat = 0x07; return false; }
             haveCodec = true;
@@ -182,6 +186,9 @@ void Avdtp::service() {
             if (parseAcceptCfg(m_peerSetPl, m_peerSetLen, c, badCat)) {
                 uint8_t r[2] = { (uint8_t)((m_peerSetHdr & 0xF0) | ACCEPT), 0x03 };
                 if (send(r, 2)) { m_peerSetCfg = false; m_acceptCfg = c; m_cfgChanged = true; m_role = ACCEPTOR; m_state = CONFIGURING;
+                    // The source's own endpoint id: the INT SEID of this command, which is the ACP SEID our
+                    // DelayReport COMMAND must carry back to it (AVDTP 1.3 s8.19).
+                    m_peerIntSeid = m_peerSetLen >= 4 ? (uint8_t)(m_peerSetPl[3] >> 2) : 0;
                     // Did the source configure Delay Reporting (category 0x08)?  Only then may we send DelayReports.
                     // Bounded exactly like parseSbcCaps's walk: a 16-bit i+2+l can wrap and re-enter the buffer.
                     m_peerDelayCfg = false;
@@ -214,9 +221,16 @@ void Avdtp::service() {
         // "peer accepts the channel but never drives it to OPEN": Avdtp has no clock of its own; bounded by the caller's outer timeout.
         return;
     }
-    // The source's ACCEPT of a DelayReport WE sent carries our own tl, so onSignalling() filed it as a response;
-    // it advances nothing, so consume it here rather than letting the state machine below read it as one.
-    if (m_rspSeen && m_delayRptOut && m_rspLen >= 2 && m_rsp[1] == 0x0D) { m_rspSeen = false; m_delayRptOut = false; return; }
+    // The source's answer to a DelayReport WE sent carries our own tl, so onSignalling() filed it as a response;
+    // it advances nothing, so consume it here rather than letting the state machine below read it as one.  Only an
+    // ACCEPT or a rejection of THAT command qualifies: anything else with our tl is a real response to whatever the
+    // initiator has outstanding and must reach the machine below.  A rejection is counted (there is no log here) --
+    // it never fails the stream, since a source that will not take delay reports still plays the media.
+    if (m_rspSeen && m_delayRptOut && m_rspLen >= 2 && m_rsp[1] == 0x0D) {
+        MsgType mt = responseType(m_rsp[0]);
+        if (mt == ACCEPT)                              { m_rspSeen = false; m_delayRptOut = false; return; }
+        if (mt == REJECT || mt == GENERAL_REJECT)      { m_delayRejects++; m_rspSeen = false; m_delayRptOut = false; return; }
+    }
     if (!m_rspSeen) return; m_rspSeen = false;
     uint8_t b[16];
     if (responseType(m_rsp[0]) != ACCEPT) {
