@@ -23,13 +23,16 @@ public:
     void service(L2cap &l2);                            // main context: build + queue the pending reply (retried while the TXQ is full)
     void reset() { m_pending = false; m_cid = 0; m_len = 0; m_volRegistered = false; m_volLabel = 0; m_volChanged = false; }
     bool     pending()       const { return m_pending; }
+    // The three counters below partition what the target REPLIED TO -- not every command it saw.  A frame
+    // respond() DECLINES (a fragment, a RESPONSE frame, or one under 6 bytes) is answered with nothing and
+    // counted nowhere; dropped() is a different thing again, counting a pending command REPLACED before
+    // service() ran.  (NEW-42: one bool used to fold GetCapabilities and SetAbsoluteVolume -- both answered
+    // properly -- into unsupported(), so the sink's heartbeat read a phone's volume presses as commands we do
+    // not implement.)  ** None of the three is cleared by reset(), so all are LIFETIME while L2cap's are
+    // per-link: on one heartbeat line a cumulative ans=/unsup= sits beside a per-link l2frag=. **
     uint32_t notifications() const { return m_notifications; }   // RegisterNotification answered INTERIM (PLAYBACK_STATUS_CHANGED -> PLAYING, VOLUME_CHANGED -> the current volume)
-    // WHAT each AV/C command was answered with, as three counters (NEW-42 -- one bool used to fold GetCapabilities
-    // and SetAbsoluteVolume, both answered properly, into unsupported(), so the sink's heartbeat read a phone's
-    // volume presses as commands we do not implement):
     uint32_t answered()      const { return m_answered; }        // answered from respond() with a real reply: GetCapabilities, SetAbsoluteVolume
-    uint32_t unsupported()   const { return m_unsupported; }     // NOT IMPLEMENTED (unknown PDU), or IPID for a foreign profile id
-    enum { KIND_NOT_IMPLEMENTED = 0, KIND_NOTIFICATION = 1, KIND_ANSWERED = 2 };
+    uint32_t unsupported()   const { return m_unsupported; }     // NOT IMPLEMENTED (a PDU, ctype or parameter this target builds no reply for), or IPID for a foreign profile id
     uint32_t dropped()       const { return m_dropped; }
     // --- absolute volume (AVRCP 1.4 sec 6.13) --------------------------------------------------------------
     // The target keeps ONE volume, 0..127.  The phone writes it with SetAbsoluteVolume (PDU 0x50), which is
@@ -48,6 +51,7 @@ public:
     // receives KIND_NOTIFICATION / KIND_ANSWERED / KIND_NOT_IMPLEMENTED for what was built; volumeSet (optional)
     // receives the volume a SetAbsoluteVolume applied, so the OBJECT can track what respond() did; it is left
     // untouched for every other command.
+    enum { KIND_NOT_IMPLEMENTED = 0, KIND_NOTIFICATION = 1, KIND_ANSWERED = 2 };   // what respond() built; its only user
     static uint16_t respond(const uint8_t *cmd, uint16_t len, uint8_t *out, uint16_t outMax, uint8_t *kind,
                             uint8_t *volumeSet = nullptr);
 private:

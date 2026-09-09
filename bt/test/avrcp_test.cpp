@@ -16,6 +16,8 @@ int main() {
     // The captured command: AVCTP 20 11 0E | AV/C 03 48 00 | 00 19 58 | 31 00 | 00 05 | 01 00 00 00 00
     const uint8_t shokz[] = { 0x20, 0x11, 0x0E, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
     {   // 1. INTERIM PLAYING, transaction label 2 echoed, response bit set, PID echoed.
+        // kind is seeded to POISON, not 0: 0 is KIND_NOT_IMPLEMENTED, so a respond() that never WRITES kind
+        // would be indistinguishable from one that classified correctly.  Every later call must CHANGE it.
         uint8_t out[64]; uint8_t kind = 0xEE; uint16_t n = Avrcp::respond(shokz, sizeof shokz, out, sizeof out, &kind);
         CHECK(kind == Avrcp::KIND_NOTIFICATION);
         CHECK(eq(out, n, { 0x22, 0x11, 0x0E, 0x0F, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x02, 0x01, 0x01 }));
