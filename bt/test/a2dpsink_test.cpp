@@ -146,6 +146,37 @@ struct Rig {
     }
     void peerAvdtp(std::vector<uint8_t> pdu) { feed(sigLocal, pdu); step(); }
     uint16_t mediaCid() const { return mediaLocal; }
+    // ---- OUR outbound channels (K10-K12: the sink opens AVCTP itself) ------------------------------
+    // Every outbound L2CAP Connection Request we sent for `psm`, as (identifier, our scid), read off the
+    // RAW ACL stream: [len][cid=1][code=02][id][len][psm][scid].  Counting them is the assertion -- exactly
+    // one per link, and NONE when the peer opened the channel first.
+    std::vector<std::pair<uint8_t, uint16_t> > outConnReqs(uint16_t psm) {
+        std::vector<std::pair<uint8_t, uint16_t> > v;
+        for (auto &p : io.aclOut) {
+            if (p.size() < 12 || (uint16_t)(p[2] | (p[3] << 8)) != 0x0001 || p[4] != 0x02) continue;
+            if ((uint16_t)(p[8] | (p[9] << 8)) != psm) continue;
+            v.push_back(std::make_pair(p[5], (uint16_t)(p[10] | (p[11] << 8))));
+        }
+        return v;
+    }
+    // The peer ACCEPTS the channel we asked for: CONN_RSP (its dcid, our scid, result 0), then the config
+    // exchange in both directions -- avdtp_test's bytes for an outbound channel.
+    void acceptOurConn(uint8_t id, uint16_t ourScid, uint16_t peerDcid) {
+        feed(0x0001, { 0x03, id, 8, 0, (uint8_t)peerDcid, (uint8_t)(peerDcid >> 8), (uint8_t)ourScid, (uint8_t)(ourScid >> 8), 0, 0, 0, 0 }); step();
+        feed(0x0001, { 0x04, sigId++, 8, 0, (uint8_t)ourScid, (uint8_t)(ourScid >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feed(0x0001, { 0x05, sigId++, 6, 0, (uint8_t)ourScid, (uint8_t)(ourScid >> 8), 0, 0, 0, 0 }); step();
+    }
+    // ... or REFUSES it: result 0x0002 (PSM not supported), the answer an iPhone-class peer with no AVRCP
+    // controller would give.
+    void refuseOurConn(uint8_t id, uint16_t ourScid) {
+        feed(0x0001, { 0x03, id, 8, 0, 0, 0, (uint8_t)ourScid, (uint8_t)(ourScid >> 8), 0x02, 0x00, 0, 0 }); step();
+    }
+    // The last L2CAP payload we transmitted on `cid` (the peer's CID: what our AVCTP replies are addressed to).
+    std::vector<uint8_t> lastOn(uint16_t cid) {
+        for (size_t i = io.aclOut.size(); i-- > 0;) { const std::vector<uint8_t> &p = io.aclOut[i];
+            if (p.size() >= 5 && (uint16_t)(p[2] | (p[3] << 8)) == cid) return std::vector<uint8_t>(p.begin() + 4, p.end()); }
+        return std::vector<uint8_t>(4, 0);
+    }
     // The last AVDTP PDU WE sent (payloads on the signalling channel only -- L2CAP signalling goes on cid 1).
     std::vector<uint8_t> lastAvdtp() {
         const L2cap::Channel *ch = g_sink->l2().byLocal(sigLocal);
@@ -408,6 +439,77 @@ int main() {
         CHECK(sink.result() == A2dpSink::AVDTP_FAILED);                               // RED before the fix: OK
         CHECK(logCount("avdtp failed while streaming") == 1);                          // RED before the fix: 0
         CHECK(logCount("stream closed") == 0);                                         // it did not end well
+    }
+    {   // K10. The sink OPENS AVCTP ITSELF once STREAMING.  An iPhone never opens AVRCP to a sink (bench
+        //      2026-09-09: four connections, ~15 min, avctp=0 throughout even with a Category 2 Target
+        //      record) -- iOS waits for the sink to initiate, as real speakers do.  Exactly ONE Connection
+        //      Request for PSM 0x0017, with our reserved SCID 0x0043; the peer accepts and configures it;
+        //      the phone then drives absolute volume over it: RegisterNotification(VOLUME_CHANGED) is
+        //      answered INTERIM with the current volume, SetAbsoluteVolume(0x40) is ACCEPTED, the volume
+        //      callback fires with 64 and the target keeps it.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink); r.bringToStreaming(sink);
+        std::vector<std::pair<uint8_t, uint16_t> > reqs = r.outConnReqs(Avrcp::PSM);
+        CHECK(reqs.size() == 1);                                                   // RED before the fix: 0
+        CHECK(logCount("avctp connect") == 1);
+        if (reqs.size() != 1) { printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return 1; }
+        CHECK(reqs[0].second == 0x0043);
+        r.acceptOurConn(reqs[0].first, reqs[0].second, 0x00D0);
+        L2cap::Channel *av = sink.l2().byLocal(0x0043);
+        CHECK(av != nullptr && av->state == L2cap::OPEN && av->psm == Avrcp::PSM && av->remoteCid == 0x00D0);
+        CHECK(sink.avctpRefused() == 0);
+        // The phone registers for VOLUME_CHANGED on the channel WE opened -> INTERIM with the current volume.
+        static uint8_t seen = 0xFF; seen = 0xFF;
+        Avrcp::setVolumeCallback([](void *, uint8_t v) { seen = v; }, nullptr);
+        r.peerAcl(0x0043, { 0x20, 0x11, 0x0E, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x05, 0x0D, 0, 0, 0, 0 });
+        CHECK(r.runUntil([&] { return r.lastOn(0x00D0).size() == 15 && r.lastOn(0x00D0)[3] == 0x0F; }, 200));
+        std::vector<uint8_t> in = r.lastOn(0x00D0);
+        CHECK(in.size() == 15 && in[0] == 0x22 && in[9] == 0x31 && in[13] == 0x0D && in[14] == 100);   // INTERIM, current volume
+        // ... then sets the absolute volume: ACCEPTED, echoed, applied.
+        r.peerAcl(0x0043, { 0x30, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40 });
+        CHECK(r.runUntil([&] { return r.lastOn(0x00D0).size() == 14 && r.lastOn(0x00D0)[3] == 0x09; }, 200));
+        std::vector<uint8_t> ac = r.lastOn(0x00D0);
+        CHECK(ac.size() == 14 && ac[0] == 0x32 && ac[9] == 0x50 && ac[13] == 0x40);
+        CHECK(seen == 64 && sink.avrcp().volume() == 64);
+        Avrcp::setVolumeCallback(nullptr, nullptr);
+    }
+    {   // K11. The PEER opens AVCTP first (the Shokz/Bose way: 1.8 s after AVDTP START).  The sink must NOT
+        //      open a SECOND one -- byPsm() is the guard -- and absolute volume still works on the peer's
+        //      channel, which is what makes the guard safe to have.  Mutant: remove the byPsm() check and
+        //      this test fails on the CONN_REQ count.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        r.bringToConfigured(sink, 0x21);
+        uint16_t avctpLocal = r.peerOpens(Avrcp::PSM, 0x00C5);                     // the headset's own AVCTP channel
+        r.peerAvdtp({ 0x40, 0x06, 1 << 2 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x06; }, 200));
+        r.mediaLocal = r.peerOpens(Avdtp::PSM, 0x00C1);
+        r.peerAvdtp({ 0x50, 0x07, 1 << 2 });
+        CHECK(r.runUntil([&] { return sink.state() == A2dpSink::STREAMING; }, 500));
+        r.advanceMs(200);
+        CHECK(r.outConnReqs(Avrcp::PSM).size() == 0);                              // RED against the mutant: 1
+        CHECK(logCount("avctp connect") == 0);
+        static uint8_t seen = 0xFF; seen = 0xFF;
+        Avrcp::setVolumeCallback([](void *, uint8_t v) { seen = v; }, nullptr);
+        r.peerAcl(avctpLocal, { 0x30, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40 });
+        CHECK(r.runUntil([&] { return r.lastOn(0x00C5).size() == 14 && r.lastOn(0x00C5)[3] == 0x09; }, 200));
+        CHECK(seen == 64 && sink.avrcp().volume() == 64);
+        Avrcp::setVolumeCallback(nullptr, nullptr);
+    }
+    {   // K12. The peer REFUSES our Connection Request (result 0x0002, PSM not supported).  The refusal is
+        //      COUNTED, the stream is unaffected, and we never ask again on this link -- a retry loop against
+        //      a peer with no AVRCP controller is a CONN_REQ every few seconds for the life of the stream.
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink); r.bringToStreaming(sink);
+        std::vector<std::pair<uint8_t, uint16_t> > reqs = r.outConnReqs(Avrcp::PSM);
+        CHECK(reqs.size() == 1);
+        if (reqs.size() != 1) { printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return 1; }
+        r.refuseOurConn(reqs[0].first, reqs[0].second);
+        CHECK(r.runUntil([&] { return sink.avctpRefused() == 1; }, 200));
+        r.advanceMs(60000);
+        CHECK(sink.avctpRefused() == 1);                                           // counted ONCE, not once per tick
+        CHECK(r.outConnReqs(Avrcp::PSM).size() == 1);                              // ... and never retried
+        CHECK(sink.state() == A2dpSink::STREAMING && sink.result() == A2dpSink::OK);
+        static int calls = 0; calls = 0;
+        sink.onMedia([](void *, const uint8_t *, uint16_t) { calls++; }, nullptr);
+        r.peerAcl(r.mediaCid(), { 0x80, 0x60, 0, 9, 0,0,0,0, 0,0,0,0, 0x01, 0x9C }); r.tick();
+        CHECK(calls == 1);                                                          // media unaffected by the refusal
     }
     printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

@@ -53,6 +53,22 @@ bool A2dpSink::streamClosed() {
     logf("sink: stream closed");
     m_streamUp = false; m_result = OK; m_st = DISCONNECTING; return true;
 }
+// SINK-INITIATED AVCTP (bench 2026-09-09).  An iPhone streaming to us NEVER opens an AVCTP channel
+// (PSM 0x0017) at our AVRCP target -- four connections over ~15 minutes, avctp=0 throughout, even after the
+// Target record advertised Category 2 -- so no SetAbsoluteVolume ever arrives and the phone's volume slider
+// does nothing.  Real speakers open the channel themselves once A2DP is up, and iOS waits for them to.  So
+// the sink asks, ONCE, on the transition to STREAMING.  Two peers must not produce two channels: a headset
+// that has already opened AVCTP at us (the Shokz opens it 1.8 s after START, the Bose likewise) is found by
+// byPsm() and left alone -- the channel is an ordinary AVCTP channel either way, since Avrcp::onData matches
+// on the PSM and answers on the channel's remote CID regardless of who opened it.
+void A2dpSink::openAvctp() {
+    if (m_avctpTried) return;
+    m_avctpTried = true;
+    if (m_l2.byPsm(Avrcp::PSM)) return;                       // the peer opened it first: one channel, not two
+    m_avctpChan = m_l2.connect(Avrcp::PSM, AVCTP_LOCAL_CID);
+    if (!m_avctpChan) { logf("sink: avctp connect unavailable"); return; }   // no free slot / CID in use
+    logf("sink: avctp connect");
+}
 void A2dpSink::begin(uint32_t now, uint8_t aclNum) { m_aclNum = aclNum; m_st = IDLE; m_result = OK; m_link.begin(now); m_link.startPrepare(); }
 bool A2dpSink::start() {
     if (busy() || !m_link.inboundUp()) return false;
@@ -62,6 +78,7 @@ bool A2dpSink::start() {
     // ACCEPTOR, and the next DISCOVER is answered to a dead channel's remote cid (0x0000 once L2cap::begin()
     // has zeroed the table).  a2dpsink_test K4 is the regression.
     m_avdtp.reset(); m_avrcp.reset(); m_mediaRemoteCid = 0; m_avdtpUp = false; m_streamUp = false;
+    m_avctpChan = nullptr; m_avctpTried = false; m_avctpRefused = 0;
     m_link.ackLost(); m_link.ackInboundUp(); m_delaySent = false; m_result = PENDING;
     m_opIssued = m_link.startPair(true); m_st = PAIRING; return true;
 }
@@ -70,7 +87,13 @@ void A2dpSink::tick(uint32_t now) {
     m_link.tick(now);
     if (m_st != IDLE && m_st != DONE && m_st != DISCONNECTING && m_link.lost()) {
         m_link.ackLost(); m_avdtp.reset(); m_avrcp.reset(); m_l2.reset(); m_mediaRemoteCid = 0; m_avdtpUp = false; m_streamUp = false;
+        m_avctpChan = nullptr;
         logf("sink: link lost reason=0x%02X", m_link.lostReason()); m_result = LOST; m_st = DONE; return;
+    }
+    // The verdict on the channel we asked for, read once it stops being WAIT_CONN (see the member comment).
+    if (m_avctpChan) {
+        if (m_avctpChan->state == L2cap::CLOSED) { m_avctpRefused++; logf("sink: avctp refused"); m_avctpChan = nullptr; }
+        else if (m_avctpChan->state != L2cap::WAIT_CONN) m_avctpChan = nullptr;
     }
     switch (m_st) {
     case PAIRING:
@@ -91,7 +114,8 @@ void A2dpSink::tick(uint32_t now) {
         if (m_avdtp.configChanged()) adoptConfig();
         // m_streamUp latches HERE -- on the sink's OWN transition to STREAMING -- and nowhere else: it is what
         // tells streamClosed() apart from an abort that never got this far.
-        if (m_avdtp.started()) { m_result = OK; m_st = STREAMING; m_streamUp = true; logf("sink: streaming bitpool=%u", m_params.bitpool); break; }
+        if (m_avdtp.started()) { m_result = OK; m_st = STREAMING; m_streamUp = true; logf("sink: streaming bitpool=%u", m_params.bitpool);
+                                 openAvctp(); break; }
         if (streamClosed()) break;
         if (m_avdtp.state() == Avdtp::FAILED || (int32_t)(now - m_deadline) >= 0) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; }
         break;

@@ -44,6 +44,14 @@ public:
     void onAcl(uint16_t h, const uint8_t *d, uint16_t len, uint8_t pb = L2cap::PB_FIRST) { m_l2.onAcl(h, d, len, pb); }   // forwarding pb is LOAD-BEARING (see A2dpSource)
     Hci &hci() { return m_hci; } L2cap &l2() { return m_l2; } Avdtp &avdtp() { return m_avdtp; } BtLink &link() { return m_link; } Avrcp &avrcp() { return m_avrcp; }
     uint16_t mediaCid() { return m_avdtp.mediaRemoteCid(); }
+    // The peer refused our AVCTP Connection Request (result != 0).  Counted, never retried on that link:
+    // a peer with no AVRCP controller would otherwise draw a CONN_REQ every few seconds for the whole stream.
+    uint32_t avctpRefused() const { return m_avctpRefused; }
+    // OUR AVCTP channel's local CID.  L2cap hands PEER-initiated channels CIDs from 0x0080 up
+    // (L2cap::begin: "above the caller-chosen 0x0040-0x005F range"), and the caller-chosen range is used
+    // by A2dpSource alone (0x0040 SDP, 0x0041 AVDTP signalling, 0x0042 media) -- the sink opened nothing
+    // outbound before this, so 0x0043 can collide with neither.
+    static const uint16_t AVCTP_LOCAL_CID = 0x0043;
     const Sbc::Params &sbcParams() const { return m_params; }
     // The sink's own delay report (ring latency, 0.1 ms units): sent once after START if the source configured it.
     void setDelayTenthMs(uint16_t t) { m_delayTenthMs = t; }
@@ -51,6 +59,7 @@ private:
     static void onData(void *ctx, L2cap::Channel &ch, const uint8_t *p, uint16_t len);
     void logf(const char *fmt, ...);
     void adoptConfig();
+    void openAvctp();             // once, on the transition to STREAMING
     bool streamClosed();          // peer CLOSE/ABORT -> DISCONNECTING(OK); true when it fired this tick
     BtLink::LogFn m_log = nullptr; void *m_logCtx = nullptr; char m_lb[96];
     BondTable *m_bonds = nullptr; Hci &m_hci; L2cap m_l2; BtLink m_link; Avdtp m_avdtp; SdpServer m_sdpServer; Avrcp m_avrcp;
@@ -71,4 +80,8 @@ private:
     // completed session earns -- m_streamUp used to latch at SET_CONFIGURATION and reported those as OK.
     bool m_avdtpUp = false;
     bool m_streamUp = false;
+    // The AVCTP channel WE opened, watched only while it is WAIT_CONN: a CLOSED verdict there is the peer's
+    // refusal (counted), and any other state means it was accepted, after which the pointer is dropped -- a
+    // later peer DISC_REQ also lands the channel in CLOSED and must not be miscounted as a refusal.
+    L2cap::Channel *m_avctpChan = nullptr; uint32_t m_avctpRefused = 0; bool m_avctpTried = false;
 };
