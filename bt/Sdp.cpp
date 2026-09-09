@@ -38,13 +38,19 @@ const uint16_t RECORD0_UUIDS[] = { 0x110A, 0x0100, 0x0019, 0x1002, 0x110D };   /
 //   0x0001 ServiceClassIDList             { AVRemoteControlTarget 0x110C }
 //   0x0004 ProtocolDescriptorList         { {L2CAP, PSM 0x0017}, {AVCTP 0x0017, 0x0104} }
 //   0x0009 BluetoothProfileDescriptorList { {AVRemoteControl 0x110E, 0x0104} }   (AVRCP 1.4: no browsing, no cover art)
-//   0x0311 SupportedFeatures              UINT16 0x0001 (Category 1: player/recorder)
+//   0x0311 SupportedFeatures              UINT16: role-dependent -- 0x0001 (Category 1: player/recorder) as a
+//          SOURCE, 0x0002 (Category 2: monitor/amplifier) as a SINK.  Bench 2026-09-09: an iPhone streams to our
+//          sink but never sends SetAbsoluteVolume -- AVRCP 1.4 6.13 makes absolute volume a Category 2 feature
+//          and iOS gates on the TARGET's SupportedFeatures.  Nothing else in the record changes with the role.
 const uint8_t B0000[] = { 0x0A, 0x00, 0x01, 0x00, 0x01 };
 const uint8_t B0001[] = { 0x35, 0x03, 0x19, 0x11, 0x0C };
 const uint8_t B0004[] = { 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x17, 0x35, 0x06, 0x19, 0x00, 0x17, 0x09, 0x01, 0x04 };
 const uint8_t B0009[] = { 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0E, 0x09, 0x01, 0x04 };
+const uint8_t B0311_SINK[] = { 0x09, 0x00, 0x02 };            // Category 2 (monitor/amplifier) -- the SINK role's 0x0311
 const Attr RECORD1[] = { { 0x0000, B0000, sizeof B0000 }, { 0x0001, B0001, sizeof B0001 }, { 0x0004, B0004, sizeof B0004 },
                          { 0x0005, A0005, sizeof A0005 }, { 0x0009, B0009, sizeof B0009 }, { 0x0311, A0311, sizeof A0311 } };
+const Attr RECORD1_SINK[] = { { 0x0000, B0000, sizeof B0000 }, { 0x0001, B0001, sizeof B0001 }, { 0x0004, B0004, sizeof B0004 },
+                              { 0x0005, A0005, sizeof A0005 }, { 0x0009, B0009, sizeof B0009 }, { 0x0311, B0311_SINK, sizeof B0311_SINK } };
 const uint16_t RECORD1_UUIDS[] = { 0x110C, 0x0100, 0x0017, 0x1002, 0x110E };
 // Record 3 (handle 0x00010002): the AudioSink (NEW-41) -- published INSTEAD of the AudioSource when Sdp::setRole(SINK).
 //   0x0001 ServiceClassIDList { AudioSink 0x110B }; 0x0004 { {L2CAP, 0x0019}, {AVDTP, 0x0103} };
@@ -63,6 +69,11 @@ const uint8_t MAX_ATTRS = 8;                      // per record; every record ha
 Sdp::Role s_role = Sdp::SOURCE;
 // Record 0 (AudioSource) is live only as SOURCE; Record 2 (AudioSink) only as SINK; Record 1 (AVRCP Target) always.
 bool live(uint8_t r) { return r == 1 || (s_role == Sdp::SOURCE ? r == 0 : r == 2); }
+// Record 1 is served with the SINK attribute table in the SINK role (0x0311 only); same handle, same UUIDs, so
+// matching, handle lookup and the AttributeList encoding are unchanged.  Read every record through this.
+const Record RECORD1_SINK_REC = { Sdp::RECORD_HANDLE + 1, RECORD1_SINK, sizeof RECORD1_SINK / sizeof RECORD1_SINK[0],
+                                  RECORD1_UUIDS, sizeof RECORD1_UUIDS / sizeof RECORD1_UUIDS[0] };
+const Record &record(uint8_t r) { return (r == 1 && s_role == Sdp::SINK) ? RECORD1_SINK_REC : RECORDS[r]; }
 const uint8_t  BT_BASE[12] = { 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB };
 enum { ERR_BAD_HANDLE = 0x0002, ERR_BAD_SYNTAX = 0x0003, ERR_BAD_CONT = 0x0005 };
 // A Data Element Sequence header (0x35 len8 / 0x36 len16): returns the body offset, sets bodyLen; 0 = not a DES / truncated.
@@ -151,13 +162,13 @@ uint16_t Sdp::serve(const uint8_t *req, uint16_t len, uint16_t mtu, uint8_t *out
     uint8_t list[256]; uint16_t total = 0; bool wanted[MAX_ATTRS]; uint16_t maxBytes = 0, offset = 0; bool badCont = false;
     if (pdu == 0x02) {                                         // ServiceSearchRequest -> ServiceSearchResponse (0x03): every matching handle
         bool m[N_RECORDS]; uint16_t n = 0, cnt = 0;
-        for (uint8_t r = 0; r < N_RECORDS; r++) { n = matchPattern(RECORDS[r], p, plen, m[r]); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); if (!live(r)) m[r] = false; if (m[r]) cnt++; }
+        for (uint8_t r = 0; r < N_RECORDS; r++) { n = matchPattern(record(r), p, plen, m[r]); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); if (!live(r)) m[r] = false; if (m[r]) cnt++; }
         i = n; if (i + 2 > plen) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); i += 2;          // MaxServiceRecordCount
         if (!parseCont(p + i, (uint16_t)(plen - i), offset, badCont)) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX);
         if (badCont || offset) return errorRsp(out, txHi, txLo, ERR_BAD_CONT);
         uint16_t at = 5;
         out[at++] = 0; out[at++] = (uint8_t)cnt; out[at++] = 0; out[at++] = (uint8_t)cnt;
-        for (uint8_t r = 0; r < N_RECORDS; r++) if (m[r]) { uint32_t h = RECORDS[r].handle; out[at++] = (uint8_t)(h >> 24); out[at++] = (uint8_t)(h >> 16); out[at++] = (uint8_t)(h >> 8); out[at++] = (uint8_t)h; }
+        for (uint8_t r = 0; r < N_RECORDS; r++) if (m[r]) { uint32_t h = record(r).handle; out[at++] = (uint8_t)(h >> 24); out[at++] = (uint8_t)(h >> 16); out[at++] = (uint8_t)(h >> 8); out[at++] = (uint8_t)h; }
         out[at++] = 0;
         out[0] = 0x03; out[1] = txHi; out[2] = txLo; out[3] = (uint8_t)((at - 5) >> 8); out[4] = (uint8_t)(at - 5); return at;
     }
@@ -165,8 +176,8 @@ uint16_t Sdp::serve(const uint8_t *req, uint16_t len, uint16_t mtu, uint8_t *out
         if (plen < 6) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX);
         uint32_t h = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
         maxBytes = (uint16_t)((p[4] << 8) | p[5]); i = 6;
-        const Record *rec = nullptr; for (uint8_t r = 0; r < N_RECORDS; r++) if (RECORDS[r].handle == h && live(r)) rec = &RECORDS[r];
-        uint16_t n = parseAttrList(rec ? *rec : RECORDS[0], p + i, (uint16_t)(plen - i), wanted); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); i += n;
+        const Record *rec = nullptr; for (uint8_t r = 0; r < N_RECORDS; r++) if (record(r).handle == h && live(r)) rec = &record(r);
+        uint16_t n = parseAttrList(rec ? *rec : record(0), p + i, (uint16_t)(plen - i), wanted); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); i += n;
         if (!parseCont(p + i, (uint16_t)(plen - i), offset, badCont)) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX);
         if (!rec) return errorRsp(out, txHi, txLo, ERR_BAD_HANDLE);
         total = buildAttrList(*rec, wanted, list);
@@ -176,15 +187,15 @@ uint16_t Sdp::serve(const uint8_t *req, uint16_t len, uint16_t mtu, uint8_t *out
     }
     if (pdu == 0x06) {                                         // ServiceSearchAttributeRequest -> ServiceSearchAttributeResponse (0x07)
         bool m[N_RECORDS]; uint16_t n = 0;
-        for (uint8_t r = 0; r < N_RECORDS; r++) { n = matchPattern(RECORDS[r], p, plen, m[r]); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); if (!live(r)) m[r] = false; }
+        for (uint8_t r = 0; r < N_RECORDS; r++) { n = matchPattern(record(r), p, plen, m[r]); if (!n) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); if (!live(r)) m[r] = false; }
         i = n; if (i + 2 > plen) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX);
         maxBytes = (uint16_t)((p[i] << 8) | p[i + 1]); i += 2;
         uint16_t alen = 0;
         // AttributeLists = DES{ one DES per matching record, in handle order } -- empty when nothing matches, still well-formed.
         uint16_t inner = 0;
         for (uint8_t r = 0; r < N_RECORDS; r++) {
-            uint16_t a = parseAttrList(RECORDS[r], p + i, (uint16_t)(plen - i), wanted); if (!a) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); alen = a;
-            if (m[r]) inner = (uint16_t)(inner + buildAttrList(RECORDS[r], wanted, list + 2 + inner));
+            uint16_t a = parseAttrList(record(r), p + i, (uint16_t)(plen - i), wanted); if (!a) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX); alen = a;
+            if (m[r]) inner = (uint16_t)(inner + buildAttrList(record(r), wanted, list + 2 + inner));
         }
         i += alen;
         if (!parseCont(p + i, (uint16_t)(plen - i), offset, badCont)) return errorRsp(out, txHi, txLo, ERR_BAD_SYNTAX);
