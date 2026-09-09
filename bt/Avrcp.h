@@ -24,7 +24,12 @@ public:
     void reset() { m_pending = false; m_cid = 0; m_len = 0; m_volRegistered = false; m_volLabel = 0; m_volChanged = false; }
     bool     pending()       const { return m_pending; }
     uint32_t notifications() const { return m_notifications; }   // RegisterNotification answered INTERIM (PLAYBACK_STATUS_CHANGED -> PLAYING, VOLUME_CHANGED -> the current volume)
-    uint32_t unsupported()   const { return m_unsupported; }     // AV/C commands answered from respond() and NOT a notification -- NOT IMPLEMENTED, plus GetCapabilities and SetAbsoluteVolume, which are answered properly
+    // WHAT each AV/C command was answered with, as three counters (NEW-42 -- one bool used to fold GetCapabilities
+    // and SetAbsoluteVolume, both answered properly, into unsupported(), so the sink's heartbeat read a phone's
+    // volume presses as commands we do not implement):
+    uint32_t answered()      const { return m_answered; }        // answered from respond() with a real reply: GetCapabilities, SetAbsoluteVolume
+    uint32_t unsupported()   const { return m_unsupported; }     // NOT IMPLEMENTED (unknown PDU), or IPID for a foreign profile id
+    enum { KIND_NOT_IMPLEMENTED = 0, KIND_NOTIFICATION = 1, KIND_ANSWERED = 2 };
     uint32_t dropped()       const { return m_dropped; }
     // --- absolute volume (AVRCP 1.4 sec 6.13) --------------------------------------------------------------
     // The target keeps ONE volume, 0..127.  The phone writes it with SetAbsoluteVolume (PDU 0x50), which is
@@ -39,16 +44,17 @@ public:
     void    setLocalVolume(uint8_t v);                  // the local side moved the volume: update + raise CHANGED if registered
     uint8_t volume() const { return m_vol; }
     // Build the AV/C response for one AVCTP command frame (pure; host-tested).  Returns the response
-    // length (0 = not an AVRCP command: wrong PID, fragment, or a response frame -- ignored).  volumeSet
-    // (optional) receives the volume a SetAbsoluteVolume applied, so the OBJECT can track what respond() did;
-    // it is left untouched for every other command.
-    static uint16_t respond(const uint8_t *cmd, uint16_t len, uint8_t *out, uint16_t outMax, bool *wasNotification,
+    // length (0 = not an AVRCP command: wrong PID, fragment, or a response frame -- ignored).  kind (optional)
+    // receives KIND_NOTIFICATION / KIND_ANSWERED / KIND_NOT_IMPLEMENTED for what was built; volumeSet (optional)
+    // receives the volume a SetAbsoluteVolume applied, so the OBJECT can track what respond() did; it is left
+    // untouched for every other command.
+    static uint16_t respond(const uint8_t *cmd, uint16_t len, uint8_t *out, uint16_t outMax, uint8_t *kind,
                             uint8_t *volumeSet = nullptr);
 private:
     // True when m_cmd is a RegisterNotification for VOLUME_CHANGED -- answered by the object, not by respond(),
     // because the INTERIM carries live state (m_vol) and arms the one-shot CHANGED.
     bool isVolumeRegistration() const;
     volatile bool m_pending = false; uint16_t m_cid = 0, m_len = 0; uint8_t m_cmd[MAX_CMD];
-    uint32_t m_notifications = 0, m_unsupported = 0, m_dropped = 0;
+    uint32_t m_notifications = 0, m_answered = 0, m_unsupported = 0, m_dropped = 0;
     uint8_t m_vol = 100; bool m_volRegistered = false; uint8_t m_volLabel = 0; bool m_volChanged = false;
 };

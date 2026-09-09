@@ -14,12 +14,14 @@ enum { PT_SINGLE = 0x00, CTYPE_CONTROL = 0x00, CTYPE_STATUS = 0x01, CTYPE_NOTIFY
 Avrcp::VolumeFn s_volFn = nullptr; void *s_volCtx = nullptr;
 }
 void Avrcp::setVolumeCallback(VolumeFn fn, void *ctx) { s_volFn = fn; s_volCtx = ctx; }
-uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t outMax, bool *wasNotification, uint8_t *volumeSet) {
-    if (wasNotification) *wasNotification = false;
+uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t outMax, uint8_t *kind, uint8_t *volumeSet) {
+    if (kind) *kind = KIND_NOT_IMPLEMENTED;
     if (len < 6 || outMax < 18) return 0;                       // AVCTP(3) + AV/C header(3) at least
     uint8_t h = c[0];
     if ((h & 0x0C) != PT_SINGLE) return 0;                      // fragments: not built (the headset sends single frames)
     if (h & 0x02) return 0;                                     // a RESPONSE frame: nothing to answer
+    // A foreign profile id keeps the KIND_NOT_IMPLEMENTED default above: IPID means "we do not carry that profile",
+    // which is exactly what unsupported() counts.  Reached on a live link because AVCTP multiplexes profiles onto one channel.
     if (c[1] != (uint8_t)(PID >> 8) || c[2] != (uint8_t)PID) {  // unknown profile: AVCTP says answer with IPID set, no body
         out[0] = (uint8_t)((h & 0xF0) | 0x03); out[1] = c[1]; out[2] = c[2]; return 3; }
     const uint8_t *avc = c + 3; uint16_t alen = (uint16_t)(len - 3);
@@ -32,7 +34,7 @@ uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t o
         out[3] = RSP_INTERIM; out[4] = avc[1]; out[5] = OP_VENDOR; out[6] = 0x00; out[7] = 0x19; out[8] = 0x58;
         out[9] = PDU_REGISTER_NOTIFICATION; out[10] = 0x00; out[11] = 0x00; out[12] = 0x02;
         out[13] = EVENT_PLAYBACK_STATUS_CHANGED; out[14] = PLAY_STATUS_PLAYING;
-        if (wasNotification) *wasNotification = true;
+        if (kind) *kind = KIND_NOTIFICATION;
         return 15;
     }
     // GetCapabilities (PDU 0x10, STATUS ctype, one parameter byte): the Shokz sends it BEFORE registering (measured
@@ -44,6 +46,7 @@ uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t o
         out[0] = (uint8_t)((h & 0xF0) | 0x02); out[1] = c[1]; out[2] = c[2];
         out[3] = RSP_STABLE; out[4] = avc[1]; out[5] = OP_VENDOR; out[6] = 0x00; out[7] = 0x19; out[8] = 0x58;
         out[9] = PDU_GET_CAPABILITIES; out[10] = 0x00;
+        if (kind) *kind = KIND_ANSWERED;
         // Both events this target raises: PLAYBACK_STATUS_CHANGED and VOLUME_CHANGED.  A CT that does not see
         // VOLUME_CHANGED here never registers for it, so absolute volume would be write-only.
         if (avc[10] == CAP_EVENTS_SUPPORTED) { out[11] = 0x00; out[12] = 0x04; out[13] = CAP_EVENTS_SUPPORTED; out[14] = 0x02;
@@ -59,6 +62,7 @@ uint16_t Avrcp::respond(const uint8_t *c, uint16_t len, uint8_t *out, uint16_t o
         uint8_t v = (uint8_t)(avc[10] & VOL_MASK);
         if (s_volFn) s_volFn(s_volCtx, v);
         if (volumeSet) *volumeSet = v;
+        if (kind) *kind = KIND_ANSWERED;
         out[0] = (uint8_t)((h & 0xF0) | 0x02); out[1] = c[1]; out[2] = c[2];
         out[3] = RSP_ACCEPTED; out[4] = avc[1]; out[5] = OP_VENDOR; out[6] = 0x00; out[7] = 0x19; out[8] = 0x58;
         out[9] = PDU_SET_ABSOLUTE_VOLUME; out[10] = 0x00; out[11] = 0x00; out[12] = 0x01; out[13] = v;
@@ -120,11 +124,11 @@ void Avrcp::service(L2cap &l2) {
         m_notifications++; m_pending = false;
         return;
     }
-    uint8_t out[MAX_CMD + 3]; bool notif = false; uint8_t volSet = 0xFF;
-    uint16_t n = respond(m_cmd, m_len, out, sizeof out, &notif, &volSet);
+    uint8_t out[MAX_CMD + 3]; uint8_t kind = KIND_NOT_IMPLEMENTED; uint8_t volSet = 0xFF;
+    uint16_t n = respond(m_cmd, m_len, out, sizeof out, &kind, &volSet);
     if (n == 0) { m_pending = false; return; }                  // nothing to answer
     if (!l2.send(m_cid, out, n)) return;                        // TXQ full: retry next pass
     if (volSet <= VOL_MASK) m_vol = volSet;                     // the peer set the absolute volume: track it
-    if (notif) m_notifications++; else m_unsupported++;
+    if (kind == KIND_NOTIFICATION) m_notifications++; else if (kind == KIND_ANSWERED) m_answered++; else m_unsupported++;
     m_pending = false;
 }
