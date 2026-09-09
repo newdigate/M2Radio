@@ -150,11 +150,19 @@ void A2dpSource::tick(uint32_t now) {
         if (m_avdtp.state() == Avdtp::FAILED) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; break; }
         if ((int32_t)(now - m_deadline) >= 0) { m_result = AVDTP_FAILED; m_st = DISCONNECTING; break; }
         break;
+    case STREAMING:
+        // The AVDTP case adopts BEFORE it tests started(), so a media channel that reaches L2CAP OPEN in the
+        // very tick that answers START is still picked up on the next one.  A channel that opens LATER -- its
+        // CONN_REQ before START, its config exchange completing after -- was never adopted at all, because
+        // nothing called adoptInbound() from here: mediaRemoteCid() stayed 0 forever and every media PDU missed
+        // the media route (a2dpsource_test; the sink's own instance of this is a2dpsink_test K8, fixed 859c381).
+        if (m_inbound) m_avdtp.adoptInbound(m_l2);
+        break;
     case DISCONNECTING:
         if (!m_link.busy() && m_link.op() == BtLink::NONE && m_link.handle() == 0) { m_st = DONE; return; }
         if (m_link.op() != BtLink::DISCONNECT) m_link.startDisconnect();
         break;
-    default: break;                                                            // IDLE, STREAMING, DONE: nothing to advance
+    default: break;                                                            // IDLE, DONE: nothing to advance
     }
     m_l2.service(); m_avdtp.service(); m_sdpServer.service(m_l2);
     { uint32_t before = m_avrcp.notifications(); m_avrcp.service(m_l2);   // NEW-34 piece 3: answer the headset's AV/C

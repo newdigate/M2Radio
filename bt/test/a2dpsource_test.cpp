@@ -239,5 +239,42 @@ int main() {
         CHECK(runUntil([&]{ return cidOfLastAvdtpAccept(r.io, 0x01) != 0xFFFF; }, 500));
         CHECK(cidOfLastAvdtpAccept(r.io, 0x01) == 0x00C2);                                             // the NEW channel, not 0x0000
     }
+    {   // The media channel opens LATE, in the SAME tick that answers START -- a2dpsink_test K8's scenario, on
+        //   the SOURCE.  The peer's media channel reaches L2CAP OPEN only AFTER the attempt has left AVDTP for
+        //   STREAMING -- its CONN_REQ lands before START but its config exchange completes later.  From the
+        //   next tick on the attempt is in STREAMING, which called adoptInbound() nowhere -- so mediaRemoteCid()
+        //   stayed 0 forever and every media PDU missed the media route.  The sink adopts in STREAMING; the
+        //   source now does too.  Note the ONE tick of slack the source has that the sink has not: its AVDTP
+        //   case adopts BEFORE it tests started(), so a channel that opens in the very tick that answers START
+        //   is still picked up next tick.  Two ticks late is the window that was never closed, which is what
+        //   this drives -- the peer STARTs with its own media channel still in L2CAP CONFIG.
+        Rig r; inboundLinkUp(r);
+        A2dpSource::Target t{}; t.kind = A2dpSource::Target::INBOUND; memcpy(t.bd, SHOKZ, 6);
+        CHECK(r.src.start(t));
+        r.io.ev(0x08, { 0x00, 0x01, 0x00, 0x01 });                                                         // peer secures the link
+        CHECK(runUntil([&]{ return r.src.state() == A2dpSource::AVDTP_WAIT; }, 5000));
+        feedAcl(r.src, 0x0001, { 0x02, 0x20, 4, 0, 0x19, 0x00, 0xC0, 0x00 }); step();                      // peer opens AVDTP signalling
+        L2cap::Channel *sig = r.src.l2().byRemote(0x00C0); CHECK(sig);
+        uint16_t sc = sig ? sig->localCid : 0;
+        feedAcl(r.src, 0x0001, { 0x04, 0x21, 8, 0, (uint8_t)sc, (uint8_t)(sc >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feedAcl(r.src, 0x0001, { 0x05, 0x22, 6, 0, (uint8_t)sc, (uint8_t)(sc >> 8), 0, 0, 0, 0 }); step();
+        CHECK(runUntil([&]{ return r.src.avdtp().role() == Avdtp::ACCEPTOR; }, 3000));
+        feedAcl(r.src, sc, { 0x30, 0x01 }); step();
+        feedAcl(r.src, sc, { 0x40, 0x0C, 1 << 2 }); step();
+        feedAcl(r.src, sc, { 0x50, 0x03, 1 << 2, 5 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x23 }); step();
+        feedAcl(r.src, sc, { 0x60, 0x06, 1 << 2 }); step();                                                // OPEN -> Avdtp OPENING
+        feedAcl(r.src, 0x0001, { 0x02, 0x23, 4, 0, 0x19, 0x00, 0xC1, 0x00 }); step();                      // media CONN_REQ: the channel exists, still CONFIG
+        L2cap::Channel *med = r.src.l2().byRemote(0x00C1); CHECK(med);
+        uint16_t mc = med ? med->localCid : 0;
+        CHECK(r.src.mediaCid() == 0);                                                                      // ... but not OPEN, so nothing to adopt yet
+        feedAcl(r.src, sc, { 0x70, 0x07, 1 << 2 });                                                        // START, with the media config still outstanding
+        CHECK(runUntil([&]{ return r.src.state() == A2dpSource::STREAMING; }, 3000));                       // the attempt leaves AVDTP for good
+        CHECK(r.src.mediaCid() == 0);
+        feedAcl(r.src, 0x0001, { 0x04, 0x24, 8, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03 });
+        feedAcl(r.src, 0x0001, { 0x05, 0x25, 6, 0, (uint8_t)mc, (uint8_t)(mc >> 8), 0, 0, 0, 0 }); step();  // the peer finally configures it: OPEN
+        CHECK(r.src.l2().byRemote(0x00C1)->state == L2cap::OPEN);
+        CHECK(runUntil([&]{ return r.src.avdtp().mediaRemoteCid() == 0x00C1; }, 3000));                     // RED before the fix: 0 forever
+        CHECK(r.src.mediaCid() == 0x00C1);
+    }
     printf("a2dpsource_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

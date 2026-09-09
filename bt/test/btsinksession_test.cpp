@@ -89,6 +89,12 @@ static void attemptCb(void *, A2dpSink::Result r, const char *pb) { g_att.push_b
 // Q6: a stream callback that disconnects the session from INSIDE the callback, on the loss edge.
 static BtSinkSession *g_cbSession = nullptr;
 static void disconnectOnLossCb(void *, bool streaming, uint8_t) { if (!streaming && g_cbSession) g_cbSession->disconnect(); }
+// Q7: the ATTEMPT callback disconnects on the success edge -- the other side of the same rule.  It records the
+// attempt exactly as attemptCb does, so the callback ORDER is still observable, and then asks to disconnect.
+static void disconnectOnAttemptCb(void *, A2dpSink::Result r, const char *pb) {
+    g_att.push_back(AttRec{ r, pb ? pb : "" });
+    if (r == A2dpSink::OK && g_cbSession) g_cbSession->disconnect();
+}
 
 struct Rig {
     FakeIo io; Hci hci; A2dpSink sink; BtSinkSession session; BondTable bonds;
@@ -146,7 +152,9 @@ struct Rig {
     // The phone pages us and the SESSION takes the link over: page -> (session start) -> SSP -> the peer's
     // AVDTP signalling channel -> DISCOVER / GET_ALL_CAP / SET_CONFIG / OPEN / media channel / START.
     // `scid` bases the peer's channel ids so a SECOND bring-up on the same rig uses fresh ones.
-    void inboundToStreaming(uint16_t scid) {
+    // `expectStreaming` false: the attempt callback took us out of STREAMING inside the same tick, so the
+    // session is never OBSERVED there -- wait for it to leave CONNECTING instead (Q7).
+    void inboundToStreaming(uint16_t scid, bool expectStreaming = true) {
         incomingPage(PHONE);
         CHECK(runUntil([&] { return session.state() == BtSinkSession::CONNECTING; }, 1000));
         peerAuthenticates();
@@ -160,7 +168,8 @@ struct Rig {
         peerAvdtp({ 0x40, 0x06, 1 << 2 }); CHECK(runUntil([&] { return lastAvdtp()[1] == 0x06; }, 200));
         mediaLocal = peerOpens(Avdtp::PSM, (uint16_t)(scid + 1));
         peerAvdtp({ 0x50, 0x07, 1 << 2 });
-        CHECK(runUntil([&] { return session.state() == BtSinkSession::STREAMING; }, 1000));
+        if (expectStreaming) CHECK(runUntil([&] { return session.state() == BtSinkSession::STREAMING; }, 1000));
+        else                 CHECK(runUntil([&] { return session.state() != BtSinkSession::CONNECTING; }, 1000));
     }
 };
 int main() {
@@ -299,6 +308,25 @@ int main() {
         CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });                     // RED: 0x02
         r.advanceMs(1000);
         CHECK(r.session.state() == BtSinkSession::MANUAL);                                     // ... and STAYS there
+        g_cbSession = nullptr;
+    }
+    {   // Q7. The OTHER callback that can disconnect us: the ATTEMPT callback, on the success edge.  m_state is
+        //     already STREAMING when it runs (Q6's rule), so a disconnect() from inside it assigns DISCONNECTING
+        //     -- and the stream callback that follows on the very next line fired ANYWAY, telling the app the
+        //     stream was up on a session it had just torn down.  Nothing would ever send the matching
+        //     onStream(false): the DISCONNECTING branch reaches MANUAL without one.  The stream callback is now
+        //     guarded on the state the line above assigned.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        g_cbSession = &r.session; r.session.onStream(streamCb, nullptr); r.session.onAttempt(disconnectOnAttemptCb, nullptr);
+        r.inboundToStreaming(0x00D0, false);
+        CHECK(g_att.size() == 1 && g_att[0].r == A2dpSink::OK);                     // the attempt itself still succeeded
+        CHECK(g_stream.empty());                                                    // RED before the fix: one streaming=true
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));
+        CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });          // MANUAL announces nothing
+        r.advanceMs(1000);
+        CHECK(r.session.state() == BtSinkSession::MANUAL);
+        CHECK(g_stream.empty());                                                    // ... and no late stream event either
+        CHECK(r.session.stats().links == 1 && r.session.stats().accepts == 1);      // stats unchanged by the guard
         g_cbSession = nullptr;
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;

@@ -390,5 +390,24 @@ int main() {
         CHECK(calls == 1);                                                          // RED before the fix: 0
         CHECK(!sawGeneralReject(r.io, before));                                     // RED before the fix: the RTP header answered as a command
     }
+    {   // K9. Avdtp FAILS while the stream is RUNNING.  The AVDTP case tests Avdtp::FAILED; the STREAMING case
+        //     did not, and streamClosed() deliberately ignores FAILED (it only fires on a return to IDLE) -- so a
+        //     failure after START left the sink reporting STREAMING, with a dead signalling machine, until the
+        //     link itself dropped.  The peer's REJECT carrying our own outstanding transaction label is the
+        //     cheapest way to reach it: Avdtp::service() files any non-ACCEPT response as FAILED.  (It is NOT the
+        //     DelayReport's own rejection -- that carries signal 0x0D, is counted, and never fails the stream.)
+        Rig r; A2dpSink sink(r.hci, r.io); r.attach(sink);
+        r.bringToStreaming(sink);
+        CHECK(r.runUntil([&] { return logCount("delay_report") == 1; }, 500));       // the one command we have outstanding
+        std::vector<uint8_t> dr = r.lastAvdtp(); CHECK(dr.size() >= 2 && dr[1] == 0x0D);
+        uint8_t tl = (uint8_t)(dr[0] >> 4);
+        CHECK(sink.state() == A2dpSink::STREAMING);
+        r.peerAvdtp({ (uint8_t)((tl << 4) | 0x03), 0x07, 0x00 });                    // REJECT of START, our tl -> Avdtp FAILED
+        CHECK(r.runUntil([&] { return sink.avdtp().state() == Avdtp::FAILED; }, 500));
+        CHECK(r.runUntil([&] { return !sink.busy(); }, 3000));                        // RED before the fix: STREAMING forever
+        CHECK(sink.result() == A2dpSink::AVDTP_FAILED);                               // RED before the fix: OK
+        CHECK(logCount("avdtp failed while streaming") == 1);                          // RED before the fix: 0
+        CHECK(logCount("stream closed") == 0);                                         // it did not end well
+    }
     printf("a2dpsink_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

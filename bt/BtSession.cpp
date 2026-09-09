@@ -75,7 +75,10 @@ void BtSession::handleAttemptEnd(uint32_t now) {
         if (m_attemptCb) m_attemptCb(m_attemptCtx, r, m_src.link().pairedBy());
         m_stats.links++; m_stats.accepts++;
         if (m_haveLost) { m_stats.reconnectMs = now - m_stats.lostAt; m_haveLost = false; }
-        if (m_streamCb) m_streamCb(m_streamCtx, true, 0, m_stats.by);
+        // Guarded on the state assigned above: m_attemptCb may have called disconnect() (DISCONNECTING), and
+        // reporting the stream UP then leaves the app waiting for an onStream(false) that never comes -- the
+        // DISCONNECTING branch reaches MANUAL without one.  Same rule as BtSinkSession (btsinksession_test Q7).
+        if (m_state == STREAMING && m_streamCb) m_streamCb(m_streamCtx, true, 0, m_stats.by);
         return;
     }
     m_state = WAITING; m_retryAt = now + m_retryMs;

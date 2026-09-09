@@ -22,7 +22,11 @@ void BtSinkSession::tick(uint32_t now) {
         if (m_sink.state() == A2dpSink::STREAMING) {                        // success: A2dpSink stays busy() in STREAMING
             m_stats.links++; m_stats.accepts++; m_state = STREAMING;
             if (m_attemptCb) m_attemptCb(m_attemptCtx, A2dpSink::OK, m_sink.link().pairedBy());
-            if (m_streamCb) m_streamCb(m_streamCtx, true, 0);
+            // ... and the stream callback only if we are STILL streaming.  The attempt callback above may have
+            // called disconnect(), which assigns DISCONNECTING: announcing the stream UP on a session the app
+            // has just torn down is a report that never gets its matching onStream(false) -- the DISCONNECTING
+            // branch reaches MANUAL without one (btsinksession_test Q7).
+            if (m_state == STREAMING && m_streamCb) m_streamCb(m_streamCtx, true, 0);
             break;
         }
         if (m_sink.busy() || m_sink.link().busy()) break;                   // attempt still running

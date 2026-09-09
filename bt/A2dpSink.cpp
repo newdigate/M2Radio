@@ -98,6 +98,10 @@ void A2dpSink::tick(uint32_t now) {
     case STREAMING:
         m_avdtp.adoptInbound(m_l2);
         if (streamClosed()) break;
+        // A signalling failure AFTER START.  streamClosed() deliberately ignores FAILED (it fires only on the
+        // return to IDLE that a CLOSE produces), and the AVDTP case's FAILED test is behind us -- so without
+        // this the sink reported STREAMING with a dead Avdtp until the link itself dropped (a2dpsink_test K9).
+        if (m_avdtp.state() == Avdtp::FAILED) { logf("sink: avdtp failed while streaming"); m_result = AVDTP_FAILED; m_st = DISCONNECTING; break; }
         if (!m_delaySent && m_avdtp.peerWantsDelayReports() && m_avdtp.sendDelayReport(m_delayTenthMs)) { m_delaySent = true; logf("sink: delay_report=%u", m_delayTenthMs); }
         break;
     case DISCONNECTING:
