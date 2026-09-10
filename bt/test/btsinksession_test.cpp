@@ -278,6 +278,14 @@ int main() {
         r.session.resume();
         CHECK(r.session.state() == BtSinkSession::LISTENING);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 500));
+        // NEW-46 (Task 1 review): resume() opens NO window.  It is an app command, not the end of an attempt --
+        // the app calls enterPairing() if it wants one.  The 0x02 above already says so inside its 500 ms budget
+        // (a window would have written 0x03 and held it for 120 s); pinned by name here too, and by the PREPARE
+        // count, since a window's own re-issue would be the SECOND Write_Simple_Pairing_Mode.  pairingEnd() still
+        // reads the boot window's close: disconnect() had nothing open to cancel and must not stamp CANCELLED.
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);
+        r.advanceMs(1000);
+        CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 } && r.io.count(OP_SSP) == 1);
     }
     {   // Q5. The SAME sequence as a2dpsink_test K7, through the session: the source configures us and then
         //     ABORTs before START.  That is a FAILED attempt -- the session must report AVDTP_FAILED and count
@@ -320,8 +328,14 @@ int main() {
         r.disconnectionComplete(0x08);
         CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));   // RED: settles LISTENING
         CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });                     // RED: 0x02
+        // NEW-46 (Task 1 review): the loss branch opened a PAIR_DROP window ONE LINE before this callback ran, and
+        // disconnect() must close it as CANCELLED -- a window open on a sink that announces nothing is the LED
+        // blinking "pairing" in MANUAL while enterPairing() is refused.  RED before the fix: pairingOpen() true
+        // through MANUAL with scans off, pairingEnd() still the BOOT window's PAIRED (nothing had closed this one).
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_CANCELLED);
         r.advanceMs(1000);
         CHECK(r.session.state() == BtSinkSession::MANUAL);                                     // ... and STAYS there
+        CHECK(!r.session.pairingOpen());                                                       // ... window included
         g_cbSession = nullptr;
     }
     {   // Q7. The OTHER callback that can disconnect us: the ATTEMPT callback, on the success edge.  m_state is
@@ -335,8 +349,14 @@ int main() {
         r.inboundToStreaming(0x00D0, false);
         CHECK(g_att.size() == 1 && g_att[0].r == A2dpSink::OK);                     // the attempt itself still succeeded
         CHECK(g_stream.empty());                                                    // RED before the fix: one streaming=true
+        // NEW-46 (Task 1 review): the BOOT window was still open when the attempt callback ran -- the callback
+        // runs BEFORE tick()'s close check, and disconnect() had already left STREAMING, so `m_state == STREAMING`
+        // never closed it as PAIRED and the clock would not for 120 s.  Spec s4's literal invariant is "never open
+        // while a link is up": pinned HERE, mid-teardown with the link LINK_SECURE, and again once MANUAL settles.
+        CHECK(!r.session.pairingOpen());                                            // RED before the fix: open, link secure
         CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));
         CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });          // MANUAL announces nothing
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_CANCELLED);
         r.advanceMs(1000);
         CHECK(r.session.state() == BtSinkSession::MANUAL);
         CHECK(g_stream.empty());                                                    // ... and no late stream event either
@@ -402,7 +422,12 @@ int main() {
     }
     {   // P3. A DROP WINDOW ON A FAILED ATTEMPT -- the NEW-43 shape.  A page that fails to pair returns the
         //     session to LISTENING from CONNECTING, not from STREAMING, and it is precisely that path that must
-        //     re-issue PREPARE: BtLink's legacy-PIN fallback has just written SSP_Mode=0 on the controller.
+        //     re-issue PREPARE.  What the case pins is the BRANCH -- the rejects path opens a window and the window
+        //     writes Write_Simple_Pairing_Mode a SECOND time, parameter 0x01 -- not the heal itself: failPairing()
+        //     refuses Authentication_Requested at its Command Status (PR_AUTH1_STATUS), which is BEFORE the
+        //     legacy-PIN rung (PR_PIN_SSP_ISSUE), so the fallback's mode-0 write is never reached here (measured:
+        //     OP_SSP=2, both parameters 0x01).  The heal's substance is that PREPARE's parameter is 0x01 REGARDLESS
+        //     of what the ladder wrote before it, which is what the last check reads.
         //     RED with the rejects branch not opening a window: pairingOpen() false, OP_SSP count stays 1.
         Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
         r.advanceMs(121000); CHECK(!r.session.pairingOpen());                    // let the boot window lapse first
@@ -413,6 +438,7 @@ int main() {
         CHECK(r.session.stats().rejects == 1);
         CHECK(r.session.pairingOpen()); CHECK(r.session.pairingReason() == BtSinkSession::PAIR_DROP);
         CHECK(r.runUntil([&] { return r.io.count(OP_SSP) == 2; }, 500));
+        CHECK(r.io.lastParamsOf(OP_SSP) == std::vector<uint8_t>{ 0x01 });
     }
     {   // P4. enterPairing(): EXTENDS an open window (deadline moves, reason becomes the caller's), is REFUSED
         //     while a link is up (no window, no PREPARE), and does not double a PREPARE already in flight.

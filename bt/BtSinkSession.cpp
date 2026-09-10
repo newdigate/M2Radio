@@ -6,7 +6,7 @@ const char *BtSinkSession::stateName(State s) {
 }
 void BtSinkSession::begin(BondTable *bonds, uint8_t aclNum, uint32_t now) {
     m_bonds = bonds; m_sink.setBonds(bonds);      // the session and the sink share one table (the inbound accept reads it)
-    m_sink.begin(now, aclNum);                    // resets the attempt machine and runs PREPARE once per session
+    m_sink.begin(now, aclNum);                    // resets the attempt machine and runs PREPARE; every pairing window re-runs it (openWindow)
     m_stats = Stats{}; m_state = LISTENING;
     m_pairOpen = false; m_pairEnd = PAIR_END_NONE;
     openWindow(now, PAIR_BOOT);                   // begin()'s own PREPARE is in flight, so this one's startPrepare() declines: no double
@@ -97,5 +97,17 @@ void BtSinkSession::tick(uint32_t now) {
     m_sink.link().wantPageScan(listening);
     m_sink.link().wantDiscoverable(listening && (m_alwaysDisc || !m_bonds || m_bonds->count() == 0 || m_pairOpen));
 }
-void BtSinkSession::disconnect() { m_sink.stop(); m_state = DISCONNECTING; }
+// disconnect() closes an open window as CANCELLED, because both callbacks can call it with one open and tick()'s
+// close check sees neither shape: the ATTEMPT callback on the success edge runs BEFORE that check and has already
+// left STREAMING, so `m_state == STREAMING` never closes the BOOT window (btsinksession_test Q7); the STREAM
+// callback on the loss edge runs one line AFTER the drop branch opened a PAIR_DROP window (Q6).  Either way the
+// window rode through DISCONNECTING and MANUAL with the scans off -- pairingOpen() true on a sink that is not
+// discoverable, enterPairing() refused at the same time, and resume() re-entering LISTENING on a stale deadline
+// with no PREPARE.  Guarded: with nothing open, the last window's end is left as it was (Q4).
+void BtSinkSession::disconnect() {
+    if (m_pairOpen) { m_pairOpen = false; m_pairEnd = PAIR_END_CANCELLED; }
+    m_sink.stop(); m_state = DISCONNECTING;
+}
+// resume() opens NO window: "every return to LISTENING" (spec s4) enumerates the ends of ATTEMPTS -- loss, clean
+// close, failed pairing -- and this is an app command; the app calls enterPairing() if it wants one (Q4).
 void BtSinkSession::resume()     { m_state = LISTENING; }

@@ -37,7 +37,7 @@ public:
     // every `m_state == LISTENING` test in tick() stays as it is.  A window is never open while a link is up --
     // scans are already off then -- so enterPairing() refuses rather than queues.
     enum PairingReason : uint8_t { PAIR_NONE, PAIR_BOOT, PAIR_DROP, PAIR_CMD };
-    enum PairingEnd    : uint8_t { PAIR_END_NONE, PAIR_END_TIMEOUT, PAIR_END_PAIRED };
+    enum PairingEnd    : uint8_t { PAIR_END_NONE, PAIR_END_TIMEOUT, PAIR_END_PAIRED, PAIR_END_CANCELLED };   // CANCELLED: closed by the app's disconnect(), not by pairing or the clock
     static const uint32_t PAIR_DEFAULT_MS = 120000;
     void          setPairingWindowMs(uint32_t ms) { m_pairMs = ms; }   // auto-window length; 0 = no auto-windows (a commanded window is then PAIR_DEFAULT_MS)
     bool          canPair() const;                                     // LISTENING with no link up -- the one condition every trigger needs
