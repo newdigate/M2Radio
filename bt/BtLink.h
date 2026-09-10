@@ -41,7 +41,10 @@ public:
     // ---- The non-blocking operation engine (NEW-34 piece 2) -----------------------------------
     enum Op : uint8_t { NONE, PREPARE, INQUIRY, PAGE, PAIR, DISCONNECT };
     void begin(uint32_t now);                      // reset op/scan state (call once per session; safe to re-call)
-    bool startPrepare();                           // Set_Event_Mask/Write_SSP_Mode/Write_Page_Timeout (+ CoD/Local_Name if set).  begin() does NOT run it -- the OWNER does, right after begin() (A2dpSink/A2dpSource) and again on every pairing window (BtSinkSession::openWindow)
+    // Set_Event_Mask / Write_SSP_Mode / Write_Page_Timeout (+ CoD / Local_Name if set).  begin() does NOT run
+    // it -- the OWNER does, right after begin() (A2dpSink/A2dpSource) and again on every pairing window
+    // (BtSinkSession::openWindow).
+    bool startPrepare();
     // Inquiry access code: GIAC 0x9E8B33 (general, the default) or LIAC 0x9E8B00 (limited -- some sinks answer ONLY
     // this while in pairing mode).  Bench knob; set before startInquiry()/the session's boot walk.
     void setInquiryLap(uint32_t lap) { m_lap = lap; }

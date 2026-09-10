@@ -32,7 +32,11 @@ public:
     // NEW-43 sharpened it: one failed SSP leaves the controller in legacy-PIN mode until PREPARE runs again.
     // A pairing WINDOW answers both, the way a speaker does: discoverable for a while after power-on and after
     // any attempt ends (loss, clean close, OR a failed pairing -- the NEW-43 path is a failed attempt), and on
-    // demand.  Every window re-issues PREPARE, so opening one guarantees SSP is on.
+    // demand.  Every window ASKS for PREPARE and opens whether or not it gets one: openWindow() calls
+    // startPrepare(), which DECLINES while another op is in flight, and returns true either way -- so what
+    // re-arms SSP is which op can be running at that moment, not the call.  At begin() that op is the session's
+    // own PREPARE (nothing doubled, nothing missed); the drop and commanded windows open from LISTENING, with
+    // the attempt over.  P2/P3/P4 COUNT the re-issue at the fake controller rather than assuming it.
     // The window is a DEADLINE beside LISTENING, not a State: MANUAL and LISTENING both compose with it and
     // every `m_state == LISTENING` test in tick() stays as it is.  A window never SURVIVES a link reaching
     // STREAMING (the transition closes it PAIRED, ahead of the callbacks), and enterPairing() refuses rather
@@ -42,9 +46,17 @@ public:
     enum PairingReason : uint8_t { PAIR_NONE, PAIR_BOOT, PAIR_DROP, PAIR_CMD };
     enum PairingEnd    : uint8_t { PAIR_END_NONE, PAIR_END_TIMEOUT, PAIR_END_PAIRED, PAIR_END_CANCELLED };   // CANCELLED: torn down by the app's disconnect() before it ever saw STREAMING -- not by pairing, not by the clock
     static const uint32_t PAIR_DEFAULT_MS = 120000;
-    void          setPairingWindowMs(uint32_t ms) { m_pairMs = ms; }   // auto-window length; 0 = no auto-windows (a commanded window is then PAIR_DEFAULT_MS)
-    bool          canPair() const;                                     // LISTENING with no link up -- the one condition every trigger needs
-    bool          enterPairing(uint32_t now, PairingReason r);         // open, or extend to now + window; false = refused (see canPair)
+    // AUTOMATIC-window length; 0 switches the automatic windows off and leaves enterPairing() working at
+    // PAIR_DEFAULT_MS.  Affects the NEXT window; an open one runs to its deadline.
+    void          setPairingWindowMs(uint32_t ms) { m_pairMs = ms; }
+    // Idle enough to OPEN a window: LISTENING with no link up, the one condition every trigger tests before it
+    // fires.  NOT "a phone can pair with us right now" -- that also needs a window open, or no bond yet.
+    bool          canPair() const;
+    // Open a commanded window, or extend an open one to now + window; false = refused (see canPair).  The
+    // reason is the caller's LABEL and never a policy switch: a window entered HERE is a command whatever it is
+    // labelled, so setPairingWindowMs(0) does not refuse it, and PAIR_NONE -- which would leave pairingOpen()
+    // and pairingReason() contradicting each other -- normalises to PAIR_CMD (P7).
+    bool          enterPairing(uint32_t now, PairingReason r = PAIR_CMD);
     bool          pairingOpen() const { return m_pairOpen; }           // as of the last tick(now): that is where expiry is evaluated, so the poll, the scan line and the heartbeat agree
     uint32_t      pairingRemainingMs(uint32_t now) const { return m_pairOpen && (int32_t)(m_pairUntil - now) > 0 ? m_pairUntil - now : 0; }
     PairingReason pairingReason() const { return m_pairOpen ? m_pairReason : PAIR_NONE; }
@@ -58,5 +70,11 @@ private:
     StreamFn m_streamCb = nullptr; void *m_streamCtx = nullptr; AttemptFn m_attemptCb = nullptr; void *m_attemptCtx = nullptr;
     uint32_t m_pairMs = PAIR_DEFAULT_MS, m_pairUntil = 0; bool m_pairOpen = false;
     PairingReason m_pairReason = PAIR_NONE; PairingEnd m_pairEnd = PAIR_END_NONE;
-    bool openWindow(uint32_t now, PairingReason r);                    // the ONE path every trigger takes
+    // The ONE path every trigger takes.  `commanded` is the app asking (enterPairing) rather than the session
+    // deciding (begin, the drop branches) -- it is what setPairingWindowMs(0) switches off, and it is an
+    // argument of its own rather than `r == PAIR_CMD` so that a public enum cannot select policy (P7).
+    bool openWindow(uint32_t now, PairingReason r, bool commanded);
+    // ... and the ONE path every close takes, so the three sites cannot spell it three ways.  Guarded: a close
+    // with nothing open leaves the LAST window's end as it was (Q4, P6).
+    void closeWindow(PairingEnd e) { if (m_pairOpen) { m_pairOpen = false; m_pairEnd = e; } }
 };

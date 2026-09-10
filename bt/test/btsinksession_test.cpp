@@ -312,7 +312,10 @@ int main() {
         CHECK(g_stream.empty());                                                    // it never streamed: no stream event either way
         // ... and announcing again.  The SSP dance stored a bond, so once the pairing window lapses it is
         // page scan only (0x02), not 0x03.  NEW-46: the ABORT is a FAILED attempt (CONNECTING -> LISTENING,
-        // rejects++), which opens a PAIR_DROP window -- the NEW-43 path -- so we advertise (0x03) first.
+        // rejects++) and does open a PAIR_DROP window -- but that is NOT why 0x03 is read here and this case
+        // does not pin it.  Q5 never reaches STREAMING, so nothing closes the BOOT window and it is still open
+        // on its own 120 s.  Measured with the failed-attempt openWindow() deleted: the same scan history
+        // (0x03 0x00 0x03), case green.  P3 pins that branch, and lapses the boot window first to do it.
         CHECK(r.bonds.count() == 1);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 }; }, 500));
         r.advanceMs(121000);
@@ -393,13 +396,18 @@ int main() {
         Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
         // The boot window stays open THROUGH CONNECTING and closes as PAIRED only on STREAMING -- never on
         // CONNECTING (spec §4: a page that fails to pair must not have closed the window it is about to need).
-        // Bringing the link up by hand so the CONNECTING moment is observable at all; inboundToStreaming()
-        // runs past it in one call, and after the bring-up the window is closed either way -- so the
-        // CONNECTING check below is the ONLY thing that reddens a close-on-CONNECTING mutant.
+        // Bringing the link up by hand so the CONNECTING ticks are observable at all: inboundToStreaming()
+        // runs past them in one call, and after the bring-up the window is closed either way -- so the two
+        // checks below are the only ones that can redden a close-on-CONNECTING mutant.  BOTH are needed, and
+        // it is the SECOND that bites: runUntil(state == CONNECTING) returns on the tick that ASSIGNS
+        // CONNECTING in the LISTENING branch, so `case CONNECTING:` has not run once yet, and a mutant closing
+        // the window at the top of that case passes 267/267 against the first check alone (measured).
+        // peerAuthenticates() steps through real CONNECTING passes, which is where the second one samples.
         r.incomingPage(PHONE);
         CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::CONNECTING; }, 1000));
-        CHECK(r.session.pairingOpen());                                          // still open mid-attempt
+        CHECK(r.session.pairingOpen());                                          // the tick that ENTERED connecting
         r.peerAuthenticates();
+        CHECK(r.session.pairingOpen());                                          // ... and a tick that really is inside case CONNECTING
         CHECK(r.runUntil([&] { return r.sink.state() == A2dpSink::AVDTP_WAIT; }, 3000));
         r.sigLocal = r.peerOpens(Avdtp::PSM, 0x0060);
         CHECK(r.runUntil([&] { return r.sink.avdtp().role() == Avdtp::ACCEPTOR && r.sink.state() == A2dpSink::AVDTP; }, 500));
@@ -480,7 +488,9 @@ int main() {
         //     inside the attempt callback.  While the PAIRED close lived at the end of tick() the two read
         //     differently (Q7 cancelled, this paired) for one and the same wire outcome, and the sketch would have
         //     printed `pairing=off reason=cancelled` on a successful pairing.  Closing at the transition makes
-        //     them agree; this case is the pin, and it only bites BESIDE Q7 -- alone it is green either way.
+        //     them agree, and Q7 AND THIS CASE TOGETHER are the pin: alone this one is green either way, and
+        //     measured, the transition-close mutant reddens only Q7 while the unguarded-disconnect() mutant
+        //     reddens Q4, Q7 and this case alike.  It is the control, not the detector.
         //     The trailing checks are last round's guard: disconnect() with nothing open must leave the last
         //     window's end alone rather than overwrite a PAIRED with its own CANCELLED.
         Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
@@ -489,6 +499,31 @@ int main() {
         r.session.disconnect();
         CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));
         CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);
+    }
+    {   // P7. enterPairing() IS THE COMMANDED ENTRY, AND ITS REASON IS A LABEL -- NEVER A POLICY SWITCH.  The
+        //     public parameter used to select policy behind the caller's back, two ways, both measured: passing
+        //     PAIR_NONE opened a window whose pairingReason() then read PAIR_NONE, so pairingOpen() and
+        //     pairingReason() CONTRADICTED each other and Task 2's heartbeat would print `pairing=off secs=120`
+        //     with the LED blinking; and after setPairingWindowMs(0) any reason but PAIR_CMD was REFUSED, so the
+        //     header's promise that a commanded window still runs at PAIR_DEFAULT_MS held only for callers who
+        //     happened to pass that one value.  openWindow() now takes the commanded/automatic distinction as an
+        //     argument of its own, and enterPairing() normalises PAIR_NONE -- a commanded window with no reason
+        //     is still a commanded window.  Kept out of P5 deliberately: P5 owns the OFF SWITCH, this owns the
+        //     public entry's contract, and P5's "RED with the guard removed" would name two guards if merged.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        r.advanceMs(121000); CHECK(!r.session.pairingOpen());                    // lapse it: an OPENING, not an extension
+        CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_NONE));
+        CHECK(r.session.pairingOpen());
+        CHECK(r.session.pairingReason() == BtSinkSession::PAIR_CMD);             // NOT PAIR_NONE: open and reasonless is the contradiction
+        r.advanceMs(121000); CHECK(!r.session.pairingOpen());
+        r.session.setPairingWindowMs(0);                                         // automatic windows off (P5's subject) ...
+        CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_DROP));       // ... but a COMMAND is not automatic
+        CHECK(r.session.pairingOpen());
+        CHECK(r.session.pairingRemainingMs(r.io.now) > 119000);                  // the default 120 s, not 0
+        CHECK(r.session.pairingReason() == BtSinkSession::PAIR_DROP);            // the caller's label, kept
+        r.advanceMs(121000); CHECK(!r.session.pairingOpen());
+        CHECK(r.session.enterPairing(r.io.now));                                 // the DEFAULT argument: spec s4's shape without the enum
+        CHECK(r.session.pairingOpen()); CHECK(r.session.pairingReason() == BtSinkSession::PAIR_CMD);
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

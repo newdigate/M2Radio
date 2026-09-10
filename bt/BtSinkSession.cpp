@@ -9,25 +9,44 @@ void BtSinkSession::begin(BondTable *bonds, uint8_t aclNum, uint32_t now) {
     m_sink.begin(now, aclNum);                    // resets the attempt machine and runs PREPARE; every pairing window re-runs it (openWindow)
     m_stats = Stats{}; m_state = LISTENING;
     m_pairOpen = false; m_pairEnd = PAIR_END_NONE;
-    openWindow(now, PAIR_BOOT);                   // begin()'s own PREPARE is in flight, so this one's startPrepare() declines: no double
+    // The boot window -- unless this begin() cannot open one.  openWindow() also refuses when canPair() is
+    // false, and A2dpSink::begin() -> BtLink::begin() deliberately does NOT clear link state, so a begin()
+    // called with a live ACL lands in LISTENING with no window (measured).  Nothing does that today.
+    // begin()'s own PREPARE is in flight, so this window's startPrepare() declines: no double.
+    openWindow(now, PAIR_BOOT, false);
 }
 bool BtSinkSession::canPair() const {
     bool linkUp = m_sink.link().linkState() == BtLink::LINK_UP || m_sink.link().linkState() == BtLink::LINK_SECURE;
     return m_state == LISTENING && !linkUp;
 }
-bool BtSinkSession::openWindow(uint32_t now, PairingReason r) {
-    if (r != PAIR_CMD && m_pairMs == 0) return false;               // automatic windows switched off
+bool BtSinkSession::openWindow(uint32_t now, PairingReason r, bool commanded) {
+    if (!commanded && m_pairMs == 0) return false;                  // automatic windows switched off
     if (!canPair()) return false;
     m_pairUntil = now + (m_pairMs ? m_pairMs : PAIR_DEFAULT_MS);
     m_pairOpen = true; m_pairReason = r; m_pairEnd = PAIR_END_NONE;
-    // Every window guarantees SSP is on.  startPrepare() returns false when an op is already in flight (the
-    // boot PREPARE, or a page being accepted), which is exactly the no-double we want; tickPrepare() writes
-    // only idempotent things and never touches the scan bookkeeping, so this needs no begin() -- and MUST NOT
-    // use one: BtLink::begin() resets that bookkeeping to "off" and would desync host and controller.
+    // Every window re-issues PREPARE -- the NEW-43 heal.  startPrepare() declines while an op is in flight
+    // (begin()'s own PREPARE, or one a previous window started), which is exactly the no-double we want.  It is
+    // NOT a guard against a link coming up, because AN INBOUND ACCEPT IS NOT AN OP: BtLink submits
+    // Accept_Connection_Request straight from onEvent and leaves m_op NONE -- measured in the
+    // Connection_Request -> Connection_Complete gap as op=0 busy=0 canPair=1.  So a window opened in that gap
+    // does start a PREPARE overlapping the link coming up, and that is harmless: A2dpSink::start() records
+    // m_opIssued=false and its PAIRING state re-issues startPair() once the PREPARE finishes, and SSP events
+    // are handled in onEvent whatever op is running.
+    // tickPrepare() writes only idempotent things, so this needs no begin() -- and MUST NOT use one, because
+    // BtLink::begin() also does `m_op = NONE; m_cmdBusy = false`, ABANDONING an op in flight with the
+    // controller still owing it a reply.  The scan bookkeeping it resets as well is what this comment used to
+    // name, and it is NOT the half that bites: measured, a link().begin(now) here passes the suite 267/267,
+    // because the scan line at the end of tick() recomputes `want` on the same pass and writes on the delta.
     m_sink.link().startPrepare();
     return true;
 }
-bool BtSinkSession::enterPairing(uint32_t now, PairingReason r) { return openWindow(now, r); }
+// The app asking is ALWAYS a command: setPairingWindowMs(0) switches off the windows the SESSION opens by
+// itself, never this one, and the reason it is given is a label to print rather than a policy to obey.  A
+// PAIR_NONE label is the one value that cannot be kept -- pairingReason() reports PAIR_NONE for "closed", so an
+// open window wearing it makes pairingOpen() and pairingReason() contradict each other, and the heartbeat would
+// print `pairing=off secs=120` with the LED blinking (P7).  A commanded window with no reason is still a
+// commanded window, so it becomes PAIR_CMD.
+bool BtSinkSession::enterPairing(uint32_t now, PairingReason r) { return openWindow(now, r == PAIR_NONE ? PAIR_CMD : r, true); }
 void BtSinkSession::tick(uint32_t now) {
     m_sink.tick(now);
     switch (m_state) {
@@ -45,7 +64,7 @@ void BtSinkSession::tick(uint32_t now) {
             // STREAMING, so it paired -- not which line the app happened to call disconnect() on.  Closed at the
             // end of tick() instead, the same wire outcome read CANCELLED from inside the callback (m_state is
             // DISCONNECTING by then) and PAIRED from loop() one tick later (btsinksession_test Q7 vs P6).
-            if (m_pairOpen) { m_pairOpen = false; m_pairEnd = PAIR_END_PAIRED; }
+            closeWindow(PAIR_END_PAIRED);
             if (m_attemptCb) m_attemptCb(m_attemptCtx, A2dpSink::OK, m_sink.link().pairedBy());
             // ... and the stream callback only if we are STILL streaming.  The attempt callback above may have
             // called disconnect(), which assigns DISCONNECTING: announcing the stream UP on a session the app
@@ -60,14 +79,14 @@ void BtSinkSession::tick(uint32_t now) {
         // called from inside a callback assigns DISCONNECTING, and assigning m_state afterwards threw that
         // away silently -- the session went straight back to announcing itself (btsinksession_test Q6).
         m_state = LISTENING;
-        openWindow(now, PAIR_DROP);          // a FAILED attempt is the NEW-43 path: re-issue PREPARE
+        openWindow(now, PAIR_DROP, false);    // a FAILED attempt is the NEW-43 path: re-issue PREPARE
         if (m_attemptCb) m_attemptCb(m_attemptCtx, m_sink.result(), m_sink.link().pairedBy());
         break;
     case STREAMING:
         if (m_sink.result() == A2dpSink::LOST) {                            // the attempt reported the drop (ackLost already ran in m_sink.tick)
             m_stats.lost++; m_stats.lastReason = m_sink.link().lostReason(); m_stats.lostAt = now;
             m_state = LISTENING;
-            openWindow(now, PAIR_DROP);
+            openWindow(now, PAIR_DROP, false);
             if (m_streamCb) m_streamCb(m_streamCtx, false, m_stats.lastReason);
             break;
         }
@@ -77,7 +96,7 @@ void BtSinkSession::tick(uint32_t now) {
         if (!m_sink.busy() && m_sink.result() == A2dpSink::OK) {
             m_stats.closed++;
             m_state = LISTENING;
-            openWindow(now, PAIR_DROP);
+            openWindow(now, PAIR_DROP, false);
             if (m_streamCb) m_streamCb(m_streamCtx, false, 0);
         }
         break;
@@ -98,7 +117,7 @@ void BtSinkSession::tick(uint32_t now) {
     // happens at the CONNECTING -> STREAMING transition above, ahead of the callbacks, so that a disconnect()
     // from inside one cannot change the reason a window ended.  Nothing else can reach STREAMING with a window
     // open -- openWindow() only opens one in LISTENING -- so there is no second close to make here.
-    if (m_pairOpen && (int32_t)(now - m_pairUntil) >= 0) { m_pairOpen = false; m_pairEnd = PAIR_END_TIMEOUT; }
+    if (m_pairOpen && (int32_t)(now - m_pairUntil) >= 0) closeWindow(PAIR_END_TIMEOUT);
     m_sink.link().wantPageScan(listening);
     m_sink.link().wantDiscoverable(listening && (m_alwaysDisc || !m_bonds || m_bonds->count() == 0 || m_pairOpen));
 }
@@ -110,7 +129,7 @@ void BtSinkSession::tick(uint32_t now) {
 // blinking "pairing" while enterPairing() is refused, and resume() re-entering LISTENING on a stale deadline with
 // no PREPARE.  Guarded: with nothing open, the last window's end is left as it was (Q4, P6).
 void BtSinkSession::disconnect() {
-    if (m_pairOpen) { m_pairOpen = false; m_pairEnd = PAIR_END_CANCELLED; }
+    closeWindow(PAIR_END_CANCELLED);
     m_sink.stop(); m_state = DISCONNECTING;
 }
 // resume() opens NO window: "every return to LISTENING" (spec s4) enumerates the ends of ATTEMPTS -- loss, clean
