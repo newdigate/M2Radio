@@ -40,6 +40,12 @@ void BtSinkSession::tick(uint32_t now) {
     case CONNECTING:
         if (m_sink.state() == A2dpSink::STREAMING) {                        // success: A2dpSink stays busy() in STREAMING
             m_stats.links++; m_stats.accepts++; m_state = STREAMING;
+            // The window closes HERE, on the transition, and BEFORE any callback: the app may disconnect() from
+            // inside the attempt callback below, and why a window ended must describe the WIRE -- a link reached
+            // STREAMING, so it paired -- not which line the app happened to call disconnect() on.  Closed at the
+            // end of tick() instead, the same wire outcome read CANCELLED from inside the callback (m_state is
+            // DISCONNECTING by then) and PAIRED from loop() one tick later (btsinksession_test Q7 vs P6).
+            if (m_pairOpen) { m_pairOpen = false; m_pairEnd = PAIR_END_PAIRED; }
             if (m_attemptCb) m_attemptCb(m_attemptCtx, A2dpSink::OK, m_sink.link().pairedBy());
             // ... and the stream callback only if we are STILL streaming.  The attempt callback above may have
             // called disconnect(), which assigns DISCONNECTING: announcing the stream UP on a session the app
@@ -86,24 +92,23 @@ void BtSinkSession::tick(uint32_t now) {
     // tick's state, exactly as BtSession does.
     bool linkUp = m_sink.link().linkState() == BtLink::LINK_UP || m_sink.link().linkState() == BtLink::LINK_SECURE;
     bool listening = (m_state == LISTENING && !linkUp);
-    // The window's edges are evaluated HERE, once per tick, so pairingOpen(), the scan line below and the
-    // heartbeat all read the same answer for the same pass.  A link coming up closes it as PAIRED; the clock
-    // closes it as TIMEOUT.  (A window opened this tick by a drop branch above has now + window as its
-    // deadline and cannot expire on the same pass.)
-    if (m_pairOpen) {
-        if (m_state == STREAMING)                        { m_pairOpen = false; m_pairEnd = PAIR_END_PAIRED; }
-        else if ((int32_t)(now - m_pairUntil) >= 0)      { m_pairOpen = false; m_pairEnd = PAIR_END_TIMEOUT; }
-    }
+    // The CLOCK edge is evaluated HERE, once per tick, so pairingOpen(), the scan line below and the heartbeat
+    // all read the same answer for the same pass.  (A window opened this tick by a drop branch above has
+    // now + window as its deadline and cannot expire on the same pass.)  The PAIRED close is NOT here: it
+    // happens at the CONNECTING -> STREAMING transition above, ahead of the callbacks, so that a disconnect()
+    // from inside one cannot change the reason a window ended.  Nothing else can reach STREAMING with a window
+    // open -- openWindow() only opens one in LISTENING -- so there is no second close to make here.
+    if (m_pairOpen && (int32_t)(now - m_pairUntil) >= 0) { m_pairOpen = false; m_pairEnd = PAIR_END_TIMEOUT; }
     m_sink.link().wantPageScan(listening);
     m_sink.link().wantDiscoverable(listening && (m_alwaysDisc || !m_bonds || m_bonds->count() == 0 || m_pairOpen));
 }
-// disconnect() closes an open window as CANCELLED, because both callbacks can call it with one open and tick()'s
-// close check sees neither shape: the ATTEMPT callback on the success edge runs BEFORE that check and has already
-// left STREAMING, so `m_state == STREAMING` never closes the BOOT window (btsinksession_test Q7); the STREAM
-// callback on the loss edge runs one line AFTER the drop branch opened a PAIR_DROP window (Q6).  Either way the
-// window rode through DISCONNECTING and MANUAL with the scans off -- pairingOpen() true on a sink that is not
-// discoverable, enterPairing() refused at the same time, and resume() re-entering LISTENING on a stale deadline
-// with no PREPARE.  Guarded: with nothing open, the last window's end is left as it was (Q4).
+// disconnect() closes an open window as CANCELLED, and CANCELLED means exactly what it says: a window that never
+// saw STREAMING.  One reaching STREAMING is already closed PAIRED by the transition above, so what is left here
+// is the drop window the loss branch opens ONE LINE before the stream callback that calls us (btsinksession_test
+// Q6), or a boot/commanded window torn down from LISTENING or CONNECTING.  Unclosed, such a window rode through
+// DISCONNECTING and MANUAL with the scans off -- pairingOpen() true on a sink that is not discoverable, the LED
+// blinking "pairing" while enterPairing() is refused, and resume() re-entering LISTENING on a stale deadline with
+// no PREPARE.  Guarded: with nothing open, the last window's end is left as it was (Q4, P6).
 void BtSinkSession::disconnect() {
     if (m_pairOpen) { m_pairOpen = false; m_pairEnd = PAIR_END_CANCELLED; }
     m_sink.stop(); m_state = DISCONNECTING;

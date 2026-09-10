@@ -28,10 +28,13 @@ public:
     void setBonds(BondTable *t) { m_bonds = t; m_link.setBonds(t); }
     BondTable *bonds() { return m_bonds; }
     // `name` is BORROWED, not copied (BtLink keeps the pointer and writes it to the controller in PREPARE):
-    // it must outlive this object, and it must be set BEFORE begin(), which is what runs PREPARE.
+    // it must outlive the whole SESSION, not just begin().  PREPARE runs at begin() and again on every pairing
+    // window (BtSinkSession::openWindow, NEW-46), re-dereferencing the pointer each time -- so storage that has
+    // gone away is a dangling read on every window after it, and a value set after begin() is not ignored: it
+    // reaches the controller at the next window.
     void setIdentity(uint32_t cod, const char *name) { m_link.setIdentity(cod, name); }
     void onMedia(MediaFn fn, void *ctx) { m_mediaFn = fn; m_mediaCtx = ctx; }
-    void begin(uint32_t now, uint8_t aclNum);         // reset; PREPARE once per session (identity written there)
+    void begin(uint32_t now, uint8_t aclNum);         // reset; runs PREPARE (identity written there) -- and so does every pairing window after it
     bool start();                                      // take over the accepted incoming link (link().inboundUp()); false if busy/none
     void tick(uint32_t now);
     void stop();

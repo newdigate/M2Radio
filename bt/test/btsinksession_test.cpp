@@ -332,6 +332,8 @@ int main() {
         // disconnect() must close it as CANCELLED -- a window open on a sink that announces nothing is the LED
         // blinking "pairing" in MANUAL while enterPairing() is refused.  RED before the fix: pairingOpen() true
         // through MANUAL with scans off, pairingEnd() still the BOOT window's PAIRED (nothing had closed this one).
+        // CANCELLED and not PAIRED, unlike Q7's: THIS window never saw STREAMING -- it was opened by the drop that
+        // ended the stream.  The two cases disagree because the wire did, which is the whole point of the reason.
         CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_CANCELLED);
         r.advanceMs(1000);
         CHECK(r.session.state() == BtSinkSession::MANUAL);                                     // ... and STAYS there
@@ -349,14 +351,16 @@ int main() {
         r.inboundToStreaming(0x00D0, false);
         CHECK(g_att.size() == 1 && g_att[0].r == A2dpSink::OK);                     // the attempt itself still succeeded
         CHECK(g_stream.empty());                                                    // RED before the fix: one streaming=true
-        // NEW-46 (Task 1 review): the BOOT window was still open when the attempt callback ran -- the callback
-        // runs BEFORE tick()'s close check, and disconnect() had already left STREAMING, so `m_state == STREAMING`
-        // never closed it as PAIRED and the clock would not for 120 s.  Spec s4's literal invariant is "never open
-        // while a link is up": pinned HERE, mid-teardown with the link LINK_SECURE, and again once MANUAL settles.
-        CHECK(!r.session.pairingOpen());                                            // RED before the fix: open, link secure
+        // NEW-46 (second Task 1 review): the BOOT window closes as PAIRED at the CONNECTING -> STREAMING
+        // transition, BEFORE this callback runs -- so it is shut here (no window on a sink with a link up) and
+        // the reason describes the WIRE: a link reached STREAMING, whatever the app did next.  It read CANCELLED
+        // while the close lived at the end of tick(): the callback had already left STREAMING, so the close check
+        // missed it and disconnect() stamped its own reason.  P6 is the same wire sequence with disconnect()
+        // called one tick LATER; the two must agree, and did not.
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);   // RED: CANCELLED
         CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));
         CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x00 });          // MANUAL announces nothing
-        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_CANCELLED);
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);   // RED: CANCELLED
         r.advanceMs(1000);
         CHECK(r.session.state() == BtSinkSession::MANUAL);
         CHECK(g_stream.empty());                                                    // ... and no late stream event either
@@ -469,6 +473,22 @@ int main() {
         CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_CMD));
         CHECK(r.session.pairingOpen());
         CHECK(r.session.pairingRemainingMs(r.io.now) > 119000);                  // the default 120 s, not 0
+    }
+    {   // P6. WHY A WINDOW ENDED IS A FACT ABOUT THE WIRE, NOT ABOUT WHICH LINE THE APP CALLED disconnect() ON.
+        //     Q7's sequence exactly -- stranger pages, SSP completes, the link reaches STREAMING, the app tears
+        //     it down -- with the ONE difference that disconnect() comes from loop() a tick later instead of from
+        //     inside the attempt callback.  While the PAIRED close lived at the end of tick() the two read
+        //     differently (Q7 cancelled, this paired) for one and the same wire outcome, and the sketch would have
+        //     printed `pairing=off reason=cancelled` on a successful pairing.  Closing at the transition makes
+        //     them agree; this case is the pin, and it only bites BESIDE Q7 -- alone it is green either way.
+        //     The trailing checks are last round's guard: disconnect() with nothing open must leave the last
+        //     window's end alone rather than overwrite a PAIRED with its own CANCELLED.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        r.inboundToStreaming(0x00E0);
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);
+        r.session.disconnect();
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::MANUAL; }, 3000));
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }

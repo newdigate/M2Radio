@@ -41,7 +41,7 @@ public:
     // ---- The non-blocking operation engine (NEW-34 piece 2) -----------------------------------
     enum Op : uint8_t { NONE, PREPARE, INQUIRY, PAGE, PAIR, DISCONNECT };
     void begin(uint32_t now);                      // reset op/scan state (call once per session; safe to re-call)
-    bool startPrepare();                           // Set_Event_Mask/Write_SSP_Mode/Write_Page_Timeout (+ CoD/Local_Name if set): at begin() AND on every pairing window (BtSinkSession::openWindow)
+    bool startPrepare();                           // Set_Event_Mask/Write_SSP_Mode/Write_Page_Timeout (+ CoD/Local_Name if set).  begin() does NOT run it -- the OWNER does, right after begin() (A2dpSink/A2dpSource) and again on every pairing window (BtSinkSession::openWindow)
     // Inquiry access code: GIAC 0x9E8B33 (general, the default) or LIAC 0x9E8B00 (limited -- some sinks answer ONLY
     // this while in pairing mode).  Bench knob; set before startInquiry()/the session's boot walk.
     void setInquiryLap(uint32_t lap) { m_lap = lap; }
@@ -64,11 +64,12 @@ public:
     // from a phone it has never met.  All three are opt-in: unset, the wire sequence is unchanged.
     // `name` is BORROWED, not copied: BtLink stores the pointer and dereferences it later, from the PREPARE
     // operation's own steps (Write_Local_Name and the log line after it), so the storage must OUTLIVE the link --
-    // a string literal or a static buffer, never a stack local of the caller.  PREPARE runs at begin() AND on every
-    // pairing window (BtSinkSession::openWindow, NEW-46), and each run re-dereferences the pointer and rewrites
-    // CoD/Local_Name, so the storage must last the WHOLE session, not just the first PREPARE (the sink sketch
-    // passes its M2_BT_SINK_NAME literal); a value set after begin() reaches the controller at the NEXT window, and
-    // storage that has gone away is a dangling read on every window after it.  0 / null = not written.
+    // a string literal or a static buffer, never a stack local of the caller.  PREPARE runs once at bring-up (the
+    // OWNER's begin() runs it, not this one) AND on every pairing window (BtSinkSession::openWindow, NEW-46), and
+    // each run re-dereferences the pointer and rewrites CoD/Local_Name, so the storage must last the WHOLE
+    // session, not just the first PREPARE (the sink sketch passes its M2_BT_SINK_NAME literal); a value set after
+    // begin() reaches the controller at the NEXT window, and storage that has gone away is a dangling read on
+    // every window after it.  0 / null = not written.
     void setIdentity(uint32_t cod, const char *name) { m_cod = cod; m_name = name; }
     void wantDiscoverable(bool on) { m_wantInqScan = on; }     // adds INQUIRY scan (0x01) to Write_Scan_Enable
     void acceptUnknown(bool on) { m_acceptUnknown = on; }      // accept an incoming page from an UNBONDED address (a sink pairs strangers)
