@@ -8,7 +8,26 @@ void BtSinkSession::begin(BondTable *bonds, uint8_t aclNum, uint32_t now) {
     m_bonds = bonds; m_sink.setBonds(bonds);      // the session and the sink share one table (the inbound accept reads it)
     m_sink.begin(now, aclNum);                    // resets the attempt machine and runs PREPARE once per session
     m_stats = Stats{}; m_state = LISTENING;
+    m_pairOpen = false; m_pairEnd = PAIR_END_NONE;
+    openWindow(now, PAIR_BOOT);                   // begin()'s own PREPARE is in flight, so this one's startPrepare() declines: no double
 }
+bool BtSinkSession::canPair() const {
+    bool linkUp = m_sink.link().linkState() == BtLink::LINK_UP || m_sink.link().linkState() == BtLink::LINK_SECURE;
+    return m_state == LISTENING && !linkUp;
+}
+bool BtSinkSession::openWindow(uint32_t now, PairingReason r) {
+    if (r != PAIR_CMD && m_pairMs == 0) return false;               // automatic windows switched off
+    if (!canPair()) return false;
+    m_pairUntil = now + (m_pairMs ? m_pairMs : PAIR_DEFAULT_MS);
+    m_pairOpen = true; m_pairReason = r; m_pairEnd = PAIR_END_NONE;
+    // Every window guarantees SSP is on.  startPrepare() returns false when an op is already in flight (the
+    // boot PREPARE, or a page being accepted), which is exactly the no-double we want; tickPrepare() writes
+    // only idempotent things and never touches the scan bookkeeping, so this needs no begin() -- and MUST NOT
+    // use one: BtLink::begin() resets that bookkeeping to "off" and would desync host and controller.
+    m_sink.link().startPrepare();
+    return true;
+}
+bool BtSinkSession::enterPairing(uint32_t now, PairingReason r) { return openWindow(now, r); }
 void BtSinkSession::tick(uint32_t now) {
     m_sink.tick(now);
     switch (m_state) {
@@ -35,12 +54,14 @@ void BtSinkSession::tick(uint32_t now) {
         // called from inside a callback assigns DISCONNECTING, and assigning m_state afterwards threw that
         // away silently -- the session went straight back to announcing itself (btsinksession_test Q6).
         m_state = LISTENING;
+        openWindow(now, PAIR_DROP);          // a FAILED attempt is the NEW-43 path: re-issue PREPARE
         if (m_attemptCb) m_attemptCb(m_attemptCtx, m_sink.result(), m_sink.link().pairedBy());
         break;
     case STREAMING:
         if (m_sink.result() == A2dpSink::LOST) {                            // the attempt reported the drop (ackLost already ran in m_sink.tick)
             m_stats.lost++; m_stats.lastReason = m_sink.link().lostReason(); m_stats.lostAt = now;
             m_state = LISTENING;
+            openWindow(now, PAIR_DROP);
             if (m_streamCb) m_streamCb(m_streamCtx, false, m_stats.lastReason);
             break;
         }
@@ -50,6 +71,7 @@ void BtSinkSession::tick(uint32_t now) {
         if (!m_sink.busy() && m_sink.result() == A2dpSink::OK) {
             m_stats.closed++;
             m_state = LISTENING;
+            openWindow(now, PAIR_DROP);
             if (m_streamCb) m_streamCb(m_streamCtx, false, 0);
         }
         break;
@@ -60,11 +82,20 @@ void BtSinkSession::tick(uint32_t now) {
     }
     // Scanning: page scan (connectable) whenever we are LISTENING with no link up, and inquiry scan
     // (discoverable) on top of it until a bond exists -- a phone that already knows us pages, it does not
-    // search.  Computed AFTER the state machine so it reflects THIS tick's state, exactly as BtSession does.
+    // search -- OR while a pairing window is open.  Computed AFTER the state machine so it reflects THIS
+    // tick's state, exactly as BtSession does.
     bool linkUp = m_sink.link().linkState() == BtLink::LINK_UP || m_sink.link().linkState() == BtLink::LINK_SECURE;
     bool listening = (m_state == LISTENING && !linkUp);
+    // The window's edges are evaluated HERE, once per tick, so pairingOpen(), the scan line below and the
+    // heartbeat all read the same answer for the same pass.  A link coming up closes it as PAIRED; the clock
+    // closes it as TIMEOUT.  (A window opened this tick by a drop branch above has now + window as its
+    // deadline and cannot expire on the same pass.)
+    if (m_pairOpen) {
+        if (m_state == STREAMING)                        { m_pairOpen = false; m_pairEnd = PAIR_END_PAIRED; }
+        else if ((int32_t)(now - m_pairUntil) >= 0)      { m_pairOpen = false; m_pairEnd = PAIR_END_TIMEOUT; }
+    }
     m_sink.link().wantPageScan(listening);
-    m_sink.link().wantDiscoverable(listening && (m_alwaysDisc || !m_bonds || m_bonds->count() == 0));
+    m_sink.link().wantDiscoverable(listening && (m_alwaysDisc || !m_bonds || m_bonds->count() == 0 || m_pairOpen));
 }
 void BtSinkSession::disconnect() { m_sink.stop(); m_state = DISCONNECTING; }
 void BtSinkSession::resume()     { m_state = LISTENING; }

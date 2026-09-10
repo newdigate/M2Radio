@@ -49,6 +49,7 @@ struct FakeIo : HciIo {
     }
 };
 static const uint16_t OP_SCAN = 0x0C1A;                        // Write_Scan_Enable: bit1 = page scan, bit0 = inquiry scan
+static const uint16_t OP_SSP = 0x0C56;   // Write_Simple_Pairing_Mode: PREPARE writes it once; every pairing window writes it again
 static A2dpSink *g_sink = nullptr;
 static void evThunk(void *ctx, uint8_t code, const uint8_t *p, uint8_t len) { ((A2dpSink *)ctx)->onEvent(code, p, len); }
 static std::vector<std::string> g_log;
@@ -207,6 +208,11 @@ int main() {
         // The pairing stored a bond, which is what makes us stop advertising -- a real bond from the run,
         // not a synthetic upsert, so the check cannot pass against a table the sink never sees.
         CHECK(r.bonds.count() == 1);
+        // NEW-46: the loss opened a PAIR_DROP pairing window (real behaviour Q1 predates), so we stay
+        // discoverable (0x03) for its 120 s despite the bond; it is only AFTER the window lapses that a
+        // bonded sink stops advertising and drops back to page scan only.
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 }; }, 200));
+        r.advanceMs(121000);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 200));
         r.session.setAlwaysDiscoverable(true); r.tick(); r.tick();
         CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 });          // ... unless the app insists
@@ -247,6 +253,10 @@ int main() {
         CHECK(g_stream.size() == 2 && !g_stream[1].streaming && g_stream[1].reason == 0);
         CHECK(r.sink.result() == A2dpSink::OK && !r.sink.busy());
         CHECK(r.bonds.count() == 1);
+        // NEW-46: a clean CLOSE returns us to LISTENING, which opens a PAIR_DROP window just as a loss does,
+        // so we advertise (0x03) for its 120 s before the bond quiets us to page scan only (0x02).
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 }; }, 200));
+        r.advanceMs(121000);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 200));   // announcing again
         r.inboundToStreaming(0x0090);                                               // a second phone page, end to end
         CHECK(r.session.stats().links == 2 && r.session.stats().closed == 1 && r.session.stats().lost == 0);
@@ -292,8 +302,12 @@ int main() {
         CHECK(g_att.size() == 1 && g_att[0].r == A2dpSink::AVDTP_FAILED);           // RED before the fix: OK
         CHECK(logCount("stream closed") == 0);                                      // RED before the fix: 1
         CHECK(g_stream.empty());                                                    // it never streamed: no stream event either way
-        // ... and announcing again.  The SSP dance stored a bond, so page scan only (0x02), not 0x03.
+        // ... and announcing again.  The SSP dance stored a bond, so once the pairing window lapses it is
+        // page scan only (0x02), not 0x03.  NEW-46: the ABORT is a FAILED attempt (CONNECTING -> LISTENING,
+        // rejects++), which opens a PAIR_DROP window -- the NEW-43 path -- so we advertise (0x03) first.
         CHECK(r.bonds.count() == 1);
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 }; }, 500));
+        r.advanceMs(121000);
         CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 500));
     }
     {   // Q6. A callback that calls disconnect().  m_state used to be assigned AFTER the stream callback ran,
@@ -328,6 +342,107 @@ int main() {
         CHECK(g_stream.empty());                                                    // ... and no late stream event either
         CHECK(r.session.stats().links == 1 && r.session.stats().accepts == 1);      // stats unchanged by the guard
         g_cbSession = nullptr;
+    }
+    {   // P1. THE BOOT WINDOW (NEW-46).  begin() opens a PAIR_BOOT window: a BONDED sink is discoverable (0x03)
+        //     while it is open and stops advertising (0x02) when it expires on the clock.  The bond is a
+        //     synthetic upsert here ON PURPOSE -- the case is "bonded AND windowed", which no live pairing
+        //     produces on a fresh session.  Both halves are load-bearing: a window that never closes keeps
+        //     the first half green and reddens the second; no window at all reddens the first.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        CHECK(r.session.pairingOpen()); CHECK(r.session.pairingReason() == BtSinkSession::PAIR_BOOT);
+        CHECK(r.session.pairingRemainingMs(r.io.now) > 110000 && r.session.pairingRemainingMs(r.io.now) <= 120000);
+        Bond b{}; memcpy(b.bd, PHONE, 6); memcpy(b.key, KEY, 16); b.keyType = 4; r.bonds.upsert(b);
+        r.tick(); r.tick();
+        CHECK(r.bonds.count() == 1);
+        CHECK(r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 });      // bonded, but the window keeps us discoverable
+        r.advanceMs(119000);
+        CHECK(r.session.pairingOpen());                                          // 1 s to go
+        r.advanceMs(2000);
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_TIMEOUT);
+        CHECK(r.session.pairingRemainingMs(r.io.now) == 0);
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 200));   // expired: connectable only
+        CHECK(r.io.count(OP_SSP) == 1);                                          // the boot window did NOT double begin()'s PREPARE
+    }
+    {   // P2. A DROP WINDOW ON LOSS, closed as PAIRED by the next link, and PREPARE RE-ISSUED once per window.
+        //     The stream is real (Q1's flow); the window's PREPARE is counted at the fake controller as a second
+        //     Write_Simple_Pairing_Mode -- which is the NEW-43 heal, so it is what this case exists to pin.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        // The boot window stays open THROUGH CONNECTING and closes as PAIRED only on STREAMING -- never on
+        // CONNECTING (spec §4: a page that fails to pair must not have closed the window it is about to need).
+        // Bringing the link up by hand so the CONNECTING moment is observable at all; inboundToStreaming()
+        // runs past it in one call, and after the bring-up the window is closed either way -- so the
+        // CONNECTING check below is the ONLY thing that reddens a close-on-CONNECTING mutant.
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::CONNECTING; }, 1000));
+        CHECK(r.session.pairingOpen());                                          // still open mid-attempt
+        r.peerAuthenticates();
+        CHECK(r.runUntil([&] { return r.sink.state() == A2dpSink::AVDTP_WAIT; }, 3000));
+        r.sigLocal = r.peerOpens(Avdtp::PSM, 0x0060);
+        CHECK(r.runUntil([&] { return r.sink.avdtp().role() == Avdtp::ACCEPTOR && r.sink.state() == A2dpSink::AVDTP; }, 500));
+        r.peerAvdtp({ 0x10, 0x01 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x01; }, 200));
+        r.peerAvdtp({ 0x20, 0x0C, 1 << 2 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x0C; }, 200));
+        r.peerAvdtp({ 0x30, 0x03, 1 << 2, 2 << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00 });
+        CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x03; }, 200));
+        r.peerAvdtp({ 0x40, 0x06, 1 << 2 }); CHECK(r.runUntil([&] { return r.lastAvdtp()[1] == 0x06; }, 200));
+        r.mediaLocal = r.peerOpens(Avdtp::PSM, 0x0061);
+        r.peerAvdtp({ 0x50, 0x07, 1 << 2 });
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::STREAMING; }, 1000));
+        CHECK(!r.session.pairingOpen()); CHECK(r.session.pairingEnd() == BtSinkSession::PAIR_END_PAIRED);   // the boot window closed on STREAMING
+        CHECK(r.io.count(OP_SSP) == 1);
+        r.disconnectionComplete(0x13);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::LISTENING; }, 500));
+        CHECK(r.session.pairingOpen()); CHECK(r.session.pairingReason() == BtSinkSession::PAIR_DROP);
+        CHECK(r.runUntil([&] { return r.io.count(OP_SSP) == 2; }, 500));         // PREPARE re-issued for the window
+        CHECK(r.bonds.count() == 1);
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x03 }; }, 500));   // bonded AND discoverable
+        r.advanceMs(121000);
+        CHECK(!r.session.pairingOpen());
+        CHECK(r.runUntil([&] { return r.io.lastParamsOf(OP_SCAN) == std::vector<uint8_t>{ 0x02 }; }, 200));
+        CHECK(r.io.count(OP_SSP) == 2);                                          // expiry writes nothing
+    }
+    {   // P3. A DROP WINDOW ON A FAILED ATTEMPT -- the NEW-43 shape.  A page that fails to pair returns the
+        //     session to LISTENING from CONNECTING, not from STREAMING, and it is precisely that path that must
+        //     re-issue PREPARE: BtLink's legacy-PIN fallback has just written SSP_Mode=0 on the controller.
+        //     RED with the rejects branch not opening a window: pairingOpen() false, OP_SSP count stays 1.
+        Rig r; r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        r.advanceMs(121000); CHECK(!r.session.pairingOpen());                    // let the boot window lapse first
+        r.incomingPage(PHONE);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::CONNECTING; }, 1000));
+        r.failPairing();
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::LISTENING; }, 5000));
+        CHECK(r.session.stats().rejects == 1);
+        CHECK(r.session.pairingOpen()); CHECK(r.session.pairingReason() == BtSinkSession::PAIR_DROP);
+        CHECK(r.runUntil([&] { return r.io.count(OP_SSP) == 2; }, 500));
+    }
+    {   // P4. enterPairing(): EXTENDS an open window (deadline moves, reason becomes the caller's), is REFUSED
+        //     while a link is up (no window, no PREPARE), and does not double a PREPARE already in flight.
+        Rig r; r.session.begin(&r.bonds, 8, 0);
+        CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_CMD));       // boot PREPARE still in flight ...
+        r.answerPrepare();
+        CHECK(r.io.count(OP_SSP) == 1);                                          // ... so startPrepare() declined: ONE write, not two
+        CHECK(r.session.pairingReason() == BtSinkSession::PAIR_CMD);
+        r.advanceMs(60000);
+        uint32_t before = r.session.pairingRemainingMs(r.io.now);
+        CHECK(before > 55000 && before <= 60000);
+        CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_CMD));
+        CHECK(r.session.pairingRemainingMs(r.io.now) > 119000);                  // extended to a full window
+        CHECK(r.runUntil([&] { return r.io.count(OP_SSP) == 2; }, 500));         // idle now: PREPARE re-issued
+        r.inboundToStreaming(0x0060);
+        CHECK(!r.session.enterPairing(r.io.now, BtSinkSession::PAIR_CMD));      // link up: refused
+        CHECK(!r.session.pairingOpen()); CHECK(r.io.count(OP_SSP) == 2);
+        CHECK(!r.session.canPair());
+    }
+    {   // P5. setPairingWindowMs(0) turns the AUTOMATIC windows off and leaves the commanded one working at
+        //     the default length.  RED with the guard removed: the boot window opens anyway.
+        Rig r; r.session.setPairingWindowMs(0); r.session.begin(&r.bonds, 8, 0); r.answerPrepare();
+        CHECK(!r.session.pairingOpen());
+        r.inboundToStreaming(0x0060); r.disconnectionComplete(0x13);
+        CHECK(r.runUntil([&] { return r.session.state() == BtSinkSession::LISTENING; }, 500));
+        r.tick(); r.tick();
+        CHECK(!r.session.pairingOpen()); CHECK(r.io.count(OP_SSP) == 1);
+        CHECK(r.session.enterPairing(r.io.now, BtSinkSession::PAIR_CMD));
+        CHECK(r.session.pairingOpen());
+        CHECK(r.session.pairingRemainingMs(r.io.now) > 119000);                  // the default 120 s, not 0
     }
     printf("btsinksession_test: %d checks, %d failures\n", g_checks, g_fails); return g_fails ? 1 : 0;
 }
